@@ -62,10 +62,10 @@ class UniqueWindowDataset(Dataset):
         # Load VCF (single pass)
         self._snps_by_chrom, self.samples = load_snps_from_vcf(vcf_path, samples)
 
-        # Build chrom_name map from FASTA key order (1-based int → FASTA key)
+        # Build chrom_name map from FASTA key names (numeric keys only)
         _fasta = Fasta(fasta_path)
         self._chrom_name: dict[int, str] = {
-            i + 1: name for i, name in enumerate(_fasta.keys())
+            int(name): name for name in _fasta.keys() if name.isdigit()
         }
         # Cache reference chromosomes as bytearrays (lazy: filled on first access)
         self._ref_cache: dict[int, bytearray] = {}

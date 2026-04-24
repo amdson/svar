@@ -72,7 +72,7 @@ def load_snps_from_vcf(
             )
 
             snps_by_chrom[chrom_int].append(
-                SNPRecord(rec.pos, ref_byte, alt_byte, gt_alts)
+                SNPRecord(rec.start, ref_byte, alt_byte, gt_alts)
             )
 
     # Sort each chromosome's SNPs by position (required for sliding-window logic)

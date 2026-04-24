@@ -24,7 +24,7 @@ from pyfaidx import Fasta
 
 _DATA_DIR    = Path(__file__).resolve().parents[3] / "rice_data"
 
-FASTA_PATH   = str(_DATA_DIR / "GCA_rice.fasta")
+FASTA_PATH   = str(_DATA_DIR / "Oryza_sativa.IRGSP-1.0.dna_sm.toplevel.fa")
 VCF_PATH     = str(_DATA_DIR / "RiceDiversity_44K_Genotypes_PLINK" / "sativas413.vcf")
 FLANKING_PATH = str(_DATA_DIR / "RiceDiversity.44K.MSU6.SNP_flanking_seq.txt")
 SNP_INFO_PATH = str(_DATA_DIR / "RiceDiversity.44K.MSU6.SNP_Information.MSU7.txt")
@@ -158,6 +158,6 @@ def remap_vcf_coordinates(
 # ---------------------------------------------------------------------------
 
 def chrom_name_map(fasta_path: str = FASTA_PATH) -> dict[int, str]:
-    """Return {chrom_int: fasta_key} from the FASTA key order."""
+    """Return {chrom_int: fasta_key} for numeric chromosomes in the FASTA."""
     ref = Fasta(fasta_path)
-    return {i + 1: name for i, name in enumerate(ref.keys())}
+    return {int(name): name for name in ref.keys() if name.isdigit()}
