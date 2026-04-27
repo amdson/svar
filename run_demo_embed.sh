@@ -28,7 +28,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || tr
 # ── Run ───────────────────────────────────────────────────────────────────────
 # The script resumes automatically from sativas413_embeddings.ckpt.pt if it exists,
 # so resubmitting this job after a timeout requires no changes.
-cd /home/adickson/variant_cache
+cd /home/adickson/svar
 python demo_embed.py
 
 echo "Done."
