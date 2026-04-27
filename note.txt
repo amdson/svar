@@ -1,0 +1,17 @@
+Submit
+  sbatch run_demo_embed.sh          # prints JOBID
+
+Monitor
+  squeue -u $USER                   # PD=pending, R=running
+  tail -f logs/crop_embed_<JOBID>.out  # live tqdm progress bar
+  ssh <NODE> && nvidia-smi          # GPU usage (node from squeue)
+
+After job ends
+  sacct -j <JOBID> --format=JobID,State,ExitCode,Elapsed,MaxRSS
+    COMPLETED  → done
+    TIMEOUT    → resubmit unchanged, resumes from checkpoint
+    FAILED     → check logs/crop_embed_<JOBID>.err for traceback
+
+Output
+  sativas413_embeddings.pt          # final result
+  sativas413_embeddings.ckpt.pt     # partial state, safe to delete after run
