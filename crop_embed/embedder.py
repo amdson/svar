@@ -113,6 +113,8 @@ class SampleEmbedder:
         batch_size: int = 64,
         max_length: int = 512,
         device: str | torch.device | None = None,
+        checkpoint_path: str | None = None,
+        checkpoint_every: int = 500,
     ) -> dict[Fingerprint, torch.Tensor]:
         """
         Run `model` over every unique window in `dataset` and return a
@@ -120,17 +122,22 @@ class SampleEmbedder:
 
         Parameters
         ----------
-        model       : a HuggingFace model returning last_hidden_state
-        tokenizer   : matching HuggingFace tokenizer
-        batch_size  : sequences per forward pass
-        max_length  : tokenizer max_length
-        device      : torch device; defaults to CUDA if available
+        model            : a HuggingFace model returning last_hidden_state
+        tokenizer        : matching HuggingFace tokenizer
+        batch_size       : sequences per forward pass
+        max_length       : tokenizer max_length
+        device           : torch device; defaults to CUDA if available
+        checkpoint_path  : if set, periodically save the embedding table here
+                           and resume from it automatically on restart
+        checkpoint_every : save a checkpoint every this many batches
 
         Returns
         -------
         embedding_table : {Fingerprint: Tensor(embedding_dim,)}
         """
-        from torch.utils.data import DataLoader
+        import os
+        from torch.utils.data import DataLoader, Subset
+        from tqdm import tqdm
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -138,18 +145,41 @@ class SampleEmbedder:
         model = model.to(device)
         model.eval()
 
+        # ── Resume from checkpoint if one exists ─────────────────────────────
+        embedding_table: dict[Fingerprint, torch.Tensor] = {}
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            embedding_table = torch.load(checkpoint_path, weights_only=False)
+            print(f"Resumed from checkpoint: {len(embedding_table):,} windows already embedded")
+
+        already_done = set(embedding_table.keys())
+        remaining_indices = [
+            i for i, fp in enumerate(dataset.unique_fingerprints)
+            if fp not in already_done
+        ]
+
+        if not remaining_indices:
+            print("All windows already embedded; returning checkpoint table.")
+            return embedding_table
+
+        subset = Subset(dataset, remaining_indices)
         loader = DataLoader(
-            dataset,
+            subset,
             batch_size=batch_size,
             shuffle=False,
             num_workers=0,       # FASTA not fork-safe; use 0 or spawn workers
             collate_fn=_collate,
         )
 
-        embedding_table: dict[Fingerprint, torch.Tensor] = {}
+        def _save_checkpoint():
+            tmp = checkpoint_path + ".tmp"
+            torch.save(embedding_table, tmp)
+            os.replace(tmp, checkpoint_path)  # atomic on POSIX
 
+        n_remaining = len(remaining_indices)
+        batches_since_save = 0
         with torch.no_grad():
-            for batch in loader:
+            for batch in tqdm(loader, desc="Embedding windows", unit="batch",
+                              total=(n_remaining + batch_size - 1) // batch_size):
                 sequences    = batch["sequences"]      # list[str]
                 fingerprints = batch["fingerprints"]   # list[Fingerprint]
 
@@ -169,6 +199,15 @@ class SampleEmbedder:
 
                 for fp, vec in zip(fingerprints, vecs):
                     embedding_table[fp] = vec
+
+                if checkpoint_path:
+                    batches_since_save += 1
+                    if batches_since_save >= checkpoint_every:
+                        _save_checkpoint()
+                        batches_since_save = 0
+
+        if checkpoint_path:
+            _save_checkpoint()
 
         return embedding_table
 
