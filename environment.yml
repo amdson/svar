@@ -1,0 +1,43 @@
+name: svar
+# Reproduces the full environment for variant_cache/ + Makefile pipeline.
+# bcftools is excluded — use the system installation to avoid conflicts.
+#
+# Create:  conda env create -f environment.yml
+# Update:  conda env update -f environment.yml --prune
+# Then:    conda activate svar && pip install -e /home/adickson/variant_cache/
+
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+
+  # ── Genomics tools (Makefile pipeline) ──────────────────────────────────────
+  - crossmap           # VCF coordinate remapping
+  - plink2             # PED/MAP → VCF conversion and QC
+  - samtools           # samtools faidx in get_data.sh
+  - htslib             # provides tabix and bgzip (used in test-consensus target)
+
+  # ── Python — bioinformatics ──────────────────────────────────────────────────
+  - pysam              # VCF reading in crop_embed and sanity checks
+  - pyfaidx            # FASTA random access
+  - biopython          # Bio.SeqIO in generate_SNP_context_embedding
+
+  # ── Python — data science ────────────────────────────────────────────────────
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn       # TruncatedSVD, KNNImputer, train_test_split
+  - tqdm               # progress bars in fill_embedding_table
+
+  # ── Jupyter (for .ipynb sanity checks) ──────────────────────────────────────
+  - jupyterlab
+
+  # ── PyTorch + HuggingFace via pip ────────────────────────────────────────────
+  # Install via pip so you can pick the right CUDA build for your cluster.
+  # After activating: pip install torch --index-url https://download.pytorch.org/whl/cu121
+  - pip
+  - pip:
+    - transformers
