@@ -47,7 +47,9 @@ def load_dnabert2(
     model : BertModel (eval mode, on device)
     tokenizer : AutoTokenizer
     """
-    config = BertConfig.from_pretrained(repo_id)
+    import os
+    local = os.path.isdir(repo_id)
+    config = BertConfig.from_pretrained(repo_id, local_files_only=local)
     if config_overrides:
         for key, val in config_overrides.items():
             setattr(config, key, val)
@@ -80,12 +82,22 @@ def load_dnabert2(
     model = model.to(device)
     model.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(repo_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(repo_id, trust_remote_code=True, use_fast=False, local_files_only=local)
     return model, tokenizer
 
 
 def _download_weights(repo_id: str) -> dict[str, torch.Tensor]:
-    """Download model weights, preferring safetensors over pytorch bin."""
+    """Load model weights from a local directory or HuggingFace Hub."""
+    import os
+
+    if os.path.isdir(repo_id):
+        safetensors_path = os.path.join(repo_id, "model.safetensors")
+        if os.path.exists(safetensors_path):
+            from safetensors.torch import load_file
+            return load_file(safetensors_path)
+        bin_path = os.path.join(repo_id, "pytorch_model.bin")
+        return torch.load(bin_path, map_location="cpu", weights_only=True)
+
     from huggingface_hub import hf_hub_download
 
     try:

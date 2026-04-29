@@ -16,6 +16,7 @@ import torch.nn as nn
 from einops import rearrange
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 from transformers.activations import ACT2FN
+from dataclasses import dataclass
 from transformers.modeling_outputs import (MaskedLMOutput,
                                            SequenceClassifierOutput)
 from transformers.models.bert.modeling_bert import BertPreTrainedModel
@@ -522,6 +523,17 @@ class BertPredictionHeadTransform(nn.Module):
         return hidden_states
 
 
+@dataclass
+class BertModelOutput:
+    """Return type of BertModel.forward — supports both attribute access and tuple unpacking."""
+    last_hidden_state: torch.Tensor
+    pooler_output: Optional[torch.Tensor] = None
+
+    def __iter__(self):
+        yield self.last_hidden_state
+        yield self.pooler_output
+
+
 class BertModel(BertPreTrainedModel):
     """Overall BERT model.
 
@@ -632,10 +644,10 @@ class BertModel(BertPreTrainedModel):
         if not output_all_encoded_layers:
             encoder_outputs = sequence_output
 
-        if self.pooler is not None:
-            return encoder_outputs, pooled_output
-
-        return encoder_outputs, None
+        return BertModelOutput(
+            last_hidden_state=encoder_outputs,
+            pooler_output=pooled_output,
+        )
 
 
 ###################
