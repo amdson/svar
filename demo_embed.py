@@ -7,14 +7,17 @@ Produces a .pt file with shape (n_samples, embedding_dim) and a matching
 list of sample IDs, ready for downstream phenotype prediction.
 """
 
+import os
 import sys
 from pathlib import Path
 
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoTokenizer
 
-# crop_embed lives in variant_cache/
+# crop_embed and DNABERT2_modules live in variant_cache/
 sys.path.insert(0, str(Path(__file__).parent))
+
+from DNABERT2_modules import load_dnabert2
 
 from crop_embed.data.coords import FASTA_PATH
 from crop_embed.data.vcf import load_snps_from_vcf
@@ -25,7 +28,7 @@ from crop_embed.partitioner import SNPWindowPartitioner
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 VCF_PATH   = "/home/adickson/rice_data/sativas413_msu7.vcf"
-MODEL_PATH = "/mnt/inspurfs/user-fs/experiment/DNABERT-2/DNABERT-2-117M"
+MODEL_PATH = "zhihan1996/DNABERT-2-117M"
 OUT_PATH        = "sativas413_embeddings.pt"
 CHECKPOINT_PATH = "sativas413_embeddings.ckpt.pt"  # partial state; safe to delete after OUT_PATH is written
 
@@ -58,8 +61,13 @@ print(f"  {len(dataset):,} unique windows to embed "
 # ── Load model ────────────────────────────────────────────────────────────────
 
 print(f"\nLoading DNABERT-2 from {MODEL_PATH} …")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
-model     = AutoModel.from_pretrained(MODEL_PATH,     trust_remote_code=True)
+_local = os.path.isdir(MODEL_PATH)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True, use_fast=False, local_files_only=_local)
+model, _  = load_dnabert2(
+    repo_id=MODEL_PATH,
+    add_pooling_layer=False,
+    config_overrides={"pad_token_id": tokenizer.pad_token_id},
+)
 
 # ── Embed unique windows ──────────────────────────────────────────────────────
 

@@ -1,1 +1,16 @@
 /test_consensus
+# Ignore the .vscode directory, which contains user-specific settings and workspace configurations.
+.vscode/
+.claude/
+# Ignore all __pycache__ directories, which contain compiled Python files.
+__pycache__/
+*/__pycache__/
+# Ignore all .ipynb_checkpoints directories, which contain Jupyter Notebook checkpoints.
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+# Ignore all .DS_Store files, which are created by macOS to store custom attributes of a folder.
+.DS_Store
+# Ignore all .env files, which may contain sensitive environment variables.
+.env
+# Ignore .egg-info directories, which are created when installing Python packages in editable mode.
+*.egg-info/
