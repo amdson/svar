@@ -26,9 +26,10 @@ echo "GPUs:   ${CUDA_VISIBLE_DEVICES:-none}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true
 
 # ── Run ───────────────────────────────────────────────────────────────────────
-# The script resumes automatically from sativas413_embeddings.ckpt.pt if it exists,
-# so resubmitting this job after a timeout requires no changes.
+# Pass --snp-only to pool only SNP-containing tokens instead of the full window.
+# Each mode writes to a separate output file, but delete the matching .ckpt.pt
+# before switching modes to avoid resuming from an incompatible checkpoint.
 cd /home/adickson/svar
-python demo_embed.py
+python demo_embed.py --snp-only
 
 echo "Done."

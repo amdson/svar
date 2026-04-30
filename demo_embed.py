@@ -7,6 +7,7 @@ Produces a .pt file with shape (n_samples, embedding_dim) and a matching
 list of sample IDs, ready for downstream phenotype prediction.
 """
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -25,13 +26,27 @@ from crop_embed.dataset import UniqueWindowDataset
 from crop_embed.embedder import SampleEmbedder
 from crop_embed.partitioner import SNPWindowPartitioner
 
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+parser = argparse.ArgumentParser(description="Embed sativas413 VCF with DNABERT-2.")
+parser.add_argument(
+    "--snp-only",
+    action="store_true",
+    default=False,
+    help="Pool only SNP-containing tokens instead of the full window. "
+         "Produces a separate output file. Delete any existing checkpoint "
+         "before switching modes.",
+)
+args = parser.parse_args()
+SNP_ONLY = args.snp_only
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 # VCF_PATH   = "/home/adickson/rice_data/sativas413_msu7.vcf"
 VCF_PATH = "/home/andrew.dickson/rice_data/sativas413_msu7.vcf"
 MODEL_PATH = "zhihan1996/DNABERT-2-117M"
-OUT_PATH        = "sativas413_embeddings.pt"
-CHECKPOINT_PATH = "sativas413_embeddings.ckpt.pt"  # partial state; safe to delete after OUT_PATH is written
+OUT_PATH        = "sativas413_embeddings_snponly.pt" if SNP_ONLY else "sativas413_embeddings.pt"
+CHECKPOINT_PATH = OUT_PATH.replace(".pt", ".ckpt.pt")  # delete before switching modes
 
 # ── Windowing parameters ──────────────────────────────────────────────────────
 
@@ -81,6 +96,7 @@ embedding_table = SampleEmbedder.fill_embedding_table(
     max_length=MAX_LENGTH,
     checkpoint_path=CHECKPOINT_PATH,
     checkpoint_every=CHECKPOINT_EVERY,
+    snp_only=SNP_ONLY,
 )
 print(f"  {len(embedding_table):,} unique windows embedded")
 

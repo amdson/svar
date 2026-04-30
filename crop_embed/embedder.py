@@ -115,6 +115,7 @@ class SampleEmbedder:
         device: str | torch.device | None = None,
         checkpoint_path: str | None = None,
         checkpoint_every: int = 500,
+        snp_only: bool = False,
     ) -> dict[Fingerprint, torch.Tensor]:
         """
         Run `model` over every unique window in `dataset` and return a
@@ -130,6 +131,12 @@ class SampleEmbedder:
         checkpoint_path  : if set, periodically save the embedding table here
                            and resume from it automatically on restart
         checkpoint_every : save a checkpoint every this many batches
+        snp_only         : if True, pool only over tokens whose character span
+                           contains a SNP position rather than all tokens.
+                           Windows with no alt alleles fall back to full-window
+                           pooling. Incompatible with checkpoints produced
+                           without this flag — delete any existing checkpoint
+                           before switching modes.
 
         Returns
         -------
@@ -183,19 +190,41 @@ class SampleEmbedder:
                 sequences    = batch["sequences"]      # list[str]
                 fingerprints = batch["fingerprints"]   # list[Fingerprint]
 
-                inputs = tokenizer(
-                    sequences,
-                    return_tensors="pt",
-                    padding="longest",
-                    max_length=max_length,
-                    truncation=True,
-                ).to(device)
+                if snp_only:
+                    inputs = tokenizer(
+                        sequences,
+                        return_tensors="pt",
+                        padding="longest",
+                        max_length=max_length,
+                        truncation=True,
+                        return_offsets_mapping=True,
+                    )
+                    offset_mapping = inputs.pop("offset_mapping")  # (B, T, 2); not a model input
+                    snp_mask = _build_snp_mask(offset_mapping, fingerprints)  # (B, T) bool
+                    inputs = inputs.to(device)
+                else:
+                    inputs = tokenizer(
+                        sequences,
+                        return_tensors="pt",
+                        padding="longest",
+                        max_length=max_length,
+                        truncation=True,
+                    ).to(device)
 
                 outputs = model(**inputs)
-                hidden  = outputs.last_hidden_state   # (B, T, D)
-                mask    = inputs["attention_mask"].unsqueeze(-1).float()
-                vecs    = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1)
-                vecs    = vecs.cpu()
+                hidden  = outputs.last_hidden_state        # (B, T, D)
+
+                if snp_only:
+                    attn_mask = inputs["attention_mask"].unsqueeze(-1).float()   # (B, T, 1)
+                    s_mask    = snp_mask.to(device).unsqueeze(-1).float()        # (B, T, 1)
+                    # Windows with no SNPs in alt_positions: fall back to full-window pooling
+                    has_snp   = s_mask.squeeze(-1).any(dim=1, keepdim=True).unsqueeze(-1)  # (B, 1, 1)
+                    pool_mask = torch.where(has_snp, s_mask, attn_mask)
+                else:
+                    pool_mask = inputs["attention_mask"].unsqueeze(-1).float()   # (B, T, 1)
+
+                vecs = (hidden * pool_mask).sum(1) / pool_mask.sum(1).clamp(min=1)
+                vecs = vecs.cpu()
 
                 for fp, vec in zip(fingerprints, vecs):
                     embedding_table[fp] = vec
@@ -221,3 +250,40 @@ def _collate(items: list[dict]) -> dict:
         "ends":         [item["end"]         for item in items],
         "indices":      [item["idx"]         for item in items],
     }
+
+
+def _build_snp_mask(
+    offset_mapping: torch.Tensor,
+    fingerprints: list[Fingerprint],
+) -> torch.Tensor:
+    """
+    Build a (B, T) bool mask that is True for tokens whose character span
+    contains at least one SNP position.
+
+    offset_mapping : (B, T, 2) int tensor from the tokenizer.  Special tokens
+                     and padding entries both have offset (0, 0) and will never
+                     match a SNP position (the interval [0, 0) is empty).
+    fingerprints   : list of Fingerprint tuples (chrom, w_start, w_end, alt_positions).
+                     alt_positions are 0-based genomic coordinates; the character
+                     index within the sequence string is pos - w_start.
+    """
+    B, T, _ = offset_mapping.shape
+    mask   = torch.zeros(B, T, dtype=torch.bool)
+    starts = offset_mapping[:, :, 0]  # (B, T)
+    ends   = offset_mapping[:, :, 1]  # (B, T)
+
+    for b, fp in enumerate(fingerprints):
+        alt_positions = fp[3]
+        if not alt_positions:
+            continue  # pure-reference window; caller falls back to attention mask
+
+        w_start   = fp[1]
+        snp_chars = torch.tensor([p - w_start for p in alt_positions], dtype=torch.long)
+
+        # Broadcast (S, 1) against (1, T) to get (S, T) hit matrix
+        p_col  = snp_chars.unsqueeze(1)    # (S, 1)
+        s_row  = starts[b].unsqueeze(0)    # (1, T)
+        e_row  = ends[b].unsqueeze(0)      # (1, T)
+        mask[b] = ((s_row <= p_col) & (p_col < e_row)).any(dim=0)
+
+    return mask
