@@ -27,7 +27,8 @@ from crop_embed.partitioner import SNPWindowPartitioner
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-VCF_PATH   = "/home/adickson/rice_data/sativas413_msu7.vcf"
+# VCF_PATH   = "/home/adickson/rice_data/sativas413_msu7.vcf"
+VCF_PATH = "/home/andrew.dickson/rice_data/sativas413_msu7.vcf"
 MODEL_PATH = "zhihan1996/DNABERT-2-117M"
 OUT_PATH        = "sativas413_embeddings.pt"
 CHECKPOINT_PATH = "sativas413_embeddings.ckpt.pt"  # partial state; safe to delete after OUT_PATH is written

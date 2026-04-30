@@ -7,7 +7,7 @@
 #SBATCH --time=12:00:00                  # checkpointing means resubmit is safe if this is too short
 #SBATCH --output=logs/crop_embed_%j.out
 #SBATCH --error=logs/crop_embed_%j.err
-# #SBATCH --account=YOUR_ACCOUNT         # ← uncomment and set if your cluster requires it
+# #SBATCH --account=small_grains         # ← uncomment and set if your cluster requires it
 # #SBATCH --nodelist=YOUR_GPU_NODE       # ← uncomment to pin to a specific node
 
 set -euo pipefail
