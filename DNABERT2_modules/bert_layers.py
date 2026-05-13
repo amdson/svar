@@ -411,7 +411,8 @@ class BertEncoder(nn.Module):
         attention_mask: torch.Tensor,
         output_all_encoded_layers: Optional[bool] = True,
         subset_mask: Optional[torch.Tensor] = None,
-    ) -> List[torch.Tensor]:
+        output_layer: Optional[int] = None,
+    ) -> Tuple[List[torch.Tensor], Optional[torch.Tensor]]:
 
         extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         extended_attention_mask = extended_attention_mask.to(
@@ -442,9 +443,22 @@ class BertEncoder(nn.Module):
         attn_bias = extended_attention_mask[:, :, :seqlen, :seqlen]
         alibi_attn_mask = attn_bias + alibi_bias
 
+        # Resolve negative layer index once so we can compare against loop index
+        n_layers = len(self.layer)
+        target_layer = None
+        if output_layer is not None:
+            target_layer = output_layer if output_layer >= 0 else n_layers + output_layer
+            if not (0 <= target_layer < n_layers):
+                raise ValueError(
+                    f"output_layer {output_layer} is out of range for a model with "
+                    f"{n_layers} layers (valid range: [{-n_layers}, {n_layers - 1}])"
+                )
+
+        intermediate_unpadded: Optional[torch.Tensor] = None
+
         all_encoder_layers = []
         if subset_mask is None:
-            for layer_module in self.layer:
+            for i, layer_module in enumerate(self.layer):
                 hidden_states = layer_module(hidden_states,
                                              cu_seqlens,
                                              seqlen,
@@ -454,12 +468,19 @@ class BertEncoder(nn.Module):
                                              bias=alibi_attn_mask)
                 if output_all_encoded_layers:
                     all_encoder_layers.append(hidden_states)
+                if target_layer is not None and i == target_layer:
+                    intermediate_unpadded = hidden_states
             # Pad inputs and mask. It will insert back zero-padded tokens.
             # Assume ntokens is total number of tokens (padded and non-padded)
             # and ntokens_unpad is total number of non-padded tokens.
             # Then padding performs the following de-compression:
             #     hidden_states[ntokens_unpad,hidden] -> hidden_states[ntokens,hidden]
             hidden_states = pad_input(hidden_states, indices, batch, seqlen)
+            if intermediate_unpadded is not None:
+                intermediate_hidden_states = pad_input(
+                    intermediate_unpadded, indices, batch, seqlen)
+            else:
+                intermediate_hidden_states = None
         else:
             for i in range(len(self.layer) - 1):
                 layer_module = self.layer[i]
@@ -472,6 +493,8 @@ class BertEncoder(nn.Module):
                                              bias=alibi_attn_mask)
                 if output_all_encoded_layers:
                     all_encoder_layers.append(hidden_states)
+                if target_layer is not None and i == target_layer:
+                    intermediate_unpadded = hidden_states
             subset_idx = torch.nonzero(subset_mask[attention_mask_bool],
                                        as_tuple=False).flatten()
             hidden_states = self.layer[-1](hidden_states,
@@ -481,10 +504,15 @@ class BertEncoder(nn.Module):
                                            indices=indices,
                                            attn_mask=attention_mask,
                                            bias=alibi_attn_mask)
+            if intermediate_unpadded is not None:
+                intermediate_hidden_states = pad_input(
+                    intermediate_unpadded, indices, batch, seqlen)
+            else:
+                intermediate_hidden_states = None
 
         if not output_all_encoded_layers:
             all_encoder_layers.append(hidden_states)
-        return all_encoder_layers
+        return all_encoder_layers, intermediate_hidden_states
 
 
 class BertPooler(nn.Module):
@@ -528,10 +556,12 @@ class BertModelOutput:
     """Return type of BertModel.forward — supports both attribute access and tuple unpacking."""
     last_hidden_state: torch.Tensor
     pooler_output: Optional[torch.Tensor] = None
+    intermediate_hidden_state: Optional[torch.Tensor] = None
 
     def __iter__(self):
         yield self.last_hidden_state
         yield self.pooler_output
+        yield self.intermediate_hidden_state
 
 
 class BertModel(BertPreTrainedModel):
@@ -598,6 +628,7 @@ class BertModel(BertPreTrainedModel):
         position_ids: Optional[torch.Tensor] = None,
         output_all_encoded_layers: Optional[bool] = False,
         masked_tokens_mask: Optional[torch.Tensor] = None,
+        output_layer: Optional[int] = None,
         **kwargs
     ) -> Tuple[Union[List[torch.Tensor], torch.Tensor], Optional[torch.Tensor]]:
         if attention_mask is None:
@@ -618,11 +649,13 @@ class BertModel(BertPreTrainedModel):
             first_col_mask[:, 0] = True
             subset_mask = masked_tokens_mask | first_col_mask
 
-        encoder_outputs = self.encoder(
+        encoder_outputs, intermediate_hidden_states = self.encoder(
             embedding_output,
             attention_mask,
             output_all_encoded_layers=output_all_encoded_layers,
-            subset_mask=subset_mask)
+            subset_mask=subset_mask,
+            output_layer=output_layer,
+        )
 
         if masked_tokens_mask is None:
             sequence_output = encoder_outputs[-1]
@@ -647,6 +680,7 @@ class BertModel(BertPreTrainedModel):
         return BertModelOutput(
             last_hidden_state=encoder_outputs,
             pooler_output=pooled_output,
+            intermediate_hidden_state=intermediate_hidden_states,
         )
 
 
@@ -768,7 +802,7 @@ class BertForMaskedLM(BertPreTrainedModel):
             masked_tokens_mask=masked_tokens_mask,
         )
         
-        sequence_output = outputs[0]
+        sequence_output = outputs.last_hidden_state
         prediction_scores = self.cls(sequence_output)
 
         loss = None
@@ -788,13 +822,13 @@ class BertForMaskedLM(BertPreTrainedModel):
                                           b=batch)
 
         if not return_dict:
-            output = (prediction_scores,) + outputs[2:]
+            output = (prediction_scores,)
             return ((loss,) + output) if loss is not None else output
 
         return MaskedLMOutput(
             loss=loss,
             logits=prediction_scores,
-            hidden_states=outputs[0],
+            hidden_states=outputs.last_hidden_state,
             attentions=None,
         )
 

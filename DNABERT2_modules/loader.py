@@ -4,7 +4,7 @@ import torch
 from transformers import AutoTokenizer
 
 from .configuration_bert import BertConfig
-from .bert_layers import BertModel
+from .bert_layers import BertForMaskedLM, BertModel
 
 _DEFAULT_REPO = "zhihan1996/DNABERT-2-117M"
 
@@ -83,6 +83,46 @@ def load_dnabert2(
     model.eval()
 
     tokenizer = AutoTokenizer.from_pretrained(repo_id, trust_remote_code=True, use_fast=False, local_files_only=local)
+    return model, tokenizer
+
+
+def load_dnabert2_mlm(
+    repo_id: str = _DEFAULT_REPO,
+    device: str | torch.device | None = None,
+) -> tuple[BertForMaskedLM, AutoTokenizer]:
+    """
+    Load DNABERT-2 as BertForMaskedLM (encoder + MLM prediction head).
+
+    The checkpoint was saved from BertForMaskedLM, so the cls.* keys map
+    directly onto the model without any prefix manipulation.
+    Use this instead of load_dnabert2 when you need output logits (e.g.
+    pseudo-perplexity, masked token prediction).
+    """
+    import os
+    local = os.path.isdir(repo_id)
+    config = BertConfig.from_pretrained(repo_id, local_files_only=local)
+
+    model = BertForMaskedLM(config)
+    state_dict = _download_weights(repo_id)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    non_trivial_missing = [k for k in missing if "decoder.weight" not in k]
+    if non_trivial_missing:
+        import warnings
+        warnings.warn(f"Missing keys not in checkpoint (random init): {non_trivial_missing}")
+    if unexpected:
+        import warnings
+        warnings.warn(f"Unexpected keys in checkpoint (ignored): {unexpected}")
+
+    _disable_triton_attention(model)
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device).eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        repo_id, trust_remote_code=True, use_fast=False, local_files_only=local
+    )
     return model, tokenizer
 
 
