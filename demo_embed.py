@@ -86,7 +86,7 @@ model, _  = load_dnabert2(
 
 # ── Embed unique windows ──────────────────────────────────────────────────────
 
-print("Running fill_embedding_table …")
+print("Running fill_embedding_table ...")
 embedding_table = SampleEmbedder.fill_embedding_table(
     dataset,
     model,

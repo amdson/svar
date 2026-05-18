@@ -83,8 +83,8 @@ class SNPWindowPartitioner:
 
             while lo < n:
                 p        = snps[lo].pos
-                w_start  = p - self.buffer
-                w_end    = w_start + 2 * self.half_window
+                w_start  = p - self.half_window
+                w_end    = p + self.half_window
                 cutoff   = w_end - self.buffer  # last pos that fits within buffer
 
                 win_idx = len(self.windows)
