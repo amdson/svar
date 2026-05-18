@@ -11,6 +11,7 @@ MAP      := $(PLINK_IN)/$(STEM).map
 VCF_MSU6 := $(PLINK_IN)/$(STEM).vcf
 VCF_MSU7 := $(DATA)/$(STEM)_msu7.vcf
 VCF_FILT := $(DATA)/$(STEM)_msu7_biallelic.vcf
+VCF_QC   := $(DATA)/$(STEM)_msu7_qc.vcf
 VCF_OUT  := $(DATA)/$(STEM)_msu7_final.vcf
 PGEN     := $(DATA)/$(STEM)_msu7_final.pgen
 
@@ -29,16 +30,23 @@ $(VCF_MSU7): $(VCF_MSU6) $(CHAIN) $(FASTA)
 	$(CROSSMAP) vcf $(CHAIN) $< $(FASTA) $@
 
 $(VCF_FILT): $(VCF_MSU7)
-	$(BCFTOOLS) view --min-alleles 2 $< -o $@.tmp
+	$(BCFTOOLS) view --min-alleles 2 --max-alleles 2 $< -o $@.tmp
 	$(BCFTOOLS) sort $@.tmp -o $@
 	rm $@.tmp
 
-$(PGEN) $(VCF_OUT) &: $(VCF_FILT) $(FASTA)
+$(VCF_QC): $(VCF_FILT)
+	$(PLINK2) --vcf $< \
+	          --mind 0.1 \
+	          --geno 0.2 \
+	          --maf 0.05 \
+	          --export vcf --out $(DATA)/$(STEM)_msu7_qc
+
+$(PGEN) $(VCF_OUT) &: $(VCF_QC) $(FASTA)
 	$(PLINK2) --vcf $< --fa $(FASTA) --ref-from-fa force \
 	          --make-pgen --export vcf --out $(DATA)/$(STEM)_msu7_final
 
 clean:
-	rm -f $(VCF_MSU6) $(VCF_MSU7) $(VCF_FILT) $(VCF_OUT) $(DATA)/$(STEM)_msu7.unmap
+	rm -f $(VCF_MSU6) $(VCF_MSU7) $(VCF_FILT) $(VCF_QC) $(VCF_OUT) $(DATA)/$(STEM)_msu7.unmap
 	rm -f $(DATA)/$(STEM)_msu7_final.pgen $(DATA)/$(STEM)_msu7_final.psam $(DATA)/$(STEM)_msu7_final.pvar
 
 # ── Equivalence test: bcftools consensus vs dataset.py on-the-fly application ─
