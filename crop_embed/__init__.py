@@ -25,13 +25,8 @@ from crop_embed.dataset import UniqueWindowDataset
 from crop_embed.embedder import CachedWindowEmbedder, SampleEmbedder, WindowEmbedder
 from crop_embed.fingerprint import Fingerprint, build_sample_window_map, make_fingerprint
 from crop_embed.partitioner import SNPWindowPartitioner, Window
-from crop_embed.train import (
-    AttentionHead,
-    LinearHead,
-    masked_mse,
-    train,
-    window_position_features,
-)
+from crop_embed.heads import AttentionHead, LinearHead, window_position_features
+from crop_embed.train import masked_mse, train
 
 __all__ = [
     "SNPRecord",
