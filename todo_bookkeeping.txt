@@ -1,0 +1,11 @@
+
+# Ignore this stuff, it's mostly resolved or irrelevant, but I should follow up on it later. 
+- BUG: vcf.py _first_allele uses gt[0] only — 0/1 hets treated as ref; fix with any(a==1 for a in gt)
+- BUG: coords.py remap_vcf_coordinates line 143: rec.pos setter is 1-based, so `rec.pos = int(pos_msu7) - 1` writes pos_msu7-1 instead of pos_msu7; every SNP in sativas413_msu7.vcf is off by 1bp
+- MISMATCH: demo_embed.py uses sativas413_msu7.vcf but snp_baseline_models.ipynb uses sativas413_msu7_final.vcf — check these are the same file or results aren't comparable
+- FRAGILE: VCF is loaded twice (demo_embed.py + UniqueWindowDataset.__init__); fingerprint.py indexes gt_alts using sample_idx from the partitioner's load while n_samples comes from the dataset's separate load — only safe because both are unfiltered
+
+1. Generate embeddings with different context lengths
+2. Generate embeddings using only snp embeddings, instead of window average
+3. Generate embeddings using more plantcaudecuas model
+4. Initialize fine-tuning code

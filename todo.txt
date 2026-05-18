@@ -1,0 +1,10 @@
+- We need to make a training pipeline for end-to-end batched generation of embeddings. 
+- Pipeline should leave the embedder model and head model as parameters, but should use the existing BERT code, and a simple linear model as base reference classes. 
+
+1. Build sample matrix dataset
+2. Sample B sample IDs from sample matrix dataset
+3. Generate unique window dataset from batch of samples + genomic sequence data. 
+4. Embed all unique windows using any model capable of generating embeddings from DNA sequences (should be abstracted)
+5. Each sample is now implicitely associated with a list of embeddings for each SNP position. Data structure should be A) a (B, 20000) matrix of fingerprint indices and B) a (#Fingerprints, Emb Dim) matrix of fingerprint embeddings. Use scatter to construct the (B, 20000, Emb Dim) matrix for the model. 
+6. Pass the explicitly constructed SNP embedding mat into a head model, and run normal gradient descent. 
+

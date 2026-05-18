@@ -1,0 +1,49 @@
+# Training pipeline follow-ups
+# MVP lives in crop_embed/train.py; these are deferred improvements.
+
+## Memory / scale
+- Window subsampling: sample S<<n_windows window indices per step rather than
+  feeding all ~20k through the head. Lets head digest a manageable slice and
+  amortizes coverage across steps. Add an optional `windows_per_step` arg to
+  `dataset.gather_batch`.
+- Gradient checkpointing on the embedder forward (DNABERT-2 has 12 layers; at
+  large batches the activation memory dominates). torch.utils.checkpoint.
+- Mixed precision: torch.autocast(bfloat16) wrap around embedder+head forward.
+- Chunk the unique-windows forward into sub-batches if N exceeds GPU capacity
+  (currently we shove all unique fingerprints through one forward pass).
+
+## Fine-tuning strategy
+- LoRA on the embedder body (peft is already a dep via trainpromoter.py).
+  Wrap `embedder.model` with `get_peft_model(...)` before passing to train().
+- Layer-wise LR decay or freezing lower layers of the encoder.
+- Option to freeze the embedder entirely (head-only training) — just don't
+  include embedder.parameters() in the optimizer.
+
+## Targets / loss
+- Helper `align_targets(dataset, pheno_df, trait_cols) -> Tensor` that reorders
+  phenotype rows to match dataset.samples (no-touch on the dataset). Currently
+  the caller is responsible for alignment.
+- Per-trait scaling already lives in preprocessing.scale_phenotypes — wire it
+  in so loss magnitudes are comparable across traits.
+- Trait weighting (some traits have far fewer non-NaN observations).
+- Classification heads for subpopulation labels (categorical loss path).
+
+## Training loop polish
+- Epoch-based sampling (RandomSampler over n_samples without replacement)
+  instead of `torch.randint` with replacement.
+- Validation split + held-out Pearson r logging — same metric as
+  snp_baseline_models.ipynb so results are directly comparable.
+- Checkpointing of (embedder, head, optimizer) state.
+- Early stopping / LR schedule.
+
+## Head models
+- AttentionPoolHead: learn per-window attention weights instead of mean pool.
+- WindowTransformerHead: a small Transformer over (n_windows, D) for inter-window
+  interactions before regression. Probably overkill but worth a sanity run.
+
+## Cleanups
+- Make `build_sample_window_map` return `sample_fp_index` directly as a tensor
+  so dataset.py doesn't post-process the dict. (Currently the dict is built and
+  then immediately copied into the tensor — wasteful at scale.)
+- Profile `dataset.gather_batch` — `extract_sequence` does bytearray + ASCII
+  per call; cache by fingerprint if it shows up in profiles.
