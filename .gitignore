@@ -14,3 +14,4 @@ __pycache__/
 .env
 # Ignore .egg-info directories, which are created when installing Python packages in editable mode.
 *.egg-info/
+sativas413_embeddings.*

@@ -62,8 +62,10 @@ class SampleEmbedder:
         for window in partitioner:
             key = (sample_idx, window.index)
             fp  = self.dataset.sample_window_to_fp.get(key)
+            # if fp is None or not fp[3]:  # skip pure-reference windows — no sample-specific signal
+            #     continue
             if fp is None:
-                continue
+                raise ValueError(f"Missing fingerprint for {window}. ({key})")
             vec = self.embedding_table.get(fp)
             if vec is None:
                 missing += 1
@@ -116,6 +118,7 @@ class SampleEmbedder:
         checkpoint_path: str | None = None,
         checkpoint_every: int = 500,
         snp_only: bool = False,
+        output_layer: int | None = None,
     ) -> dict[Fingerprint, torch.Tensor]:
         """
         Run `model` over every unique window in `dataset` and return a
@@ -137,6 +140,10 @@ class SampleEmbedder:
                            pooling. Incompatible with checkpoints produced
                            without this flag — delete any existing checkpoint
                            before switching modes.
+        output_layer     : if set, extract hidden states from this encoder layer
+                           index (0-based; negative indices count from the end)
+                           instead of the final layer. Incompatible with
+                           checkpoints produced with a different layer setting.
 
         Returns
         -------
@@ -211,8 +218,11 @@ class SampleEmbedder:
                         truncation=True,
                     ).to(device)
 
-                outputs = model(**inputs)
-                hidden  = outputs.last_hidden_state        # (B, T, D)
+                outputs = model(**inputs, output_layer=output_layer)
+                if output_layer is not None and outputs.intermediate_hidden_state is not None:
+                    hidden = outputs.intermediate_hidden_state   # (B, T, D)
+                else:
+                    hidden = outputs.last_hidden_state           # (B, T, D)
 
                 if snp_only:
                     attn_mask = inputs["attention_mask"].unsqueeze(-1).float()   # (B, T, 1)

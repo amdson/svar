@@ -8,8 +8,8 @@ Algorithm (greedy, left-to-right per chromosome)
 -------------------------------------------------
 Sort SNPs by position.  While there are unassigned SNPs:
   1. Take the leftmost unassigned SNP at position p.
-  2. Open a window  [p - buffer,  p - buffer + 2*half_window].
-  3. Assign all SNPs whose position falls in [p, window_end - buffer].
+  2. Open a window  [p - half_window, p + half_window]
+  3. Assign all SNPs whose position falls in [p - half_window + buffer, p + half_window - buffer]
      (The first SNP is `buffer` from the left edge; the last is at least
       `buffer` from the right edge.)
   4. Advance to the next unassigned SNP.
@@ -80,7 +80,7 @@ class SNPWindowPartitioner:
             snps = self.snps_by_chrom[chrom]   # already sorted by pos
             n    = len(snps)
             lo   = 0
-
+            
             while lo < n:
                 p        = snps[lo].pos
                 w_start  = p - self.half_window

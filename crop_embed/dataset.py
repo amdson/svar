@@ -151,10 +151,11 @@ class UniqueWindowDataset(Dataset):
             offset = pos - clip_start
             if 0 <= offset < len(window):
                 window[offset] = alt_map[pos]
-
+                
         seq = window.decode("ascii")
 
         # Pad with 'N' if the window extends past chromosome boundaries
+        # TODO dubeous, check if should use N padding or attention mask padding
         left_pad  = max(0, -w_start)
         right_pad = max(0, w_end - len(ref))
         if left_pad or right_pad:
