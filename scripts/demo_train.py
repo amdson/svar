@@ -124,6 +124,16 @@ parser.add_argument("--run-name",   type=str, default=None,
                     help="Subdirectory under --output-dir; default is auto-named "
                          "from --head / --cache / --positional.")
 
+# Checkpointing + wandb
+parser.add_argument("--checkpoint-every", type=int, default=500,
+                    help="Save a {head, embedder, optimizer} checkpoint every N steps.")
+parser.add_argument("--no-checkpoint", action="store_true",
+                    help="Disable periodic checkpointing.")
+parser.add_argument("--wandb-project", type=str, default=None,
+                    help="If set, log training to this wandb project.")
+parser.add_argument("--wandb-name", type=str, default=None,
+                    help="Optional wandb run name; defaults to wandb's auto name.")
+
 args = parser.parse_args()
 torch.manual_seed(args.seed)
 
@@ -205,6 +215,31 @@ print(f"Head: {args.head}{' (+positional)' if args.positional else ''}  "
       f"— {n_head_params:,} params")
 print(f"Embedder trainable params: {n_emb_params:,}")
 
+# ── Resolve run name + paths (used for checkpoints, wandb, and final save) ───
+
+if args.run_name is None:
+    mode_tag = "cached" if args.cache else "e2e"
+    pos_tag  = "_pos"  if args.positional else ""
+    args.run_name = f"{args.head}_{mode_tag}{pos_tag}"
+
+out_dir = Path(args.output_dir) / args.run_name
+out_dir.mkdir(parents=True, exist_ok=True)
+
+def _ckpt_path(phase: str) -> str | None:
+    if args.no_checkpoint:
+        return None
+    return str(out_dir / f"{phase}.ckpt.pt")
+
+# ── wandb (optional) ──────────────────────────────────────────────────────────
+
+if args.wandb_project:
+    try:
+        import wandb
+    except ImportError:
+        parser.error("--wandb-project set but wandb is not installed; pip install wandb")
+    wandb.init(project=args.wandb_project, name=args.wandb_name or args.run_name,
+               config=vars(args))
+
 # ── Train ─────────────────────────────────────────────────────────────────────
 
 trainable_embedder = args.cache is None
@@ -222,6 +257,8 @@ if trainable_embedder and args.head_only_steps > 0:
         steps=args.head_only_steps,
         precision=args.precision,
         log_every=args.log_every,
+        checkpoint_path=_ckpt_path("phase1"),
+        checkpoint_every=args.checkpoint_every,
     )
     for p in embedder.parameters():
         p.requires_grad_(True)
@@ -236,17 +273,16 @@ train(
     steps=args.steps,
     precision=args.precision,
     log_every=args.log_every,
+    checkpoint_path=_ckpt_path("phase2"),
+    checkpoint_every=args.checkpoint_every,
 )
 
-# ── Save ──────────────────────────────────────────────────────────────────────
+if args.wandb_project:
+    import wandb
+    wandb.finish()
 
-if args.run_name is None:
-    mode_tag = "cached" if args.cache else "e2e"
-    pos_tag  = "_pos"  if args.positional else ""
-    args.run_name = f"{args.head}_{mode_tag}{pos_tag}"
+# ── Save final model ──────────────────────────────────────────────────────────
 
-out_dir = Path(args.output_dir) / args.run_name
-out_dir.mkdir(parents=True, exist_ok=True)
 out_path = out_dir / "model.pt"
 torch.save({
     "head_state_dict":     head.state_dict(),
