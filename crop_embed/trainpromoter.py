@@ -105,7 +105,6 @@ def load_or_generate_kmer(data_path: str, texts: List[str], k: int) -> List[str]
         with open(kmer_path, "w") as f:
             logging.warning(f"Saving k-mer to {kmer_path}...")
             json.dump(kmer, f)
-        
     return kmer
 
 class SupervisedDataset(Dataset):

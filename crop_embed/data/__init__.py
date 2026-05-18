@@ -3,6 +3,7 @@ from crop_embed.data.preprocessing import (
     load_vcf_sparse,
     load_phenotypes,
     align_samples,
+    align_targets_to_dataset,
     scale_phenotypes,
     impute_phenotypes,
     reduce_snp_features,
@@ -24,6 +25,7 @@ __all__ = [
     "SNPRecord", "load_snps_from_vcf",
     # preprocessing
     "load_vcf_sparse", "load_phenotypes", "align_samples",
+    "align_targets_to_dataset",
     "scale_phenotypes", "impute_phenotypes", "reduce_snp_features",
     "train_test_split_data", "load_data",
     # coords

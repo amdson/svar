@@ -22,9 +22,16 @@ Typical usage
 
 from crop_embed.data.vcf import SNPRecord, load_snps_from_vcf
 from crop_embed.dataset import UniqueWindowDataset
-from crop_embed.embedder import SampleEmbedder
+from crop_embed.embedder import CachedWindowEmbedder, SampleEmbedder, WindowEmbedder
 from crop_embed.fingerprint import Fingerprint, build_sample_window_map, make_fingerprint
 from crop_embed.partitioner import SNPWindowPartitioner, Window
+from crop_embed.train import (
+    AttentionHead,
+    LinearHead,
+    masked_mse,
+    train,
+    window_position_features,
+)
 
 __all__ = [
     "SNPRecord",
@@ -36,4 +43,11 @@ __all__ = [
     "build_sample_window_map",
     "UniqueWindowDataset",
     "SampleEmbedder",
+    "WindowEmbedder",
+    "CachedWindowEmbedder",
+    "LinearHead",
+    "AttentionHead",
+    "window_position_features",
+    "masked_mse",
+    "train",
 ]

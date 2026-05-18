@@ -13,9 +13,131 @@ from __future__ import annotations
 from typing import Literal
 
 import torch
+import torch.nn as nn
 
 from crop_embed.dataset import UniqueWindowDataset
 from crop_embed.fingerprint import Fingerprint
+
+
+class WindowEmbedder(nn.Module):
+    """
+    Tokenize → forward → masked pool, returning one vector per input sequence.
+
+    This is the abstraction boundary between the data pipeline and the DNA
+    language model. Any HuggingFace-style model whose forward returns an object
+    with a `last_hidden_state` of shape (B, T, D) plugs in unchanged. If
+    `output_layer` is set, the model must additionally accept that kwarg and
+    return an `intermediate_hidden_state` field (DNABERT-2 does both).
+
+    Parameters
+    ----------
+    model        : the underlying DNA encoder (nn.Module)
+    tokenizer    : matching HuggingFace tokenizer
+    max_length   : tokenizer max_length (windows longer than this are truncated)
+    snp_only     : pool only over tokens whose character span contains a SNP.
+                   Windows with no alt alleles fall back to full-attention pool.
+    output_layer : if set, pull hidden states from this encoder layer index
+                   (0-based; negative counts from the end) instead of the final.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        tokenizer,
+        max_length: int = 512,
+        snp_only: bool = False,
+        output_layer: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.model        = model
+        self.tokenizer    = tokenizer
+        self.max_length   = max_length
+        self.snp_only     = snp_only
+        self.output_layer = output_layer
+
+    def forward(
+        self,
+        sequences: list[str],
+        fingerprints: list[Fingerprint],
+    ) -> torch.Tensor:
+        device = next(self.model.parameters()).device
+
+        tok_kwargs = dict(
+            return_tensors="pt",
+            padding="longest",
+            max_length=self.max_length,
+            truncation=True,
+        )
+        if self.snp_only:
+            tok_kwargs["return_offsets_mapping"] = True
+
+        inputs = self.tokenizer(sequences, **tok_kwargs)
+        if self.snp_only:
+            offset_mapping = inputs.pop("offset_mapping")    # not a model input
+            snp_mask = _build_snp_mask(offset_mapping, fingerprints)
+        inputs = inputs.to(device)
+
+        fwd_kwargs = {"output_layer": self.output_layer} if self.output_layer is not None else {}
+        outputs   = self.model(**inputs, **fwd_kwargs)
+        if self.output_layer is not None and outputs.intermediate_hidden_state is not None:
+            hidden = outputs.intermediate_hidden_state
+        else:
+            hidden = outputs.last_hidden_state
+
+        attn_mask = inputs["attention_mask"].unsqueeze(-1).float()   # (B, T, 1)
+        if self.snp_only:
+            s_mask    = snp_mask.to(device).unsqueeze(-1).float()
+            # Pure-reference windows have no SNP tokens: fall back to full-window pool.
+            has_snp   = s_mask.squeeze(-1).any(dim=1, keepdim=True).unsqueeze(-1)
+            pool_mask = torch.where(has_snp, s_mask, attn_mask)
+        else:
+            pool_mask = attn_mask
+
+        return (hidden * pool_mask).sum(1) / pool_mask.sum(1).clamp(min=1)
+
+
+class CachedWindowEmbedder(nn.Module):
+    """
+    Drop-in replacement for WindowEmbedder that returns precomputed vecs
+    instead of running a model. Has no trainable parameters, so passing it
+    to `train()` yields head-only training automatically.
+
+    Reproduces the non-end-to-end flow: run `SampleEmbedder.fill_embedding_table`
+    once, then wrap the resulting dict and train a head on top of frozen
+    embeddings.
+
+    Parameters
+    ----------
+    embedding_table : {Fingerprint: Tensor(D,)} — typically the output of
+                      SampleEmbedder.fill_embedding_table.
+
+    Raises
+    ------
+    KeyError on `forward` if a requested fingerprint is not in the cache.
+    """
+
+    def __init__(self, embedding_table: dict[Fingerprint, torch.Tensor]) -> None:
+        super().__init__()
+        fps = list(embedding_table.keys())
+        self.fp_to_idx = {fp: i for i, fp in enumerate(fps)}
+        # Buffer (not parameter): moves with `.to(device)` but has no grad.
+        self.register_buffer("cache", torch.stack([embedding_table[fp] for fp in fps]))
+
+    @classmethod
+    def from_checkpoint(cls, path: str) -> "CachedWindowEmbedder":
+        """Load a fill_embedding_table checkpoint and wrap it."""
+        return cls(torch.load(path, weights_only=False))
+
+    def forward(
+        self,
+        sequences: list[str],  # unused; kept for API parity with WindowEmbedder
+        fingerprints: list[Fingerprint],
+    ) -> torch.Tensor:
+        idx = torch.tensor(
+            [self.fp_to_idx[fp] for fp in fingerprints],
+            dtype=torch.long, device=self.cache.device,
+        )
+        return self.cache[idx]
 
 
 class SampleEmbedder:
@@ -156,8 +278,10 @@ class SampleEmbedder:
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        model = model.to(device)
-        model.eval()
+        embedder = WindowEmbedder(
+            model, tokenizer, max_length=max_length,
+            snp_only=snp_only, output_layer=output_layer,
+        ).to(device).eval()
 
         # ── Resume from checkpoint if one exists ─────────────────────────────
         embedding_table: dict[Fingerprint, torch.Tensor] = {}
@@ -197,44 +321,7 @@ class SampleEmbedder:
                 sequences    = batch["sequences"]      # list[str]
                 fingerprints = batch["fingerprints"]   # list[Fingerprint]
 
-                if snp_only:
-                    inputs = tokenizer(
-                        sequences,
-                        return_tensors="pt",
-                        padding="longest",
-                        max_length=max_length,
-                        truncation=True,
-                        return_offsets_mapping=True,
-                    )
-                    offset_mapping = inputs.pop("offset_mapping")  # (B, T, 2); not a model input
-                    snp_mask = _build_snp_mask(offset_mapping, fingerprints)  # (B, T) bool
-                    inputs = inputs.to(device)
-                else:
-                    inputs = tokenizer(
-                        sequences,
-                        return_tensors="pt",
-                        padding="longest",
-                        max_length=max_length,
-                        truncation=True,
-                    ).to(device)
-
-                outputs = model(**inputs, output_layer=output_layer)
-                if output_layer is not None and outputs.intermediate_hidden_state is not None:
-                    hidden = outputs.intermediate_hidden_state   # (B, T, D)
-                else:
-                    hidden = outputs.last_hidden_state           # (B, T, D)
-
-                if snp_only:
-                    attn_mask = inputs["attention_mask"].unsqueeze(-1).float()   # (B, T, 1)
-                    s_mask    = snp_mask.to(device).unsqueeze(-1).float()        # (B, T, 1)
-                    # Windows with no SNPs in alt_positions: fall back to full-window pooling
-                    has_snp   = s_mask.squeeze(-1).any(dim=1, keepdim=True).unsqueeze(-1)  # (B, 1, 1)
-                    pool_mask = torch.where(has_snp, s_mask, attn_mask)
-                else:
-                    pool_mask = inputs["attention_mask"].unsqueeze(-1).float()   # (B, T, 1)
-
-                vecs = (hidden * pool_mask).sum(1) / pool_mask.sum(1).clamp(min=1)
-                vecs = vecs.cpu()
+                vecs = embedder(sequences, fingerprints).cpu()
 
                 for fp, vec in zip(fingerprints, vecs):
                     embedding_table[fp] = vec

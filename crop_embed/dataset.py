@@ -31,7 +31,6 @@ from crop_embed.fingerprint import (
 )
 from crop_embed.partitioner import SNPWindowPartitioner
 
-
 class UniqueWindowDataset(Dataset):
     """
     Parameters
@@ -85,6 +84,14 @@ class UniqueWindowDataset(Dataset):
             build_sample_window_map(partitioner, len(self.samples))
         )
 
+        # Tensor form of sample_window_to_fp, for fast batched gather during training.
+        # Shape (n_samples, n_windows), values index into self.unique_fingerprints.
+        self.sample_fp_index = torch.empty(
+            (len(self.samples), len(partitioner)), dtype=torch.long
+        )
+        for (s, w), fp in self.sample_window_to_fp.items():
+            self.sample_fp_index[s, w] = self.fp_to_idx[fp]
+
     # ── Dataset protocol ──────────────────────────────────────────────────────
 
     def __len__(self) -> int:
@@ -104,7 +111,7 @@ class UniqueWindowDataset(Dataset):
         }
         """
         fp    = self.unique_fingerprints[idx]
-        seq   = self._extract_sequence(fp)
+        seq   = self.extract_sequence(fp)
         chrom, start, end, _ = fp
         return {
             "sequence":    seq,
@@ -130,9 +137,34 @@ class UniqueWindowDataset(Dataset):
         idx = self.fp_to_idx[fp]
         return self.__getitem__(idx)
 
+    # ── Batched lookup for training ───────────────────────────────────────────
+
+    def gather_batch(
+        self, sample_indices: torch.Tensor
+    ) -> tuple[list[str], list[Fingerprint], torch.Tensor]:
+        """
+        Gather the deduplicated set of windows for a batch of samples.
+
+        Parameters
+        ----------
+        sample_indices : LongTensor[B] of row indices into self.samples
+
+        Returns
+        -------
+        sequences    : list[str]            — DNA strings for each unique fingerprint
+        fingerprints : list[Fingerprint]    — same order as `sequences`
+        inverse      : LongTensor[B, n_windows]  — index into `sequences`,
+                                                   suitable for `emb[inverse]` scatter
+        """
+        batch_idx = self.sample_fp_index[sample_indices]               # (B, n_windows)
+        unique_global, inverse = torch.unique(batch_idx, return_inverse=True)
+        fingerprints = [self.unique_fingerprints[i] for i in unique_global.tolist()]
+        sequences    = [self.extract_sequence(fp) for fp in fingerprints]
+        return sequences, fingerprints, inverse
+
     # ── Sequence extraction ───────────────────────────────────────────────────
 
-    def _extract_sequence(self, fp: Fingerprint) -> str:
+    def extract_sequence(self, fp: Fingerprint) -> str:
         """
         Materialise the DNA string for a fingerprint.
         Applies alt alleles from fp[3] onto the reference window.

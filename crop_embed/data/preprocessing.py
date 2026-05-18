@@ -155,6 +155,30 @@ def align_samples(
 
 
 # ---------------------------------------------------------------------------
+# Step 3b — Align phenotypes to a (no-touch) dataset sample order
+# ---------------------------------------------------------------------------
+
+def align_targets_to_dataset(
+    dataset,
+    pheno_df: pd.DataFrame,
+    trait_cols: list[str],
+) -> "np.ndarray":
+    """
+    Build a (n_samples, n_traits) target array aligned to ``dataset.samples``
+    order (the order the training loop sees), without reordering the dataset.
+
+    Samples in the VCF that have no matching phenotype row get NaN — the
+    training loss (masked_mse) skips those entries.
+
+    Sample IDs are matched by NSFTVID — the integer suffix after the last
+    underscore in dataset.samples[i] (e.g. ``081215-A05_1`` → NSFTVID 1).
+    """
+    nsftvids = [int(s.rsplit("_", 1)[-1]) for s in dataset.samples]
+    Y_df = pheno_df.set_index("NSFTVID").reindex(nsftvids)[trait_cols]
+    return Y_df.values.astype(float)
+
+
+# ---------------------------------------------------------------------------
 # Step 4 — Per-trait StandardScaler (NaN-safe)
 # ---------------------------------------------------------------------------
 
