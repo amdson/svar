@@ -8,7 +8,7 @@ Typical usage
 -------------
     from crop_embed.data import load_snps_from_vcf
     from crop_embed.partitioner import SNPWindowPartitioner
-    from crop_embed.dataset import UniqueWindowDataset
+    from crop_embed.dataset import UniqueWindowDataset, SampleDataset
     from crop_embed.embedder import SampleEmbedder
 
     snps, samples = load_snps_from_vcf(vcf_path)
@@ -21,11 +21,16 @@ Typical usage
 """
 
 from crop_embed.data.vcf import SNPRecord, load_snps_from_vcf
-from crop_embed.dataset import UniqueWindowDataset
-from crop_embed.embedder import CachedWindowEmbedder, SampleEmbedder, WindowEmbedder
+from crop_embed.dataset import SampleDataset, UniqueWindowDataset
+from crop_embed.embedder import (
+    BatchedWindowEmbedder,
+    FixedWindowEmbedder,
+    SampleEmbedder,
+    WindowEmbedder,
+)
 from crop_embed.fingerprint import Fingerprint, build_sample_window_map, make_fingerprint
 from crop_embed.partitioner import SNPWindowPartitioner, Window
-from crop_embed.heads import AttentionHead, LinearHead, window_position_features
+from crop_embed.heads import AttentionHead, LinearHead, MLPHead, window_position_features
 from crop_embed.train import masked_mse, train
 
 __all__ = [
@@ -37,10 +42,13 @@ __all__ = [
     "make_fingerprint",
     "build_sample_window_map",
     "UniqueWindowDataset",
+    "SampleDataset",
     "SampleEmbedder",
     "WindowEmbedder",
-    "CachedWindowEmbedder",
+    "BatchedWindowEmbedder",
+    "FixedWindowEmbedder",
     "LinearHead",
+    "MLPHead",
     "AttentionHead",
     "window_position_features",
     "masked_mse",

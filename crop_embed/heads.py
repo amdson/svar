@@ -7,6 +7,7 @@ trait predictions (B, n_traits). New heads just need to implement
 
 Implemented:
   - LinearHead    : mean-pool over windows → Linear
+  - MLPHead       : mean-pool over windows → 2-layer GELU MLP
   - AttentionHead : K learnable queries cross-attend to windows → MLP
 
 `window_position_features(dataset)` is a helper for the AttentionHead
@@ -66,6 +67,42 @@ class LinearHead(nn.Module):
     def forward(self, window_emb: torch.Tensor) -> torch.Tensor:
         # window_emb: (B, n_windows, D)
         return self.linear(window_emb.mean(dim=1))
+
+
+class MLPHead(nn.Module):
+    """
+    Mean-pool over windows → 2-layer GELU MLP → n_traits.
+
+    A step up from LinearHead when the relationship between pooled-embedding
+    coordinates and traits isn't well captured by a single affine map.
+
+    Parameters
+    ----------
+    emb_dim    : window embedding dimension (must match the embedder).
+    n_traits   : number of regression outputs.
+    hidden_dim : MLP hidden width. Defaults to emb_dim.
+    dropout    : dropout probability applied between the two linear layers.
+    """
+
+    def __init__(
+        self,
+        emb_dim: int,
+        n_traits: int,
+        hidden_dim: int | None = None,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        hidden_dim = hidden_dim or emb_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(emb_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, n_traits),
+        )
+
+    def forward(self, window_emb: torch.Tensor) -> torch.Tensor:
+        # window_emb: (B, n_windows, D)
+        return self.mlp(window_emb.mean(dim=1))
 
 
 class AttentionHead(nn.Module):

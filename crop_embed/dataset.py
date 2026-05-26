@@ -204,3 +204,43 @@ class UniqueWindowDataset(Dataset):
                 str(fasta[key]).upper().encode("ascii")
             )
         return self._ref_cache[chrom]
+
+
+class SampleDataset(Dataset):
+    """
+    Sample-indexed view of a UniqueWindowDataset for use with DataLoader.
+
+    __getitem__ returns (global_sample_idx, target_tensor) for position
+    `local_idx` in the (possibly subsetted) sample list.  The global index
+    is used by the training loop to look up window embeddings via
+    `window_dataset.sample_fp_index`.
+
+    Parameters
+    ----------
+    window_dataset  : underlying UniqueWindowDataset
+    targets         : Tensor[n_total_samples, n_traits] aligned to
+                      window_dataset.samples order; NaN = missing
+    sample_indices  : LongTensor of row indices into window_dataset.samples
+                      to include; None means all samples
+    """
+
+    def __init__(
+        self,
+        window_dataset: UniqueWindowDataset,
+        targets: torch.Tensor,
+        sample_indices: torch.Tensor | None = None,
+    ) -> None:
+        self.window_dataset = window_dataset
+        self.targets = targets
+        self.sample_indices = (
+            sample_indices
+            if sample_indices is not None
+            else torch.arange(len(window_dataset.samples))
+        )
+
+    def __len__(self) -> int:
+        return len(self.sample_indices)
+
+    def __getitem__(self, local_idx: int):
+        global_idx = int(self.sample_indices[local_idx])
+        return global_idx, self.targets[global_idx]

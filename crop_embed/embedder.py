@@ -10,6 +10,7 @@ each sample's windows, retrieves the cached embeddings, and pools them.
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 
 import torch
@@ -96,48 +97,141 @@ class WindowEmbedder(nn.Module):
         return (hidden * pool_mask).sum(1) / pool_mask.sum(1).clamp(min=1)
 
 
-class CachedWindowEmbedder(nn.Module):
+class BatchedWindowEmbedder(nn.Module):
     """
-    Drop-in replacement for WindowEmbedder that returns precomputed vecs
-    instead of running a model. Has no trainable parameters, so passing it
-    to `train()` yields head-only training automatically.
+    Sample-batch interface around a WindowEmbedder + dataset.
 
-    Reproduces the non-end-to-end flow: run `SampleEmbedder.fill_embedding_table`
-    once, then wrap the resulting dict and train a head on top of frozen
-    embeddings.
+    `forward(global_indices)` returns the per-window embeddings for a batch of
+    samples — shape (B, n_windows, D). Deduplicates windows across the batch
+    via `dataset.gather_batch`, runs the underlying WindowEmbedder once, then
+    scatters back. Use for end-to-end / trainable-embedder training.
+    """
+
+    def __init__(self, window_embedder: WindowEmbedder, dataset: UniqueWindowDataset) -> None:
+        super().__init__()
+        self.window_embedder = window_embedder
+        # Not registered as a submodule — it has no parameters/buffers and
+        # holds file handles (FASTA) that shouldn't move with .to(device).
+        self._dataset = dataset
+
+    @property
+    def dataset(self) -> UniqueWindowDataset:
+        return self._dataset
+
+    def forward(self, global_indices: torch.Tensor) -> torch.Tensor:
+        sequences, fingerprints, inverse = self._dataset.gather_batch(global_indices.cpu())
+        emb = self.window_embedder(sequences, fingerprints)
+        return emb[inverse.to(emb.device)]
+
+
+class FixedWindowEmbedder(nn.Module):
+    """
+    Precomputed per-sample window embeddings — drop-in for training a head
+    against a frozen embedder without re-running the backbone.
+
+    `forward(global_indices)` returns (B, n_windows, D) via a single tensor
+    index. No parameters; the cache and sample→fingerprint index are stored
+    as buffers, so `state_dict()` round-trips the full precomputed table.
 
     Parameters
     ----------
-    embedding_table : {Fingerprint: Tensor(D,)} — typically the output of
-                      SampleEmbedder.fill_embedding_table.
-
-    Raises
-    ------
-    KeyError on `forward` if a requested fingerprint is not in the cache.
+    cache            : Tensor(n_unique_windows, D) of precomputed embeddings,
+                       indexed in the same order as `dataset.unique_fingerprints`.
+    sample_fp_index  : LongTensor(n_samples, n_windows) — `dataset.sample_fp_index`.
     """
 
-    def __init__(self, embedding_table: dict[Fingerprint, torch.Tensor]) -> None:
+    def __init__(self, cache: torch.Tensor, sample_fp_index: torch.Tensor) -> None:
         super().__init__()
-        fps = list(embedding_table.keys())
-        self.fp_to_idx = {fp: i for i, fp in enumerate(fps)}
-        # Buffer (not parameter): moves with `.to(device)` but has no grad.
-        self.register_buffer("cache", torch.stack([embedding_table[fp] for fp in fps]))
+        self.register_buffer("cache", cache)
+        self.register_buffer("sample_fp_index", sample_fp_index)
+
+    def forward(self, global_indices: torch.Tensor) -> torch.Tensor:
+        return self.cache[self.sample_fp_index[global_indices]]
 
     @classmethod
-    def from_checkpoint(cls, path: str) -> "CachedWindowEmbedder":
-        """Load a fill_embedding_table checkpoint and wrap it."""
-        return cls(torch.load(path, weights_only=False))
+    def from_embedder(
+        cls,
+        window_embedder: WindowEmbedder,
+        dataset: UniqueWindowDataset,
+        batch_size: int = 64,
+        device: str | torch.device | None = None,
+    ) -> "FixedWindowEmbedder":
+        """Run window_embedder over every unique window and build the cache."""
+        if device is None:
+            device = next(window_embedder.parameters()).device
+        else:
+            device = torch.device(device)
 
-    def forward(
-        self,
-        sequences: list[str],  # unused; kept for API parity with WindowEmbedder
-        fingerprints: list[Fingerprint],
-    ) -> torch.Tensor:
-        idx = torch.tensor(
-            [self.fp_to_idx[fp] for fp in fingerprints],
-            dtype=torch.long, device=self.cache.device,
-        )
-        return self.cache[idx]
+        was_training = window_embedder.training
+        window_embedder.to(device).eval()
+
+        fps = dataset.unique_fingerprints
+        vecs = []
+        with torch.no_grad():
+            for i in range(0, len(fps), batch_size):
+                batch_fps = fps[i : i + batch_size]
+                seqs = [dataset.extract_sequence(fp) for fp in batch_fps]
+                vecs.append(window_embedder(seqs, batch_fps).cpu())
+        cache = torch.cat(vecs, dim=0)
+
+        window_embedder.train(was_training)
+        return cls(cache, dataset.sample_fp_index.clone())
+
+    @classmethod
+    def from_embedding_table(
+        cls,
+        embedding_table: dict[Fingerprint, torch.Tensor],
+        dataset: UniqueWindowDataset,
+    ) -> "FixedWindowEmbedder":
+        """Build from a SampleEmbedder.fill_embedding_table-style dict."""
+        cache = torch.stack([embedding_table[fp] for fp in dataset.unique_fingerprints])
+        return cls(cache, dataset.sample_fp_index.clone())
+
+    @classmethod
+    def from_checkpoint(cls, path: str) -> "FixedWindowEmbedder":
+        """
+        Reconstruct from a training checkpoint that was saved while training
+        a FixedWindowEmbedder (so `embedder_state_dict` carries the cache).
+        Avoids re-running precompute on resume.
+        """
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        sd   = ckpt["embedder_state_dict"]
+        return cls(sd["cache"], sd["sample_fp_index"])
+
+    @classmethod
+    def from_file(
+        cls,
+        path: str,
+        dataset: UniqueWindowDataset | None = None,
+    ) -> "FixedWindowEmbedder":
+        """
+        Load from disk, auto-detecting format:
+          1. state_dict from FixedWindowEmbedder.save()  → preferred
+          2. training checkpoint with embedder_state_dict (phase1/cached ckpt.pt)
+          3. SampleEmbedder.fill_embedding_table dict    → requires `dataset`
+        """
+        obj = torch.load(path, map_location="cpu", weights_only=False)
+        if isinstance(obj, dict):
+            if "cache" in obj and "sample_fp_index" in obj:
+                return cls(obj["cache"], obj["sample_fp_index"])
+            if "embedder_state_dict" in obj:
+                sd = obj["embedder_state_dict"]
+                return cls(sd["cache"], sd["sample_fp_index"])
+        if dataset is None:
+            raise ValueError(
+                f"{path} looks like a fill_embedding_table dict; pass `dataset` "
+                "to align fingerprints, or save a FixedWindowEmbedder.state_dict()."
+            )
+        return cls.from_embedding_table(obj, dataset)
+
+    def save(self, path: str) -> None:
+        """Atomically write this embedder's cache to disk for later reuse."""
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        torch.save(self.state_dict(), tmp)
+        os.replace(tmp, path)
 
 
 class SampleEmbedder:
