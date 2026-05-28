@@ -93,6 +93,7 @@ parser = argparse.ArgumentParser(description="Train a head on DNA window embeddi
 parser.add_argument("--cache", type=str, default=None,
                     help="Path to a fill_embedding_table checkpoint. If set, "
                          "the embedder is frozen and only the head trains.")
+
 parser.add_argument("--model-path", type=str, default=DEFAULT_MODEL,
                     help="HuggingFace repo or local dir for the DNA encoder "
                          "(only used when --cache is not given).")
