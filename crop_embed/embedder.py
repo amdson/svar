@@ -20,15 +20,30 @@ from crop_embed.dataset import UniqueWindowDataset
 from crop_embed.fingerprint import Fingerprint
 
 
+Backend = Literal["dnabert2", "plantcad"]
+
+
 class WindowEmbedder(nn.Module):
     """
     Tokenize → forward → masked pool, returning one vector per input sequence.
 
     This is the abstraction boundary between the data pipeline and the DNA
-    language model. Any HuggingFace-style model whose forward returns an object
-    with a `last_hidden_state` of shape (B, T, D) plugs in unchanged. If
-    `output_layer` is set, the model must additionally accept that kwarg and
-    return an `intermediate_hidden_state` field (DNABERT-2 does both).
+    language model. Two backends are supported:
+
+      * ``backend="dnabert2"`` (default) — HuggingFace-style model whose forward
+        returns an object with ``last_hidden_state`` of shape (B, T, D). If
+        ``output_layer`` is set, the model must additionally accept that kwarg
+        and return an ``intermediate_hidden_state`` field. DNABERT-2 satisfies
+        both.
+
+      * ``backend="plantcad"`` — PlantCaduceus (kuleshov-group/PlantCaduceus_*).
+        Hidden states come from ``output_hidden_states=True``; reverse-complement
+        parameter sharing means the (B, T, 2D) last hidden state is averaged
+        with its RC-half-flip to (B, T, D) via
+        :func:`PlantCAD_modules.average_rc_embeddings`. ``output_layer`` indexes
+        into ``outputs.hidden_states`` (negatives count from the end). Caduceus
+        tokenizers don't expose offset mappings, so ``snp_only`` isn't
+        supported on this backend yet.
 
     Parameters
     ----------
@@ -37,8 +52,12 @@ class WindowEmbedder(nn.Module):
     max_length   : tokenizer max_length (windows longer than this are truncated)
     snp_only     : pool only over tokens whose character span contains a SNP.
                    Windows with no alt alleles fall back to full-attention pool.
+                   Requires ``backend="dnabert2"``.
     output_layer : if set, pull hidden states from this encoder layer index
                    (0-based; negative counts from the end) instead of the final.
+    backend      : which encoder family to drive — ``"dnabert2"`` or
+                   ``"plantcad"``. Controls how ``model(...)`` is called and
+                   which output field is read.
     """
 
     def __init__(
@@ -48,13 +67,23 @@ class WindowEmbedder(nn.Module):
         max_length: int = 512,
         snp_only: bool = False,
         output_layer: int | None = None,
+        backend: Backend = "dnabert2",
     ) -> None:
         super().__init__()
+        if backend not in ("dnabert2", "plantcad"):
+            raise ValueError(f"Unknown backend {backend!r}; expected 'dnabert2' or 'plantcad'.")
+        if snp_only and backend == "plantcad":
+            raise NotImplementedError(
+                "snp_only=True is not supported with backend='plantcad' — the "
+                "Caduceus tokenizer doesn't return offset_mapping. Pass "
+                "snp_only=False or fall back to the dnabert2 backend."
+            )
         self.model        = model
         self.tokenizer    = tokenizer
         self.max_length   = max_length
         self.snp_only     = snp_only
         self.output_layer = output_layer
+        self.backend      = backend
 
     def forward(
         self,
@@ -78,12 +107,21 @@ class WindowEmbedder(nn.Module):
             snp_mask = _build_snp_mask(offset_mapping, fingerprints)
         inputs = inputs.to(device)
 
-        fwd_kwargs = {"output_layer": self.output_layer} if self.output_layer is not None else {}
-        outputs   = self.model(**inputs, **fwd_kwargs)
-        if self.output_layer is not None and outputs.intermediate_hidden_state is not None:
-            hidden = outputs.intermediate_hidden_state
-        else:
-            hidden = outputs.last_hidden_state
+        if self.backend == "dnabert2":
+            fwd_kwargs = {"output_layer": self.output_layer} if self.output_layer is not None else {}
+            outputs   = self.model(**inputs, **fwd_kwargs)
+            if self.output_layer is not None and outputs.intermediate_hidden_state is not None:
+                hidden = outputs.intermediate_hidden_state
+            else:
+                hidden = outputs.last_hidden_state
+        else:  # plantcad — Caduceus exposes layers via output_hidden_states
+            from PlantCAD_modules import average_rc_embeddings
+            outputs   = self.model(**inputs, output_hidden_states=True)
+            layer_idx = -1 if self.output_layer is None else self.output_layer
+            # Hidden states are (B, T, 2D) due to RC parameter sharing; collapse
+            # to single-strand (B, T, D) before pooling. Cast up so downstream
+            # statistics aren't quantized by an fp16 checkpoint.
+            hidden = average_rc_embeddings(outputs.hidden_states[layer_idx].float())
 
         attn_mask = inputs["attention_mask"].unsqueeze(-1).float()   # (B, T, 1)
         if self.snp_only:
@@ -335,6 +373,7 @@ class SampleEmbedder:
         checkpoint_every: int = 500,
         snp_only: bool = False,
         output_layer: int | None = None,
+        backend: Backend = "dnabert2",
     ) -> dict[Fingerprint, torch.Tensor]:
         """
         Run `model` over every unique window in `dataset` and return a
@@ -343,6 +382,8 @@ class SampleEmbedder:
         Parameters
         ----------
         model            : a HuggingFace model returning last_hidden_state
+                           (``backend="dnabert2"``) or one supporting
+                           ``output_hidden_states=True`` (``backend="plantcad"``).
         tokenizer        : matching HuggingFace tokenizer
         batch_size       : sequences per forward pass
         max_length       : tokenizer max_length
@@ -355,11 +396,16 @@ class SampleEmbedder:
                            Windows with no alt alleles fall back to full-window
                            pooling. Incompatible with checkpoints produced
                            without this flag — delete any existing checkpoint
-                           before switching modes.
+                           before switching modes. Requires
+                           ``backend="dnabert2"``.
         output_layer     : if set, extract hidden states from this encoder layer
                            index (0-based; negative indices count from the end)
                            instead of the final layer. Incompatible with
                            checkpoints produced with a different layer setting.
+        backend          : ``"dnabert2"`` (default) or ``"plantcad"`` — see
+                           :class:`WindowEmbedder`. PlantCAD outputs are RC-
+                           averaged inside the embedder, so the returned
+                           tensors are ``hidden_size // 2`` wide.
 
         Returns
         -------
@@ -375,6 +421,7 @@ class SampleEmbedder:
         embedder = WindowEmbedder(
             model, tokenizer, max_length=max_length,
             snp_only=snp_only, output_layer=output_layer,
+            backend=backend,
         ).to(device).eval()
 
         # ── Resume from checkpoint if one exists ─────────────────────────────
