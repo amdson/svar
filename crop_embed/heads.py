@@ -69,19 +69,41 @@ class LinearHead(nn.Module):
         return self.linear(window_emb.mean(dim=1))
 
 
+class _ResidualBlock(nn.Module):
+    """LayerNorm → Linear → GELU → Dropout with a residual skip (in/out dim equal)."""
+
+    def __init__(self, dim: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.block(x)
+
+
 class MLPHead(nn.Module):
     """
-    Mean-pool over windows → 2-layer GELU MLP → n_traits.
+    Mean-pool over windows → input projection → `n_layers` residual GELU blocks
+    → Linear → n_traits.
 
     A step up from LinearHead when the relationship between pooled-embedding
-    coordinates and traits isn't well captured by a single affine map.
+    coordinates and traits isn't well captured by a single affine map. Skip
+    connections (`x + block(x)`) run at `hidden_dim`, so depth can grow without
+    the optimization/vanishing-gradient pain of a plain stacked MLP.
 
     Parameters
     ----------
     emb_dim    : window embedding dimension (must match the embedder).
     n_traits   : number of regression outputs.
-    hidden_dim : MLP hidden width. Defaults to emb_dim.
-    dropout    : dropout probability applied between the two linear layers.
+    hidden_dim : width of the projection + residual blocks. Defaults to emb_dim.
+    n_layers   : number of residual blocks after the input projection. With
+                 n_layers=0 this reduces to the original single-hidden-layer MLP
+                 (projection → output), minus the residual path.
+    dropout    : dropout probability in the projection and inside each block.
     """
 
     def __init__(
@@ -89,20 +111,27 @@ class MLPHead(nn.Module):
         emb_dim: int,
         n_traits: int,
         hidden_dim: int | None = None,
+        n_layers: int = 2,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
         hidden_dim = hidden_dim or emb_dim
-        self.mlp = nn.Sequential(
+        self.input_proj = nn.Sequential(
             nn.Linear(emb_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, n_traits),
         )
+        self.blocks = nn.ModuleList(
+            _ResidualBlock(hidden_dim, dropout) for _ in range(n_layers)
+        )
+        self.output = nn.Linear(hidden_dim, n_traits)
 
     def forward(self, window_emb: torch.Tensor) -> torch.Tensor:
         # window_emb: (B, n_windows, D)
-        return self.mlp(window_emb.mean(dim=1))
+        x = self.input_proj(window_emb.mean(dim=1))
+        for block in self.blocks:
+            x = block(x)
+        return self.output(x)
 
 
 class AttentionHead(nn.Module):
