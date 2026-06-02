@@ -122,8 +122,13 @@ parser.add_argument("--wandb-name", type=str, default=None)
 # Modes / I/O
 parser.add_argument("--sanity-check", action="store_true",
                     help="Compare two-pass encoder grads against a naive single-pass "
-                         "autograd reference on one batch, then exit. Use a small "
-                         "--batch-size and --chunk-size so the naive pass fits.")
+                         "autograd reference on a small synthetic window set, then "
+                         "exit. Correctness is window-count-independent, so this stays "
+                         "tiny regardless of --batch-size.")
+parser.add_argument("--sanity-windows", type=int, default=64,
+                    help="# of unique windows to test in --sanity-check. Kept small so "
+                         "the naive full-graph reference fits; chunk size is shrunk to "
+                         "force several chunks.")
 parser.add_argument("--output", type=str, default=None,
                     help="Path to write model.pt. Required unless --sanity-check.")
 
@@ -160,7 +165,6 @@ def embed_chunked_nograd(encoder, sequences, fingerprints):
                                     fingerprints[i:i + args.chunk_size]))
     return torch.cat(outs, dim=0)
 
-
 def accumulate_encoder_grads(encoder, sequences, fingerprints, grad):
     """PASS 2: recompute each chunk WITH grad and backprop the cached dL/dE slice."""
     start = 0
@@ -183,27 +187,46 @@ def predict_nograd(encoder, head, dataset, sample_indices):
 
 # ── Sanity check: two-pass grads vs. naive single-pass reference ──────────────
 
-def run_sanity_check(encoder, head, dataset, sample_indices, targets):
+def run_sanity_check(encoder, head, dataset, n_traits):
     """
-    On one batch, confirm the manual two-pass accumulates the same encoder + head
-    grads as a plain single-pass autograd (embed all windows WITH grad → head →
-    backward). Both run in eval() so they're deterministic. Use a small batch and
-    --chunk-size so the naive reference's full graph fits in memory.
+    Validate the two-pass gradient machinery against a naive single-pass autograd
+    reference (embed all windows WITH grad → head → backward), both in eval() so
+    they're deterministic.
+
+    Crucially this runs on a SMALL synthetic problem — the first --sanity-windows
+    unique fingerprints — NOT a real batch. A real sample spans ~20k windows, so
+    the naive reference's full graph would itself OOM (the very thing the two-pass
+    avoids). Correctness of the chunked recompute is independent of the window
+    count; it only needs >1 chunk, so we shrink the window set and the chunk size
+    to keep the reference tiny while still exercising the chunk boundaries.
     """
     encoder.eval()
     head.eval()
-    sequences, fingerprints, inverse = dataset.gather_batch(sample_indices.cpu())
-    inv = inverse.to(device)
+    n_win = min(args.sanity_windows, len(dataset.unique_fingerprints))
+    # Force several chunks even if --chunk-size is large; helpers read args.chunk_size.
+    args.chunk_size = max(1, min(args.chunk_size, n_win // 4))
+    print(f"sanity: {n_win} windows, chunk_size={args.chunk_size} "
+          f"({-(-n_win // args.chunk_size)} chunks)")
+
+    fps = list(dataset.unique_fingerprints[:n_win])
+    sequences = [dataset.extract_sequence(fp) for fp in fps]
+
+    # Synthetic batch: a few fake samples each summing a random subset of windows.
+    gen = torch.Generator().manual_seed(0)
+    B_fake, w = 4, max(2, n_win // 2)
+    inv = torch.randint(0, n_win, (B_fake, w), generator=gen).to(device)
+    targets = torch.randn(B_fake, n_traits, generator=gen).to(device)
+
     tracked = list(encoder.named_parameters()) + [("head." + n, p) for n, p in head.named_parameters()]
 
     def snapshot():
         return {n: p.grad.detach().clone() for n, p in tracked if p.grad is not None}
 
-    # Naive reference: one forward over ALL windows, with grad.
+    # Naive reference: one forward over all n_win windows, with grad (fits — n_win small).
     encoder.zero_grad(set_to_none=True)
     head.zero_grad(set_to_none=True)
     with autocast_ctx():
-        E_ref = encoder(sequences, fingerprints)
+        E_ref = encoder(sequences, fps)
         loss_ref = masked_mse(head(E_ref, inv), targets)
     loss_ref.backward()
     ref = snapshot()
@@ -211,11 +234,11 @@ def run_sanity_check(encoder, head, dataset, sample_indices, targets):
     # Manual two-pass.
     encoder.zero_grad(set_to_none=True)
     head.zero_grad(set_to_none=True)
-    E = embed_chunked_nograd(encoder, sequences, fingerprints).requires_grad_(True)
+    E = embed_chunked_nograd(encoder, sequences, fps).requires_grad_(True)
     with autocast_ctx():
         loss_tp = masked_mse(head(E, inv), targets)
     loss_tp.backward()
-    accumulate_encoder_grads(encoder, sequences, fingerprints, E.grad)
+    accumulate_encoder_grads(encoder, sequences, fps, E.grad)
     tp = snapshot()
 
     # Compare.
@@ -271,12 +294,10 @@ else:
 # No standardizer warm-start in e2e — fingerprint embeddings shift every step.
 head = FPSumHeadModel(inner, emb_dim=emb_dim, normalize=not args.no_normalize).to(device)
 
-# ── Sanity-check mode: run on one batch and exit ──────────────────────────────
+# ── Sanity-check mode: run on a small synthetic problem and exit ──────────────
 
 if args.sanity_check:
-    loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    global_indices, targets = next(iter(loader))
-    ok = run_sanity_check(encoder, head, dataset, global_indices, targets.to(device))
+    ok = run_sanity_check(encoder, head, dataset, n_traits)
     sys.exit(0 if ok else 1)
 
 # ── Optimizer (decay only on inner head Linear weights) ───────────────────────
