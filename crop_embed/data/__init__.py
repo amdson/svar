@@ -19,6 +19,15 @@ from crop_embed.data.coords import (
     FLANKING_PATH,
     SNP_INFO_PATH,
 )
+from crop_embed.data.loading import (
+    DEFAULT_VCF_PATH,
+    build_dataset,
+    load_targets,
+    make_split,
+    save_split,
+    load_split,
+    prepare_data,
+)
 
 __all__ = [
     # vcf
@@ -31,4 +40,7 @@ __all__ = [
     # coords
     "build_msu6_to_msu7_map", "remap_vcf_coordinates", "chrom_name_map",
     "FASTA_PATH", "VCF_PATH", "FLANKING_PATH", "SNP_INFO_PATH",
+    # loading / split caching
+    "DEFAULT_VCF_PATH", "build_dataset", "load_targets", "make_split",
+    "save_split", "load_split", "prepare_data",
 ]

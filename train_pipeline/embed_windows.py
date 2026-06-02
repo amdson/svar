@@ -1,5 +1,5 @@
 """
-generate_cache.py
+embed_windows.py
 -----------------
 Precompute a FixedWindowEmbedder cache for a VCF + reference FASTA + a DNA
 language model, and write it to disk in a format that demo_train.py's --cache

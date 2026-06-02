@@ -15,13 +15,11 @@ Usage
 -----
     from crop_embed import (
         UniqueWindowDataset, SampleDataset, SNPWindowPartitioner,
-        WindowEmbedder, BatchedWindowEmbedder, FixedWindowEmbedder,
-        LinearHead, train,
+        BatchedWindowEmbedder, FixedWindowEmbedder,
+        LinearHead, build_window_embedder, train,
     )
-    from DNABERT2_modules import load_dnabert2
 
-    model, tokenizer = load_dnabert2()
-    window_emb = WindowEmbedder(model, tokenizer, max_length=512)
+    window_emb = build_window_embedder(backend="dnabert2", max_length=512)
     head       = LinearHead(emb_dim=768, n_traits=Y.shape[1])
 
     # Y: Tensor[n_samples, n_traits] aligned to dataset.samples order, NaN = missing.

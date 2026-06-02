@@ -54,7 +54,6 @@ import sys
 from pathlib import Path
 
 import torch
-from transformers import AutoTokenizer
 
 # crop_embed and DNABERT2_modules live one level up
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -65,22 +64,14 @@ from crop_embed import (
     FixedWindowEmbedder,
     LinearHead,
     MLPHead,
-    SampleDataset,
-    SNPWindowPartitioner,
-    UniqueWindowDataset,
     WindowEmbedder,
+    build_window_embedder,
     train,
     window_position_features,
 )
 from crop_embed.data.coords import FASTA_PATH
-from crop_embed.data.preprocessing import (
-    DEFAULT_PHENO_PATH,
-    align_targets_to_dataset,
-    load_phenotypes,
-    scale_phenotypes,
-)
-from crop_embed.data.vcf import load_snps_from_vcf
-from DNABERT2_modules import load_dnabert2
+from crop_embed.data.loading import prepare_data
+from crop_embed.data.preprocessing import DEFAULT_PHENO_PATH
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -140,7 +131,12 @@ parser.add_argument("--log-every",  type=int,   default=50)
 parser.add_argument("--seed",       type=int,   default=42)
 parser.add_argument("--test-split", type=float, default=0.30,
                     help="Fraction of samples held out for test evaluation (default 0.30). "
-                         "Split is rebuilt deterministically from --seed every run.")
+                         "Only used when --split is not given; otherwise rebuilt "
+                         "deterministically from --seed every run.")
+parser.add_argument("--split", type=str, default=None,
+                    help="Path to a cached split file (scripts/cache_split.py). "
+                         "Loads the exact same train/val samples used by other runs; "
+                         "falls back to a fresh --seed/--test-split split if unset.")
 
 # I/O
 parser.add_argument("--output-dir", type=str, default="trained_heads")
@@ -169,47 +165,27 @@ torch.manual_seed(args.seed)
 if args.positional and args.head != "attention":
     parser.error("--positional only applies to --head attention")
 
-# ── Build dataset ─────────────────────────────────────────────────────────────
+# ── Build dataset, targets, and train/val split ───────────────────────────────
+#
+# All of this (VCF → dataset, phenotype align/scale, and the deterministic
+# split) lives in crop_embed.data.loading so a cache, a split file, and a
+# training run can't silently disagree on windowing or sample membership.
 
-print("Loading SNPs from VCF …")
-snps_by_chrom, samples = load_snps_from_vcf(args.vcf_path)
-n_snps = sum(len(v) for v in snps_by_chrom.values())
-print(f"  {n_snps:,} SNPs | {len(snps_by_chrom)} chromosomes | {len(samples)} samples")
-
-print("Building SNPWindowPartitioner …")
-partitioner = SNPWindowPartitioner(
-    snps_by_chrom, half_window=args.half_window, buffer=args.buffer
+data = prepare_data(
+    vcf_path=args.vcf_path,
+    fasta_path=args.fasta_path,
+    pheno_path=args.pheno_path,
+    half_window=args.half_window,
+    buffer=args.buffer,
+    split_path=args.split,
+    test_split=args.test_split,
+    seed=args.seed,
 )
-stats = partitioner.snps_per_window_stats()
-print(f"  {stats['n_windows']:,} windows "
-      f"(mean {stats['mean']:.1f} SNPs/window)")
-
-print("Building UniqueWindowDataset …")
-dataset = UniqueWindowDataset(args.vcf_path, args.fasta_path, partitioner)
-print(f"  {len(dataset):,} unique windows; {len(dataset.samples)} samples")
-
-# ── Load and align phenotypes ─────────────────────────────────────────────────
-
-print(f"Loading phenotypes from {args.pheno_path} …")
-pheno_df, trait_cols = load_phenotypes(args.pheno_path)
-Y_np = align_targets_to_dataset(dataset, pheno_df, trait_cols)
-Y_np = scale_phenotypes(Y_np)                          # per-trait z-score, NaN-safe
-Y    = torch.tensor(Y_np, dtype=torch.float32)
-n_with_pheno = (~torch.isnan(Y).all(dim=1)).sum().item()
-print(f"  {Y.shape[1]} traits; {n_with_pheno}/{Y.shape[0]} samples have phenotype data")
-
-# ── Train / test split ────────────────────────────────────────────────────────
-
-_n_total  = len(dataset.samples)
-_rng      = torch.Generator().manual_seed(args.seed)
-_perm     = torch.randperm(_n_total, generator=_rng)
-_n_test   = round(_n_total * args.test_split)
-test_idx  = _perm[:_n_test]
-train_idx = _perm[_n_test:]
-print(f"Train/test split: {len(train_idx)} train / {_n_test} test  (seed={args.seed}, split={args.test_split})")
-
-train_dataset = SampleDataset(dataset, Y, train_idx)
-val_dataset   = SampleDataset(dataset, Y, test_idx)
+dataset       = data["dataset"]
+Y             = data["Y"]
+trait_cols    = data["trait_cols"]
+train_dataset = data["train_dataset"]
+val_dataset   = data["val_dataset"]
 
 # ── Inspect resume checkpoint (if any) to figure out which phase to enter ────
 
@@ -246,17 +222,10 @@ if args.resume:
 
 def _load_dnabert() -> tuple[WindowEmbedder, int]:
     print(f"\nLoading DNABERT-2 from {args.model_path} …")
-    _local    = os.path.isdir(args.model_path)
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path, trust_remote_code=True, use_fast=False, local_files_only=_local,
+    we = build_window_embedder(
+        backend="dnabert2", model_path=args.model_path, max_length=args.max_length,
     )
-    model, _  = load_dnabert2(
-        repo_id=args.model_path,
-        add_pooling_layer=False,
-        config_overrides={"pad_token_id": tokenizer.pad_token_id},
-    )
-    we = WindowEmbedder(model, tokenizer, max_length=args.max_length)
-    return we, model.config.hidden_size
+    return we, we.model.config.hidden_size
 
 window_emb: WindowEmbedder | None = None
 fixed:      FixedWindowEmbedder | None = None
