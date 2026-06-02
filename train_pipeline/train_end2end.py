@@ -3,16 +3,14 @@ train_end2end.py
 -----------------
 Train the DNA encoder (embedder) and head jointly. The genome is partitioned into
 ~20k windows, so a batch of ~10 samples references tens of thousands of unique
-fingerprint windows. Building the full encoder autograd graph over all of those
-windows at once OOMs by orders of magnitude (a transformer caches per-layer
-activations for every window it forwards under grad), so we use manual activation
+fingerprint windows. We use manual activation
 checkpointing: embed once WITHOUT a graph to get per-fingerprint gradients, then
 recompute the encoder in chunks to accumulate its parameter gradients.
 
 The output is a saved ckpt with the head + embedder state_dicts and the metadata
 needed to reconstruct both for inference.
 
-v1 (this file) runs the encoder in eval() — dropout off — so the pass-1 and pass-2
+v1 (this file) runs the encoder in eval() so the pass-1 and pass-2
 forwards are bit-identical without any RNG bookkeeping. Validate it with
 --sanity-check before trusting it (compares the two-pass encoder grads against a
 naive single-pass autograd reference). Encoder dropout + per-chunk RNG handling is
