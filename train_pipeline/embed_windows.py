@@ -34,7 +34,8 @@ Examples
     # DNABERT-2 (default)
     python scripts/generate_cache.py \\
         --half-window 500 --buffer 0 --max-length 2048 --batch-size 64 \\
-        --output checkpoints/v1/sativas413_embeddings.ckpt.pt
+        --output checkpoints/sativas413_embeddings.ckpt.pt
+    python train_pipeline/embed_windows.py --half-window 500 --buffer 0 --max-length 2048 --batch-size 64 --output checkpoints/sativas413_embeddings.ckpt.pt
 
     # PlantCAD — note half_window <= 256 (PlantCAD's input cap is 512 bp)
     python scripts/generate_cache.py --backend plantcad \\
@@ -64,7 +65,8 @@ from crop_embed import (
 from crop_embed.data.coords import FASTA_PATH
 from crop_embed.data.vcf import load_snps_from_vcf
 
-DEFAULT_VCF_PATH    = "/home/andrew.dickson/rice_data/sativas413_msu7_final.vcf"
+# DEFAULT_VCF_PATH    = "/home/andrew.dickson/rice_data/sativas413_msu7_final.vcf"
+DEFAULT_VCF_PATH    = "/home/andrew/rice_data/sativas413_msu7_final.vcf"
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
