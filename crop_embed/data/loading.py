@@ -37,7 +37,7 @@ from crop_embed.data.preprocessing import (
 )
 from crop_embed.data.vcf import load_snps_from_vcf
 
-DEFAULT_VCF_PATH = "/home/andrew.dickson/rice_data/sativas413_msu7_final.vcf"
+DEFAULT_VCF_PATH = "/home/andrew/rice_data/sativas413_msu7_final.vcf"
 
 
 def build_dataset(
@@ -121,7 +121,6 @@ def make_split(
     val_idx = shuffled[:n_val]
     train_idx = shuffled[n_val:]
     return train_idx, val_idx
-
 
 def save_split(
     path: str | Path,
@@ -244,3 +243,5 @@ def prepare_data(
         "train_dataset": SampleDataset(dataset, Y, train_idx),
         "val_dataset": SampleDataset(dataset, Y, val_idx),
     }
+
+    

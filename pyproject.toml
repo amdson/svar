@@ -7,23 +7,49 @@ name = "crop_embed"
 version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = [
+    # numerics / data
     "numpy",
     "pandas",
-    "peft",
+    "scipy",
+    "scikit-learn",
+    "tqdm",
+    # bioinformatics
+    "biopython",
     "pyfaidx",
     "pysam",
-    "scikit-learn",
-    "scipy",
+    # deep learning + HF stack
     "torch",
     "transformers",
+    "peft",
+    "einops",
+    "huggingface-hub",
+    "safetensors",
 ]
 
-# PlantCAD (Caduceus / Mamba) backbone — opt-in extra. Upstream pins
+[project.optional-dependencies]
+# Experiment tracking — wandb is lazy-imported in crop_embed/logging_utils.py
+# and only needed when --wandb-project is passed to a training run.
+tracking = ["wandb"]
+
+# Custom Triton flash-attention kernel in DNABERT2_modules/flash_attn_triton.py.
+# The bundled kernel targets Triton 1.x/2.x and produces non-deterministic
+# output on Triton 3.x — pin <3 if you opt in. GPU-only.
+flash-attn = ["triton<3"]
+
+# PlantCAD (Caduceus / Mamba) backbone. Upstream pins
 # torch==2.3.1+cu121 / triton==2.3.1 / mamba-ssm==2.2.2; install into a
 # dedicated env to avoid clashing with the DNABERT-2 stack. See
 # PlantCAD_modules/loader.py for the runtime caveats.
-[project.optional-dependencies]
-plantcad = ["mamba-ssm"]
+plantcad = ["mamba-ssm==2.2.2"]
+
+# Analysis notebooks under notebooks/ and train_pipeline/track_training.ipynb.
+notebooks = [
+    "matplotlib",
+    "umap-learn",
+    "xgboost",
+    "ipython",
+    "jupyterlab",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
