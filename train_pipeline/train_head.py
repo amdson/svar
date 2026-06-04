@@ -27,6 +27,7 @@ Example
         --cache checkpoints/v2/sativas413_embeddings.ckpt.pt \\
         --head mlp --epochs 100 --lr 1e-3 --warm-start-standardizer \\
         --output trained_heads/mlp_sum/model.pt
+python train_pipeline/train_head.py --cache checkpoints/sativas413_embeddings.ckpt.pt --head linear --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/linear_sum/model.pt
 """
 import argparse
 import sys

@@ -183,7 +183,7 @@ class FPSumHeadModel(nn.Module):
         # embedding_bag fuses the gather and the per-row sum, so the (B, n_gather, D)
         # intermediate that fp_emb[gather_ind].sum(1) would build never materializes.
         # A 2D index tensor is treated as one equal-length bag per row -> (B, D).
-        summed = F.embedding_bag(gather_ind, fp_emb, mode="sum")   # (B, D)
+        summed = F.embedding_bag(gather_ind, fp_emb, mode="mean")   # (B, D)
         return self.model(self.norm(summed))
     
     def forward_postsum(self, summed_emb: torch.Tensor) -> torch.Tensor:

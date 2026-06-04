@@ -12,9 +12,7 @@ against whatever dataset you hand it.
 
 Example
 -------
-    python scripts/cache_split.py \\
-        --test-split 0.30 --seed 42 \\
-        --output splits/sativas413_seed42.pt
+    python scripts/cache_split.py --test-split 0.30 --seed 42 --output splits/sativas413_seed42.pt
 """
 
 import argparse
