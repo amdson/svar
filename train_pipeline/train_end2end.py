@@ -176,7 +176,6 @@ def accumulate_encoder_grads(encoder, sequences, fingerprints, grad):
         e_c.backward(gradient=grad[start:start + n].to(e_c.dtype))
         start += n
 
-
 def predict_nograd(encoder, head, dataset, sample_indices):
     """Full forward with no graph: chunked-embed the batch's windows, then head."""
     sequences, fingerprints, inverse = dataset.gather_batch(sample_indices.cpu())

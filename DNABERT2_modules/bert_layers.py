@@ -31,7 +31,40 @@ try:
 except ImportError as e:
     flash_attn_qkvpacked_func = None
 
+try:
+    # FlashAttention >= 2.4 exposes native ALiBi support via `alibi_slopes`.
+    from flash_attn import flash_attn_varlen_qkvpacked_func
+except ImportError as e:
+    flash_attn_varlen_qkvpacked_func = None
+
 logger = logging.getLogger(__name__)
+
+
+def _get_alibi_head_slopes(n_heads: int) -> List[float]:
+    """ALiBi per-head slopes (positive), following Press et al.
+
+    The bias added to the attention score of query i / key j is
+    `-slope * |i - j|`, which matches both the dense-bias construction used by
+    the triton/torch paths and FlashAttention's `alibi_slopes` convention.
+    """
+
+    def get_slopes_power_of_2(n_heads: int) -> List[float]:
+        start = (2**(-2**-(math.log2(n_heads) - 3)))
+        ratio = start
+        return [start * ratio**i for i in range(n_heads)]
+
+    # In the paper, they only train models that have 2^a heads for some a. This
+    # function has some good properties that only occur when the input is a
+    # power of 2. To maintain that even when the number of heads is not a power
+    # of 2, we use a workaround.
+    if math.log2(n_heads).is_integer():
+        return get_slopes_power_of_2(n_heads)
+
+    closest_power_of_2 = 2**math.floor(math.log2(n_heads))
+    slopes_a = get_slopes_power_of_2(closest_power_of_2)
+    slopes_b = _get_alibi_head_slopes(2 * closest_power_of_2)
+    slopes_b = slopes_b[0::2][:n_heads - closest_power_of_2]
+    return slopes_a + slopes_b
 
 
 class BertEmbeddings(nn.Module):
@@ -122,45 +155,93 @@ class BertUnpadSelfAttention(nn.Module):
         self.p_dropout = config.attention_probs_dropout_prob
         self.Wqkv = nn.Linear(self.all_head_size, 3 * config.hidden_size)
 
-        # Warn if defaulting to pytorch because of import issues
-        if flash_attn_qkvpacked_func is None:
-            warnings.warn(
-                'Unable to import Triton; defaulting MosaicBERT attention implementation to pytorch (this will reduce throughput when using this model).'
+        # Resolve which attention kernel to use, falling back when the requested
+        # one is unavailable in this environment.
+        self.attn_impl = self._resolve_attn_impl(
+            getattr(config, 'attn_impl', 'flash'))
+
+    def _resolve_attn_impl(self, requested: str) -> str:
+        if requested not in ('flash', 'triton', 'torch'):
+            raise ValueError(
+                f"Unknown attn_impl '{requested}'; expected 'flash', 'triton', or 'torch'."
             )
+        if requested == 'flash' and flash_attn_varlen_qkvpacked_func is None:
+            warnings.warn(
+                'attn_impl="flash" requested but `flash-attn` (>= 2.4) is not installed; '
+                'falling back to the triton/torch attention path.')
+            requested = 'triton'
+        if requested == 'triton' and flash_attn_qkvpacked_func is None:
+            warnings.warn(
+                'attn_impl="triton" requested but the Triton kernel is unavailable; '
+                'falling back to the pure-PyTorch attention path.')
+            requested = 'torch'
+        if requested == 'triton' and self.p_dropout:
+            # The Triton kernel only supports 0 attention dropout.
+            warnings.warn(
+                'attn_impl="triton" does not support attention dropout > 0; '
+                'falling back to the pure-PyTorch attention path.')
+            requested = 'torch'
+        return requested
 
     def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor,
                 max_seqlen_in_batch: int, indices: torch.Tensor,
-                attn_mask: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+                attn_mask: torch.Tensor, bias: torch.Tensor,
+                alibi_slopes: torch.Tensor) -> torch.Tensor:
         """Perform self-attention.
 
-        If dropout is zero, then we can use the Triton kernel, so we do that. However, if not, we send through a standard PyTorch
-        implementation of self-attention.
-
-        The arguments are unpadded, and our implementations of attention require padded arguments,
-        so we first call `pad_input`. Once we compute attention, we re-unpad our outputs for the other layers.
-        The pad/unpad operations add overhead, but not sending pad tokens through ffs saves compute.
-        It is possible to write an unpadded implementation of attention (in Triton and PyTorch), which we will eventually do.
+        The 'flash' path uses FlashAttention's varlen kernel directly on the
+        unpadded layout, computing ALiBi from per-head `alibi_slopes` in-kernel
+        (no dense bias, no pad/unpad round-trip). The 'triton' and 'torch' paths
+        require the padded layout and a pre-materialized dense `bias`, so they
+        first `pad_input` and re-`unpad` their output.
 
         Args:
             hidden_states: (total_nnz, dim)
             cu_seqlens: (batch + 1,)
             max_seqlen_in_batch: int
-            indices: (total_nnz,)
-            attn_mask: (batch, max_seqlen_in_batch)
-            bias: (batch, heads, max_seqlen_in_batch, max_seqlen_in_batch)
+            indices: (total_nnz,) — only used by the triton/torch paths
+            attn_mask: (batch, max_seqlen_in_batch) — only used by triton/torch
+            bias: (batch, heads, max_seqlen_in_batch, max_seqlen_in_batch) —
+                only used by triton/torch ('flash' passes None)
+            alibi_slopes: (heads,) fp32 — only used by the flash path
 
         Returns:
             attention: (total_nnz, dim)
         """
         qkv = self.Wqkv(hidden_states)
+
+        if self.attn_impl == 'flash':
+            # Operate directly on the unpadded (total_nnz, 3, h, d) layout.
+            qkv = rearrange(qkv,
+                            'nnz (t h d) -> nnz t h d',
+                            t=3,
+                            h=self.num_attention_heads)
+            convert_dtype = qkv.dtype not in [torch.float16, torch.bfloat16]
+            orig_dtype = qkv.dtype
+            if convert_dtype:
+                qkv = qkv.to(torch.float16)
+            attention = flash_attn_varlen_qkvpacked_func(
+                qkv,
+                cu_seqlens.to(torch.int32),
+                max_seqlen_in_batch,
+                dropout_p=self.p_dropout if self.training else 0.0,
+                softmax_scale=None,
+                causal=False,
+                alibi_slopes=alibi_slopes,
+            )
+            if convert_dtype:
+                attention = attention.to(orig_dtype)
+            # Already unpadded: (total_nnz, h, d)
+            return rearrange(attention, 'nnz h d -> nnz (h d)')
+
+        # triton / torch paths require the padded layout and a dense bias.
         qkv = pad_input(qkv, indices, cu_seqlens.shape[0] - 1,
                         max_seqlen_in_batch)  # batch, max_seqlen_in_batch, thd
         qkv = rearrange(qkv,
                         'b s (t h d) -> b s t h d',
                         t=3,
                         h=self.num_attention_heads)
-        if self.p_dropout or flash_attn_qkvpacked_func is None:
-            # if we have nonzero attention dropout (e.g. during fine-tuning) or no Triton, compute attention in PyTorch
+        if self.attn_impl == 'torch':
             q = qkv[:, :, 0, :, :].permute(0, 2, 1, 3)  # b h s d
             k = qkv[:, :, 1, :, :].permute(0, 2, 3, 1)  # b h d s
             v = qkv[:, :, 2, :, :].permute(0, 2, 1, 3)  # b h s d
@@ -226,6 +307,7 @@ class BertUnpadAttention(nn.Module):
         indices: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
+        alibi_slopes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass for scaled self-attention without padding.
 
@@ -238,9 +320,10 @@ class BertUnpadAttention(nn.Module):
             indices: None or (total_nnz,)
             attn_mask: None or (batch, max_seqlen_in_batch)
             bias: None or (batch, heads, max_seqlen_in_batch, max_seqlen_in_batch)
+            alibi_slopes: None or (heads,) fp32 — used by the flash path
         """
         self_output = self.self(input_tensor, cu_seqlens, max_s, indices,
-                                attn_mask, bias)
+                                attn_mask, bias, alibi_slopes)
         if subset_idx is not None:
             return self.output(index_first_axis(self_output, subset_idx),
                                index_first_axis(input_tensor, subset_idx))
@@ -313,6 +396,7 @@ class BertLayer(nn.Module):
         indices: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
+        alibi_slopes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass for a BERT layer, including both attention and MLP.
 
@@ -325,9 +409,11 @@ class BertLayer(nn.Module):
             indices: None or (total_nnz,)
             attn_mask: None or (batch, max_seqlen_in_batch)
             bias: None or (batch, heads, max_seqlen_in_batch, max_seqlen_in_batch)
+            alibi_slopes: None or (heads,) fp32 — used by the flash path
         """
         attention_output = self.attention(hidden_states, cu_seqlens, seqlen,
-                                          subset_idx, indices, attn_mask, bias)
+                                          subset_idx, indices, attn_mask, bias,
+                                          alibi_slopes)
         layer_output = self.mlp(attention_output)
         return layer_output
 
@@ -349,7 +435,18 @@ class BertEncoder(nn.Module):
             [copy.deepcopy(layer) for _ in range(config.num_hidden_layers)])
 
         self.num_attention_heads = config.num_attention_heads
+        self.attn_impl = getattr(config, 'attn_impl', 'flash')
 
+        # Per-head ALiBi slopes (positive), used by the flash path to compute the
+        # bias in-kernel. Registered as a non-persistent buffer so it follows the
+        # model's device/dtype moves but stays out of the state_dict.
+        self.register_buffer(
+            'alibi_slopes',
+            torch.tensor(_get_alibi_head_slopes(self.num_attention_heads),
+                         dtype=torch.float32),
+            persistent=False)
+
+        # The dense ALiBi+mask bias is only needed by the triton/torch paths.
         # The alibi mask will be dynamically expanded if it is too small for
         # the input the model receives. But it generally helps to initialize it
         # to a reasonably large size to help pre-allocate CUDA memory.
@@ -369,26 +466,6 @@ class BertEncoder(nn.Module):
         # of the logits, which makes the math work out *after* applying causal masking. If no causal masking
         # will be applied, it is necessary to construct the diagonal mask.
         n_heads = self.num_attention_heads
-
-        def _get_alibi_head_slopes(n_heads: int) -> List[float]:
-
-            def get_slopes_power_of_2(n_heads: int) -> List[float]:
-                start = (2**(-2**-(math.log2(n_heads) - 3)))
-                ratio = start
-                return [start * ratio**i for i in range(n_heads)]
-
-            # In the paper, they only train models that have 2^a heads for some a. This function
-            # has some good properties that only occur when the input is a power of 2. To
-            # maintain that even when the number of heads is not a power of 2, we use a
-            # workaround.
-            if math.log2(n_heads).is_integer():
-                return get_slopes_power_of_2(n_heads)
-
-            closest_power_of_2 = 2**math.floor(math.log2(n_heads))
-            slopes_a = get_slopes_power_of_2(closest_power_of_2)
-            slopes_b = _get_alibi_head_slopes(2 * closest_power_of_2)
-            slopes_b = slopes_b[0::2][:n_heads - closest_power_of_2]
-            return slopes_a + slopes_b
 
         context_position = torch.arange(size, device=device)[:, None]
         memory_position = torch.arange(size, device=device)[None, :]
@@ -414,11 +491,6 @@ class BertEncoder(nn.Module):
         output_layer: Optional[int] = None,
     ) -> Tuple[List[torch.Tensor], Optional[torch.Tensor]]:
 
-        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        extended_attention_mask = extended_attention_mask.to(
-            dtype=torch.float32)  # fp16 compatibility
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-
         attention_mask_bool = attention_mask.bool()
         batch, seqlen = hidden_states.shape[:2]
         # Unpad inputs and mask. It will remove tokens that are padded.
@@ -429,19 +501,36 @@ class BertEncoder(nn.Module):
         hidden_states, indices, cu_seqlens, _ = unpad_input(
             hidden_states, attention_mask_bool)
 
-        # Add alibi matrix to extended_attention_mask
-        if self._current_alibi_size < seqlen:
-            # Rebuild the alibi tensor when needed
-            warnings.warn(
-                f'Increasing alibi size from {self._current_alibi_size} to {seqlen}'
-            )
-            self.rebuild_alibi_tensor(size=seqlen, device=hidden_states.device)
-        elif self.alibi.device != hidden_states.device:
-            # Device catch-up
-            self.alibi = self.alibi.to(hidden_states.device)
-        alibi_bias = self.alibi[:, :, :seqlen, :seqlen]
-        attn_bias = extended_attention_mask[:, :, :seqlen, :seqlen]
-        alibi_attn_mask = attn_bias + alibi_bias
+        if self.attn_impl == 'flash':
+            # FlashAttention computes ALiBi in-kernel from per-head slopes, and
+            # padding is fully encoded by cu_seqlens, so no dense bias/mask is
+            # built. Pass slopes (kept on the right device) down to each layer.
+            alibi_slopes = self.alibi_slopes.to(device=hidden_states.device)
+            alibi_attn_mask = None
+        else:
+            # triton / torch paths need a dense (batch, heads, seq, seq) bias
+            # that combines the ALiBi slopes with the padding mask.
+            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            extended_attention_mask = extended_attention_mask.to(
+                dtype=torch.float32)  # fp16 compatibility
+            extended_attention_mask = (1.0 -
+                                       extended_attention_mask) * -10000.0
+
+            # Add alibi matrix to extended_attention_mask
+            if self._current_alibi_size < seqlen:
+                # Rebuild the alibi tensor when needed
+                warnings.warn(
+                    f'Increasing alibi size from {self._current_alibi_size} to {seqlen}'
+                )
+                self.rebuild_alibi_tensor(size=seqlen,
+                                          device=hidden_states.device)
+            elif self.alibi.device != hidden_states.device:
+                # Device catch-up
+                self.alibi = self.alibi.to(hidden_states.device)
+            alibi_bias = self.alibi[:, :, :seqlen, :seqlen]
+            attn_bias = extended_attention_mask[:, :, :seqlen, :seqlen]
+            alibi_attn_mask = attn_bias + alibi_bias
+            alibi_slopes = None
 
         # Resolve negative layer index once so we can compare against loop index
         n_layers = len(self.layer)
@@ -465,7 +554,8 @@ class BertEncoder(nn.Module):
                                              None,
                                              indices,
                                              attn_mask=attention_mask,
-                                             bias=alibi_attn_mask)
+                                             bias=alibi_attn_mask,
+                                             alibi_slopes=alibi_slopes)
                 if output_all_encoded_layers:
                     all_encoder_layers.append(hidden_states)
                 if target_layer is not None and i == target_layer:
@@ -490,7 +580,8 @@ class BertEncoder(nn.Module):
                                              None,
                                              indices,
                                              attn_mask=attention_mask,
-                                             bias=alibi_attn_mask)
+                                             bias=alibi_attn_mask,
+                                             alibi_slopes=alibi_slopes)
                 if output_all_encoded_layers:
                     all_encoder_layers.append(hidden_states)
                 if target_layer is not None and i == target_layer:
@@ -503,7 +594,8 @@ class BertEncoder(nn.Module):
                                            subset_idx=subset_idx,
                                            indices=indices,
                                            attn_mask=attention_mask,
-                                           bias=alibi_attn_mask)
+                                           bias=alibi_attn_mask,
+                                           alibi_slopes=alibi_slopes)
             if intermediate_unpadded is not None:
                 intermediate_hidden_states = pad_input(
                     intermediate_unpadded, indices, batch, seqlen)
