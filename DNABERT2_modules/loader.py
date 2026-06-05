@@ -89,6 +89,7 @@ def load_dnabert2(
 def load_dnabert2_mlm(
     repo_id: str = _DEFAULT_REPO,
     device: str | torch.device | None = None,
+    config_overrides: dict | None = None,
 ) -> tuple[BertForMaskedLM, AutoTokenizer]:
     """
     Load DNABERT-2 as BertForMaskedLM (encoder + MLM prediction head).
@@ -97,10 +98,28 @@ def load_dnabert2_mlm(
     directly onto the model without any prefix manipulation.
     Use this instead of load_dnabert2 when you need output logits (e.g.
     pseudo-perplexity, masked token prediction).
+
+    config_overrides : fields to set on the config before building the model,
+        e.g. ``{"attn_impl": "torch"}`` to run on CPU / without flash-attn (the
+        default "flash" path requires CUDA + the flash-attn package).
     """
     import os
     local = os.path.isdir(repo_id)
     config = BertConfig.from_pretrained(repo_id, local_files_only=local)
+    if config_overrides:
+        for key, val in config_overrides.items():
+            setattr(config, key, val)
+
+    # transformers >= 5 no longer auto-populates these on the config, and the
+    # DNABERT-2 checkpoint's config.json doesn't carry them. BertForMaskedLM /
+    # BertEmbeddings read both, so set them before building the model: pad_token_id
+    # from the tokenizer, is_decoder=False (this is a bidirectional MLM encoder).
+    tokenizer = AutoTokenizer.from_pretrained(
+        repo_id, trust_remote_code=True, use_fast=False, local_files_only=local
+    )
+    if getattr(config, "pad_token_id", None) is None:
+        config.pad_token_id = tokenizer.pad_token_id
+    config.is_decoder = getattr(config, "is_decoder", False)
 
     model = BertForMaskedLM(config)
     state_dict = _download_weights(repo_id)
@@ -120,9 +139,68 @@ def load_dnabert2_mlm(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device).eval()
 
+    return model, tokenizer
+
+
+def load_dnabert2_variant_cache_mlm(
+    repo_id: str = _DEFAULT_REPO,
+    device: str | torch.device | None = None,
+    backend: str = "efficient",
+    config_overrides: dict | None = None,
+):
+    """
+    Load DNABERT-2 as a VariantCacheBertForMaskedLM — the MLM head on top of the
+    variant-cache encoder. Drop-in for load_dnabert2_mlm in the variant-MLM
+    scripts (same call + MaskedLMOutput return), used to measure variant-MLM loss
+    *through the cache approximation*.
+
+    The DNABERT-2 checkpoint stores encoder/embeddings under a 'bert.' prefix and
+    the MLM head under 'cls.'. The variant-cache encoder reuses the standard
+    BertLayer, so 'bert.encoder.layer.*' maps straight onto 'encoder.layer.*'.
+
+    backend          : 'efficient' (log-sum-exp merge) or 'bruteforce' (oracle).
+    config_overrides : e.g. {"attn_impl": "torch"} to run without flash-attn.
+    """
+    import os
+    from .variant_cache_layers import VariantCacheBertForMaskedLM
+
+    local = os.path.isdir(repo_id)
+    config = BertConfig.from_pretrained(repo_id, local_files_only=local)
+    if config_overrides:
+        for key, val in config_overrides.items():
+            setattr(config, key, val)
+
     tokenizer = AutoTokenizer.from_pretrained(
         repo_id, trust_remote_code=True, use_fast=False, local_files_only=local
     )
+    if getattr(config, "pad_token_id", None) is None:
+        config.pad_token_id = tokenizer.pad_token_id
+
+    model = VariantCacheBertForMaskedLM(config)
+    model.set_backend(backend)
+
+    state_dict = _download_weights(repo_id)
+    # Strip the 'bert.' prefix so encoder/embeddings line up; keep 'cls.*' as-is.
+    remapped = {
+        (k[len("bert."):] if k.startswith("bert.") else k): v
+        for k, v in state_dict.items()
+    }
+    missing, unexpected = model.load_state_dict(remapped, strict=False)
+
+    non_trivial_missing = [k for k in missing if "decoder.weight" not in k]
+    if non_trivial_missing:
+        import warnings
+        warnings.warn(f"Missing keys not in checkpoint (random init): {non_trivial_missing}")
+    if unexpected:
+        import warnings
+        warnings.warn(f"Unexpected keys in checkpoint (ignored): {unexpected}")
+
+    _disable_triton_attention(model)
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device).eval()
+
     return model, tokenizer
 
 
