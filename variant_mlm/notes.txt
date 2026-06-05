@@ -34,6 +34,13 @@ Files
   train.py  80/10/10-style masking, AdamW, per-epoch val, saves best model.
             --freeze-backbone trains only the MLM head (drift-free option).
             --backend as above (train through the cache to adapt to it).
+  compare_backends.py
+            Runs exact + a cache backend over the SAME masked windows in one
+            process; prints corpus CE gap, per-window CE, per-token KL(exact||
+            cache); saves a 3-panel matplotlib figure (--output PNG) and a .npz
+            of the raw arrays. This is the headline benign-ness plot.
+            e.g. python variant_mlm/compare_backends.py --half-window 500 \
+                     --limit 2000 --output variant_mlm/backend_compare.png
 
 Status / TODO
 -------------
