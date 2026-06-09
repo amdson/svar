@@ -298,12 +298,22 @@ class FPRefDeltaSumHeadModel(FPSumHeadModel):
         """
         return fp_emb - fp_emb[ref_index]
 
-    def forward(self, fp_emb: torch.Tensor, gather_ind: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        fp_emb: torch.Tensor,
+        gather_ind: torch.Tensor,
+        ref_index: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # fp_emb: (n_fps, D), gather_ind: (B, n_gather)
         # Subtract each window's reference embedding, then pool exactly as
-        # FPSumHeadModel does. The (n_fps, D) delta table backprops into fp_emb.
-        delta  = fp_emb - fp_emb[self.ref_index]                     # (n_fps, D)
-        summed = F.embedding_bag(gather_ind, delta, mode="mean")     # (B, D)
+        # FPSumHeadModel does. The delta table backprops into fp_emb.
+        #
+        # `ref_index` defaults to the stored global buffer (cache-row order). End-
+        # to-end training passes a *batch-local* index instead, because there
+        # fp_emb is only the batch's unique windows, not the full cache.
+        idx    = self.ref_index if ref_index is None else ref_index
+        delta  = fp_emb - fp_emb[idx]                               # (n_fps, D)
+        summed = F.embedding_bag(gather_ind, delta, mode="mean")    # (B, D)
         return self.model(self.norm(summed))
 
 

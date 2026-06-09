@@ -22,7 +22,7 @@ cd /home/andrew/svar
 PY=/home/andrew/anaconda3/envs/svar/bin/python
 
 CACHE_DIR=checkpoints/sweep
-HEAD_DIR=trained_heads/sweep_refdelta
+HEAD_DIR=trained_heads/sweep_refdelta_mean
 LOG_DIR=logs/sweep_refdelta
 mkdir -p "$HEAD_DIR" "$LOG_DIR"
 
