@@ -91,6 +91,10 @@ parser.add_argument("--snp-only", action="store_true",
 parser.add_argument("--output-layer", type=int, default=None, metavar="N",
                     help="Extract hidden states from encoder layer N (0-based; "
                          "negative counts from the end) instead of the final layer.")
+parser.add_argument("--attn-impl", choices=["torch", "flash"], default="torch",
+                    help="DNABERT-2 attention backend: 'torch' (default, pure-PyTorch "
+                         "matmul; needs no flash-attn) or 'flash' (FlashAttention; "
+                         "requires CUDA + the flash-attn package). dnabert2 backend only.")
 
 # Data / windowing
 parser.add_argument("--vcf-path",   type=str, default=DEFAULT_VCF_PATH)
@@ -157,7 +161,9 @@ print(f"  {len(dataset):,} unique windows to embed "
 # ── Load model ────────────────────────────────────────────────────────────────
 
 print(f"\nLoading {args.backend} encoder from {args.model_path} …")
-model, tokenizer = load_encoder_model(args.backend, args.model_path, device=device)
+model, tokenizer = load_encoder_model(
+    args.backend, args.model_path, device=device, attn_impl=args.attn_impl
+)
 
 # ── Embed unique windows (with checkpoint/resume) ────────────────────────────
 
@@ -196,6 +202,7 @@ metadata = {
     "max_length":    args.max_length,
     "snp_only":      args.snp_only,
     "output_layer":  args.output_layer,
+    "attn_impl":     args.attn_impl,
     "emb_dim":       emb_dim,
 
     # Dataset reconstruction

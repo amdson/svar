@@ -27,14 +27,11 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.impute import KNNImputer
 from sklearn.model_selection import train_test_split
 
-# ---------------------------------------------------------------------------
-# Default paths (relative to repo root)
-# ---------------------------------------------------------------------------
-
 _DATA_DIR = Path(__file__).resolve().parents[3] / "rice_data"
 
-DEFAULT_VCF_PATH   = _DATA_DIR / "RiceDiversity_44K_Genotypes_PLINK" / "sativas413_msu7.vcf"
-DEFAULT_PHENO_PATH = _DATA_DIR / "RiceDiversity_44K_Phenotypes_34traits_PLINK.txt"
+# DEFAULT_VCF_PATH   = _DATA_DIR / "RiceDiversity_44K_Genotypes_PLINK" / "sativas413_msu7.vcf"
+# DEFAULT_PHENO_PATH = _DATA_DIR / "RiceDiversity_44K_Phenotypes_34traits_PLINK.txt"
+from crop_embed.coords import DEFAULT_VCF_PATH, DEFAULT_PHENO_PATH
 
 _PHENO_ID_COLS = {"HybID", "NSFTVID"}
 
@@ -42,11 +39,6 @@ DEFAULT_N_SVD_COMPONENTS = 120
 DEFAULT_TEST_SIZE        = 0.2
 DEFAULT_RANDOM_STATE     = 42
 DEFAULT_KNN_NEIGHBORS    = 10
-
-
-# ---------------------------------------------------------------------------
-# Step 1 — VCF → sparse binary matrix
-# ---------------------------------------------------------------------------
 
 def load_vcf_sparse(
     vcf_path: Path = DEFAULT_VCF_PATH,
@@ -100,11 +92,6 @@ def load_vcf_sparse(
     )
     return X, samples, snp_ids, n_missing
 
-
-# ---------------------------------------------------------------------------
-# Step 2 — Phenotype file
-# ---------------------------------------------------------------------------
-
 def load_phenotypes(
     pheno_path: Path = DEFAULT_PHENO_PATH,
 ) -> tuple[pd.DataFrame, list[str]]:
@@ -120,11 +107,6 @@ def load_phenotypes(
     pheno_df["NSFTVID"] = pheno_df["NSFTVID"].astype(int)
     trait_cols = [c for c in pheno_df.columns if c not in _PHENO_ID_COLS]
     return pheno_df, trait_cols
-
-
-# ---------------------------------------------------------------------------
-# Step 3 — Align VCF samples ↔ phenotype rows via NSFTVID
-# ---------------------------------------------------------------------------
 
 def align_samples(
     X_vcf: sp.csr_matrix,
@@ -153,11 +135,6 @@ def align_samples(
     X_aligned = X_vcf[row_order, :]
     return X_aligned, pheno_matched
 
-
-# ---------------------------------------------------------------------------
-# Step 3b — Align phenotypes to a (no-touch) dataset sample order
-# ---------------------------------------------------------------------------
-
 def align_targets_to_dataset(
     dataset,
     pheno_df: pd.DataFrame,
@@ -177,11 +154,6 @@ def align_targets_to_dataset(
     Y_df = pheno_df.set_index("NSFTVID").reindex(nsftvids)[trait_cols]
     return Y_df.values.astype(float)
 
-
-# ---------------------------------------------------------------------------
-# Step 4 — Per-trait StandardScaler (NaN-safe)
-# ---------------------------------------------------------------------------
-
 def scale_phenotypes(Y_raw: np.ndarray) -> np.ndarray:
     """
     Standardise each trait column independently, ignoring NaN entries.
@@ -198,22 +170,12 @@ def scale_phenotypes(Y_raw: np.ndarray) -> np.ndarray:
         Y_scaled[mask, j] = (col[mask] - mu) / (std if std > 0 else 1.0)
     return Y_scaled
 
-
-# ---------------------------------------------------------------------------
-# Step 5 — KNN imputation
-# ---------------------------------------------------------------------------
-
 def impute_phenotypes(
     Y_scaled: np.ndarray,
     n_neighbors: int = DEFAULT_KNN_NEIGHBORS,
 ) -> np.ndarray:
     """Fill NaN values in the scaled phenotype matrix using KNN imputation."""
     return KNNImputer(n_neighbors=n_neighbors).fit_transform(Y_scaled)
-
-
-# ---------------------------------------------------------------------------
-# Step 6 — TruncatedSVD feature reduction
-# ---------------------------------------------------------------------------
 
 def reduce_snp_features(
     X: sp.csr_matrix,

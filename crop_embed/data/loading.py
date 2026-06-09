@@ -28,7 +28,7 @@ import torch
 
 from crop_embed.dataset import SampleDataset, UniqueWindowDataset
 from crop_embed.partitioner import SNPWindowPartitioner
-from crop_embed.data.coords import FASTA_PATH
+from crop_embed.data.coords import FASTA_PATH, DEFAULT_VCF_PATH
 from crop_embed.data.preprocessing import (
     DEFAULT_PHENO_PATH,
     align_targets_to_dataset,
@@ -36,9 +36,6 @@ from crop_embed.data.preprocessing import (
     scale_phenotypes,
 )
 from crop_embed.data.vcf import load_snps_from_vcf
-
-DEFAULT_VCF_PATH = "/home/andrew/rice_data/sativas413_msu7_final.vcf"
-
 
 def build_dataset(
     vcf_path: str = DEFAULT_VCF_PATH,
@@ -243,5 +240,3 @@ def prepare_data(
         "train_dataset": SampleDataset(dataset, Y, train_idx),
         "val_dataset": SampleDataset(dataset, Y, val_idx),
     }
-
-    

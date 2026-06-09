@@ -194,6 +194,129 @@ class FPSumHeadModel(nn.Module):
         """
         return self.model(self.norm(summed_emb))
     
+class FPRefDeltaSumHeadModel(FPSumHeadModel):
+    """
+    Variant of FPSumHeadModel that pools each window's *delta from its reference*
+    instead of its absolute embedding.
+
+    For a fingerprint (chrom, w_start, w_end, alt_positions), the reference is the
+    variant-free window (chrom, w_start, w_end, ()) — see crop_embed.fingerprint.
+    `ref_index[i]` holds the cache row of fingerprint i's reference, so the forward
+    gathers `fp_emb[ref_index]` (the per-row `fp_ref_emb`) and subtracts it before
+    the embedding_bag pool:
+
+        delta = fp_emb - fp_emb[ref_index]          # reference-subtracted table
+        summed = embedding_bag(gather_ind, delta)   # pool the deltas
+
+    A reference fingerprint maps to itself, so its delta is exactly zero and it
+    contributes nothing to the (mode="sum") pool — pure-reference windows drop
+    out, and the head sees only how each window departs from reference.
+
+    Everything else — the `model`, the learned standardizer, and
+    `forward_postsum` — is inherited unchanged from FPSumHeadModel. Note the
+    standardizer warm-start (`warm_start_embeddings`) must be fit on summed
+    *deltas* to match this model's input distribution; build them by pre-summing
+    `subtract_reference(cache, ref_index)` the same way train_head pre-sums the
+    raw cache.
+
+    Build `ref_index` once from the fingerprint list that indexes the cache rows
+    (the cache's `unique_fingerprints`, equivalently `dataset.unique_fingerprints`)
+    via `FPRefDeltaSumHeadModel.build_ref_index(...)`.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        emb_dim: int,
+        ref_index: torch.Tensor,
+        normalize: bool = True,
+        warm_start_embeddings: torch.Tensor | None = None,
+    ) -> None:
+        super().__init__(
+            model, emb_dim,
+            normalize=normalize,
+            warm_start_embeddings=warm_start_embeddings,
+        )
+        # (n_fps,) long; row i -> cache row of fingerprint i's reference window.
+        # Registered as a buffer so it follows .to(device) and round-trips in the
+        # state_dict for reconstruction.
+        self.register_buffer("ref_index", ref_index.long())
+
+    @staticmethod
+    def build_ref_index(
+        unique_fingerprints: list,
+        *,
+        strict: bool = True,
+    ) -> torch.Tensor:
+        """
+        Map each fingerprint row to the row of its reference (variant-free) window.
+
+        Parameters
+        ----------
+        unique_fingerprints : the fingerprint list that indexes the cache rows, in
+            cache-row order (cache `unique_fingerprints` / `dataset.unique_fingerprints`).
+        strict : if True (default), raise when any window's reference fingerprint
+            is absent from the cache. If False, those rows map to themselves
+            (zero delta), so the window simply drops out of the pool.
+
+        Returns
+        -------
+        ref_index : LongTensor[n_fps]
+        """
+        fps = [(c, s, e, tuple(a)) for (c, s, e, a) in unique_fingerprints]
+        fp_to_idx = {fp: i for i, fp in enumerate(fps)}
+
+        ref_index = torch.empty(len(fps), dtype=torch.long)
+        missing = 0
+        for i, (chrom, w_start, w_end, _alts) in enumerate(fps):
+            ref_row = fp_to_idx.get((chrom, w_start, w_end, ()))
+            if ref_row is None:
+                missing += 1
+                ref_index[i] = i          # self -> zero delta
+            else:
+                ref_index[i] = ref_row
+
+        if missing and strict:
+            raise ValueError(
+                f"{missing}/{len(fps)} fingerprints have no reference (variant-free) "
+                "window in the cache, so their baseline can't be subtracted. Pass "
+                "strict=False to map those to themselves (zero delta / dropped from "
+                "the pool) instead."
+            )
+        return ref_index
+
+    @staticmethod
+    def subtract_reference(
+        fp_emb: torch.Tensor, ref_index: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Reference-subtracted embedding table: `fp_emb - fp_emb[ref_index]`.
+
+        Exposed as a static helper so callers that pre-sum the cache (e.g.
+        train_head.py) can pool the deltas with the same embedding_bag they
+        already use on the raw cache.
+        """
+        return fp_emb - fp_emb[ref_index]
+
+    def forward(
+        self,
+        fp_emb: torch.Tensor,
+        gather_ind: torch.Tensor,
+        ref_index: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # fp_emb: (n_fps, D), gather_ind: (B, n_gather)
+        # Subtract each window's reference embedding, then pool exactly as
+        # FPSumHeadModel does. The delta table backprops into fp_emb.
+        #
+        # `ref_index` defaults to the stored global buffer (cache-row order). End-
+        # to-end training passes a *batch-local* index instead, because there
+        # fp_emb is only the batch's unique windows, not the full cache.
+        idx    = self.ref_index if ref_index is None else ref_index
+        delta  = fp_emb - fp_emb[idx]                               # (n_fps, D)
+        summed = F.embedding_bag(gather_ind, delta, mode="mean")    # (B, D)
+        return self.model(self.norm(summed))
+
+
 class FPGatherHeadModel(nn.Module):
     """
     Head model that gathers the per-sample fingerprint embeddings into the full

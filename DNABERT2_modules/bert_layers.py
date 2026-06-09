@@ -435,7 +435,12 @@ class BertEncoder(nn.Module):
             [copy.deepcopy(layer) for _ in range(config.num_hidden_layers)])
 
         self.num_attention_heads = config.num_attention_heads
-        self.attn_impl = getattr(config, 'attn_impl', 'flash')
+        # Read the *resolved* attention impl from the layers themselves so the
+        # encoder and its self-attention modules can never disagree on whether to
+        # build a dense bias (triton/torch) or pass alibi_slopes (flash). The
+        # raw config value may be 'flash' even when flash-attn isn't installed,
+        # in which case the layers fall back to triton/torch.
+        self.attn_impl = self.layer[0].attention.self.attn_impl
 
         # Per-head ALiBi slopes (positive), used by the flash path to compute the
         # bias in-kernel. Registered as a non-persistent buffer so it follows the
