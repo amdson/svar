@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from crop_embed.models.fp_head_model import (
     MLPModel, LinearModel, FPSumHeadModel,
 )
-from crop_embed import FixedWindowEmbedder, MetricLogger, metrics_path_for
+from crop_embed import FixedWindowEmbedder, MetricLogger, metrics_path_for, ActivationTracker
 from crop_embed.data.loading import prepare_data
 from crop_embed.train import masked_mse, _compute_metrics
 
@@ -83,6 +83,10 @@ parser.add_argument("--batch-size", type=int, default=64)
 parser.add_argument("--log-every", type=int, default=20,
                     help="Log train metrics every N optimizer steps. Val metrics "
                          "are logged once per epoch over the full split.")
+parser.add_argument("--track-activations", action="store_true",
+                    help="Log per-layer activation/input summary stats (mean/std/absmax/"
+                         "frac_zero) alongside train metrics, via forward hooks on the "
+                         "head's leaf modules. Captured only on --log-every steps.")
 parser.add_argument("--seed", type=int, default=42)
 
 # wandb
@@ -199,6 +203,10 @@ opt = torch.optim.AdamW(
 n_params = sum(p.numel() for p in head.parameters())
 print(f"Head: {args.head} ({n_params:,} params)  normalize={not args.no_normalize}")
 
+# Optional per-layer activation/input tracking via forward hooks (no forward-pass
+# edits). Armed only on --log-every steps so non-logged steps stay overhead-free.
+tracker = ActivationTracker(head) if args.track_activations else None
+
 # ── 3. Train ──────────────────────────────────────────────────────────────────
 # Explicit epochs: each pass over train_loader shows the model every training
 # sample exactly once, so --epochs is the number of times it sees each sample.
@@ -212,6 +220,9 @@ for epoch in range(args.epochs):
     for x, y in train_loader:
         x, y = x.to(device), y.to(device)
 
+        is_log = step % args.log_every == 0
+        if tracker is not None and is_log:
+            tracker.arm()                       # record this forward's activations
         pred = head.forward_postsum(x)
         loss = masked_mse(pred, y)
 
@@ -219,12 +230,13 @@ for epoch in range(args.epochs):
         loss.backward()
         opt.step()
 
-        if step % args.log_every == 0:
+        if is_log:
             train_m = _compute_metrics(pred.detach(), y, trait_cols, "train")
+            act_m = tracker.collect() if tracker is not None else {}
             print(f"epoch {epoch:4d} step {step:6d}"
                   f"  loss={train_m.get('train/mean_mse', loss.item()):.4f}"
                   f"  pcc={train_m.get('train/mean_pcc', float('nan')):.3f}")
-            logger.log({"epoch": epoch, "step": step, **train_m})
+            logger.log({"epoch": epoch, "step": step, **train_m, **act_m})
         step += 1
 
     # End-of-epoch validation over the full split.
@@ -259,4 +271,6 @@ torch.save({
 }, out_path)
 print(f"\nSaved to {out_path}")
 
+if tracker is not None:
+    tracker.remove()
 logger.close()

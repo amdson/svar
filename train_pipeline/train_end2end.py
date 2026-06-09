@@ -35,6 +35,7 @@ from crop_embed.models.fp_head_model import (
 )
 from crop_embed import (
     DEFAULT_MODEL_PATHS, build_window_embedder, MetricLogger, metrics_path_for,
+    ActivationTracker,
 )
 from crop_embed.data.loading import prepare_data
 from crop_embed.train import masked_mse, _compute_metrics
@@ -147,6 +148,11 @@ parser.add_argument("--precision", choices=["fp32", "bf16"], default="fp32",
                     help="fp32 for debugging; bf16 for speed/memory once stable.")
 parser.add_argument("--log-every", type=int, default=20,
                     help="Log train metrics every N optimizer steps.")
+parser.add_argument("--track-activations", action="store_true",
+                    help="Log per-layer head activation/input summary stats (mean/std/"
+                         "absmax/frac_zero) alongside train metrics, via forward hooks on "
+                         "the head's leaf modules. Captured only on --log-every steps. "
+                         "(Hooks the head only, not the chunked encoder.)")
 parser.add_argument("--seed", type=int, default=42)
 
 # wandb
@@ -536,6 +542,13 @@ n_head = sum(p.numel() for p in head.parameters())
 print(f"Encoder {n_enc:,} params (trainable) | head {n_head:,} params "
       f"| precision={args.precision} chunk_size={args.chunk_size}")
 
+# Optional per-layer head activation/input tracking via forward hooks (no forward-pass
+# edits). Hooks the head only: the encoder runs chunked under no_grad over many chunks
+# per step, so hooking it would fire per-chunk and overwrite itself. The head sees the
+# pooled embedding once per step, which is the operating point first_batch_diagnostics
+# already probes. Armed only on --log-every steps so other steps stay overhead-free.
+tracker = ActivationTracker(head) if args.track_activations else None
+
 # ── Train ─────────────────────────────────────────────────────────────────────
 
 train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
@@ -604,6 +617,9 @@ for epoch in range(start_epoch, args.epochs):
         E = embed_chunked_nograd(encoder, sequences, fingerprints,
                                  desc="embed (pass 1)").requires_grad_(True)
         opt.zero_grad()
+        is_log = step % args.log_every == 0
+        if tracker is not None and is_log:
+            tracker.arm()                       # record this head forward's activations
         with autocast_ctx():
             pred = head(E, inv) if ref_local is None else head(E, inv, ref_index=ref_local)
             loss = masked_mse(pred, targets)
@@ -622,12 +638,13 @@ for epoch in range(start_epoch, args.epochs):
 
         opt.step()
 
-        if step % args.log_every == 0:
+        if is_log:
             train_m = _compute_metrics(pred.detach().float(), targets, trait_cols, "train")
+            act_m = tracker.collect() if tracker is not None else {}
             print(f"epoch {epoch:4d} step {step:6d}"
                   f"  loss={train_m.get('train/mean_mse', loss.item()):.4f}"
                   f"  pcc={train_m.get('train/mean_pcc', float('nan')):.3f}")
-            logger.log({"epoch": epoch, "step": step, **train_m})
+            logger.log({"epoch": epoch, "step": step, **train_m, **act_m})
         step += 1
 
     # End-of-epoch validation over the full split (eval/no_grad, chunked embed).
@@ -664,4 +681,6 @@ print(f"\nSaved to {out_path}")
 if ckpt_path.exists():
     ckpt_path.unlink()
 
+if tracker is not None:
+    tracker.remove()
 logger.close()

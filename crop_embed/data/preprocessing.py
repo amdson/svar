@@ -29,9 +29,7 @@ from sklearn.model_selection import train_test_split
 
 _DATA_DIR = Path(__file__).resolve().parents[3] / "rice_data"
 
-# DEFAULT_VCF_PATH   = _DATA_DIR / "RiceDiversity_44K_Genotypes_PLINK" / "sativas413_msu7.vcf"
-# DEFAULT_PHENO_PATH = _DATA_DIR / "RiceDiversity_44K_Phenotypes_34traits_PLINK.txt"
-from crop_embed.coords import DEFAULT_VCF_PATH, DEFAULT_PHENO_PATH
+from crop_embed.data.coords import DEFAULT_VCF_PATH, DEFAULT_PHENO_PATH
 
 _PHENO_ID_COLS = {"HybID", "NSFTVID"}
 

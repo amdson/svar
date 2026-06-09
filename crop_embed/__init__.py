@@ -33,6 +33,7 @@ from crop_embed.partitioner import SNPWindowPartitioner, Window
 from crop_embed.heads import AttentionHead, LinearHead, MLPHead, window_position_features
 from crop_embed.train import masked_mse, train
 from crop_embed.logging_utils import MetricLogger, metrics_path_for
+from crop_embed.activation_tracker import ActivationTracker
 from crop_embed.encoders import (
     DEFAULT_MODEL_PATHS,
     load_encoder_model,
@@ -61,6 +62,7 @@ __all__ = [
     "train",
     "MetricLogger",
     "metrics_path_for",
+    "ActivationTracker",
     "DEFAULT_MODEL_PATHS",
     "load_encoder_model",
     "build_window_embedder",
