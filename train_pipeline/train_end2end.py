@@ -133,6 +133,10 @@ parser.add_argument("--subtract-reference", action="store_true",
                          "window's reference embedding before pooling) instead of "
                          "FPSumHeadModel. When loading --head-checkpoint this is taken "
                          "from the checkpoint's head_config.")
+parser.add_argument("--pool", choices=["sum", "mean"], default="sum",
+                    help="Window pooling mode for a fresh head. When loading "
+                         "--head-checkpoint this is taken from the checkpoint's "
+                         "head_config instead.")
 
 # Optimization
 parser.add_argument("--epochs", type=int, default=50)
@@ -307,9 +311,10 @@ def first_batch_diagnostics(step, head, E, inv, pred, loss, ref_index=None):
     model's input, hence the prediction) explodes. Watch `resid` and `normed.std`
     grow while `summed`/`mean` stay ~1500.
     """
-    # The head pools E (plain) or the reference-delta E - E[ref] (refdelta).
+    # The head pools E (plain) or the reference-delta E - E[ref] (refdelta), using the
+    # head's own pool mode so this reconstruction matches what forward actually feeds norm.
     table  = E.detach() if ref_index is None else (E.detach() - E.detach()[ref_index])
-    summed = F.embedding_bag(inv, table, mode="sum")   # (B, D) — the head.norm input
+    summed = F.embedding_bag(inv, table, mode=head.pool)   # (B, D) — the head.norm input
     normed = head.norm(summed)                               # what the inner model actually sees
     print(f"\n── diagnostics @ step {step} (pre-update) ──")
     print(f"  loss (pre-update)        : {loss.item():.4f}")
@@ -464,16 +469,20 @@ def build_head(head_config: dict) -> FPSumHeadModel:
     else:
         inner = MLPModel(emb_dim, n_traits, hidden_dim=head_config["hidden_dim"],
                          n_layers=head_config["n_layers"], dropout=head_config["dropout"])
+    # Pooling mode: older checkpoints predate this key, so default to "sum" (what
+    # train_head.py pre-pooled with before --pool existed).
+    pool = head_config.get("pool", "sum")
     if head_config.get("subtract_reference") or head_config.get("model_class") == "FPRefDeltaSumHeadModel":
         # Reference-delta head. The global ref index (this dataset's fingerprints,
-        # cache-row order) matches the train_refdelta_head.py checkpoint's ref_index
-        # buffer so the state_dict loads; per-batch LOCAL indices are passed at forward.
+        # cache-row order) matches the train_head.py --subtract-reference checkpoint's
+        # ref_index buffer so the state_dict loads; per-batch LOCAL indices at forward.
         ref_index = FPRefDeltaSumHeadModel.build_ref_index(dataset.unique_fingerprints)
         return FPRefDeltaSumHeadModel(
             inner, emb_dim=emb_dim, ref_index=ref_index,
-            normalize=head_config["normalize"],
+            normalize=head_config["normalize"], pool=pool,
         ).to(device)
-    return FPSumHeadModel(inner, emb_dim=emb_dim, normalize=head_config["normalize"]).to(device)
+    return FPSumHeadModel(inner, emb_dim=emb_dim,
+                          normalize=head_config["normalize"], pool=pool).to(device)
 
 
 if args.head_checkpoint:
@@ -503,6 +512,7 @@ else:
         "dropout": args.dropout, "normalize": not args.no_normalize,
         "subtract_reference": args.subtract_reference,
         "model_class": "FPRefDeltaSumHeadModel" if args.subtract_reference else "FPSumHeadModel",
+        "pool": args.pool,
     }
     head = build_head(head_config)
 

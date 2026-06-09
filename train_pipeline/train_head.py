@@ -6,13 +6,21 @@ from end to end training because training on the precomputed cache is much faste
 than training on a fixed model.
 The output is a saved ckpt file with the head's state_dict and metadata needed to reconstruct the head and embedder for inference.
 
+By default this trains an FPSumHeadModel (pool absolute window embeddings). Pass
+--subtract-reference to train an FPRefDeltaSumHeadModel instead: each window's
+variant-free *reference* embedding is subtracted before pooling, so the head
+learns from per-window deltas-from-reference. The cache, split, optimizer, and
+training loop are identical either way — only the pooled table (raw vs. delta)
+and the head class differ.
+
 Pipeline
 --------
 1.   Load the fixed window cache (from embed_windows.py).
 1.a  Pre-sum it into one (n_samples, D) embedding per sample — for a frozen
      cache the per-sample sum never changes, so we do the embedding_bag once
-     up front and train through FPSumHeadModel.forward_postsum (no re-gather
-     every step). Wrapped in a TensorDataset for batching/shuffling.
+     up front and train through forward_postsum (no re-gather every step).
+     Wrapped in a TensorDataset for batching/shuffling. With --subtract-reference
+     the reference-subtracted table is pooled instead (it's likewise frozen).
 2.   Build an FPSumHeadModel (LinearModel/MLPModel inner) + optimizer.
 2.a  Optionally warm-start the whole head from a pretrained checkpoint.
 2.b  Optionally warm-start just the standardizer from the training embeddings
@@ -39,7 +47,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from crop_embed.models.fp_head_model import (
-    MLPModel, LinearModel, FPSumHeadModel,
+    MLPModel, LinearModel, FPSumHeadModel, FPRefDeltaSumHeadModel,
 )
 from crop_embed import FixedWindowEmbedder, MetricLogger, metrics_path_for, ActivationTracker
 from crop_embed.data.loading import prepare_data
@@ -65,7 +73,17 @@ parser.add_argument("--hidden-dim", type=int, default=None, help="MLP hidden wid
 parser.add_argument("--n-layers", type=int, default=2, help="MLP residual blocks (--head mlp).")
 parser.add_argument("--dropout", type=float, default=0.0, help="MLP dropout (--head mlp).")
 parser.add_argument("--no-normalize", action="store_true",
-                    help="Disable the learned de-mean/rescale standardizer in FPSumHeadModel.")
+                    help="Disable the learned de-mean/rescale standardizer in the head.")
+parser.add_argument("--subtract-reference", action="store_true",
+                    help="Train an FPRefDeltaSumHeadModel: subtract each window's "
+                         "variant-free reference embedding before pooling, so the head "
+                         "learns from deltas-from-reference. Default is the absolute "
+                         "FPSumHeadModel.")
+parser.add_argument("--pool", choices=["sum", "mean"], default="sum",
+                    help="How windows are pooled into the per-sample vector. 'sum' "
+                         "magnitude grows with #windows; 'mean' is window-count "
+                         "invariant. The pre-pool here and the head's forward use this "
+                         "same mode, and it's saved in head_config for reconstruction.")
 
 # Warm-starting (2.a / 2.b — mutually exclusive)
 parser.add_argument("--warm-start-head", type=str, default=None,
@@ -159,8 +177,20 @@ print(f"  {cache.shape[0]:,} fingerprints × {emb_dim} dims; {sample_fp_index.sh
 # ── 1.a Pre-sum into one embedding per sample ─────────────────────────────────
 # Frozen cache → the per-sample sum is constant, so compute it once. embedding_bag
 # fuses the gather+sum so the (n_samples, n_windows, D) intermediate never exists.
+# With --subtract-reference we pool each window's delta-from-reference instead of its
+# absolute embedding; ref_index[i] is the cache row of fingerprint i's variant-free
+# reference window. The delta table is likewise frozen, so it pre-sums the same way.
 
-summed = F.embedding_bag(sample_fp_index, cache, mode="sum")   # (n_samples, D)
+if args.subtract_reference:
+    ref_index = FPRefDeltaSumHeadModel.build_ref_index(dataset.unique_fingerprints)
+    table = FPRefDeltaSumHeadModel.subtract_reference(cache, ref_index)   # (n_fps, D)
+else:
+    ref_index = None
+    table = cache
+
+# Pre-pool with the SAME mode the head's forward uses, so forward_postsum trains on
+# the same scale the head would see at inference (--pool, default "sum").
+summed = F.embedding_bag(sample_fp_index, table, mode=args.pool)   # (n_samples, D)
 
 train_ds = TensorDataset(summed[train_idx], Y[train_idx])
 val_x = summed[val_idx].to(device)
@@ -176,12 +206,23 @@ else:
                      n_layers=args.n_layers, dropout=args.dropout)
 
 # 2.b warm-start the standardizer from the *training* embeddings only (no val leak).
+# When --subtract-reference, `summed` is the per-sample delta sum, so the standardizer
+# is fit on the delta distribution the head actually sees.
 warm_start_embeddings = summed[train_idx] if args.warm_start_standardizer else None
-head = FPSumHeadModel(
-    inner, emb_dim=emb_dim,
-    normalize=not args.no_normalize,
-    warm_start_embeddings=warm_start_embeddings,
-).to(device)
+if args.subtract_reference:
+    head = FPRefDeltaSumHeadModel(
+        inner, emb_dim=emb_dim, ref_index=ref_index,
+        normalize=not args.no_normalize,
+        warm_start_embeddings=warm_start_embeddings,
+        pool=args.pool,
+    ).to(device)
+else:
+    head = FPSumHeadModel(
+        inner, emb_dim=emb_dim,
+        normalize=not args.no_normalize,
+        warm_start_embeddings=warm_start_embeddings,
+        pool=args.pool,
+    ).to(device)
 
 # 2.a warm-start the whole head from a pretrained checkpoint (same architecture).
 if args.warm_start_head:
@@ -201,7 +242,8 @@ opt = torch.optim.AdamW(
 )
 
 n_params = sum(p.numel() for p in head.parameters())
-print(f"Head: {args.head} ({n_params:,} params)  normalize={not args.no_normalize}")
+head_label = f"refdelta-{args.head}" if args.subtract_reference else args.head
+print(f"Head: {head_label} ({n_params:,} params)  normalize={not args.no_normalize}")
 
 # Optional per-layer activation/input tracking via forward hooks (no forward-pass
 # edits). Armed only on --log-every steps so non-logged steps stay overhead-free.
@@ -256,6 +298,9 @@ torch.save({
     "head_state_dict": head.state_dict(),
     "head_config": {
         "head": args.head,
+        "model_class": "FPRefDeltaSumHeadModel" if args.subtract_reference else "FPSumHeadModel",
+        "subtract_reference": args.subtract_reference,
+        "pool": args.pool,
         "emb_dim": emb_dim,
         "n_traits": n_traits,
         "hidden_dim": args.hidden_dim,

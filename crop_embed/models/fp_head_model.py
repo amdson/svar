@@ -166,8 +166,17 @@ class FPSumHeadModel(nn.Module):
         emb_dim: int,
         normalize: bool = True,
         warm_start_embeddings: torch.Tensor | None = None,
+        pool: str = "sum",
     ) -> None:
         super().__init__()
+        if pool not in ("sum", "mean"):
+            raise ValueError(f"pool must be 'sum' or 'mean', got {pool!r}")
+        # How windows are pooled into the (B, D) per-sample vector: "sum" (magnitude
+        # grows with #windows) or "mean" (window-count invariant). Plain string, so it
+        # is NOT in state_dict — reconstruction must pass it (saved in head_config).
+        # forward_postsum callers (train_head.py) must pre-pool with this SAME mode, or
+        # the head trains/infers on a different scale than it was built for.
+        self.pool = pool
         self.model = model
         if normalize:
             self.norm: nn.Module = _LearnedStandardizer(emb_dim)
@@ -180,19 +189,20 @@ class FPSumHeadModel(nn.Module):
 
     def forward(self, fp_emb: torch.Tensor, gather_ind: torch.Tensor) -> torch.Tensor:
         # fp_emb: (n_fps, D), gather_ind: (B, n_gather)
-        # embedding_bag fuses the gather and the per-row sum, so the (B, n_gather, D)
+        # embedding_bag fuses the gather and the per-row pool, so the (B, n_gather, D)
         # intermediate that fp_emb[gather_ind].sum(1) would build never materializes.
         # A 2D index tensor is treated as one equal-length bag per row -> (B, D).
-        summed = F.embedding_bag(gather_ind, fp_emb, mode="mean")   # (B, D)
-        return self.model(self.norm(summed))
-    
-    def forward_postsum(self, summed_emb: torch.Tensor) -> torch.Tensor:
+        pooled = F.embedding_bag(gather_ind, fp_emb, mode=self.pool)   # (B, D)
+        return self.model(self.norm(pooled))
+
+    def forward_postsum(self, pooled_emb: torch.Tensor) -> torch.Tensor:
         """
-        Alternate forward method that skips the embedding_bag sum 
-        and just applies the model to a pre-summed (B, D) tensor. This is for
-        debugging / ablations that want to feed in pre-summed embeddings (e.g. train_head.py warm-start).
+        Alternate forward that skips the embedding_bag pool and just applies the model
+        to a pre-pooled (B, D) tensor. The caller MUST pre-pool with the same `pool`
+        mode this head was built with (see self.pool) so the scale matches `forward`.
+        Used by train_head.py, which pre-pools the frozen cache once up front.
         """
-        return self.model(self.norm(summed_emb))
+        return self.model(self.norm(pooled_emb))
     
 class FPRefDeltaSumHeadModel(FPSumHeadModel):
     """
@@ -208,9 +218,11 @@ class FPRefDeltaSumHeadModel(FPSumHeadModel):
         delta = fp_emb - fp_emb[ref_index]          # reference-subtracted table
         summed = embedding_bag(gather_ind, delta)   # pool the deltas
 
-    A reference fingerprint maps to itself, so its delta is exactly zero and it
-    contributes nothing to the (mode="sum") pool — pure-reference windows drop
-    out, and the head sees only how each window departs from reference.
+    A reference fingerprint maps to itself, so its delta is exactly zero. Under
+    `pool="sum"` such a window contributes nothing, so pure-reference windows drop
+    out of the pool entirely and the head sees only how each window departs from
+    reference. Under `pool="mean"` a zero-delta window still counts toward the bag
+    size, so it pulls the averaged delta toward zero rather than dropping out.
 
     Everything else — the `model`, the learned standardizer, and
     `forward_postsum` — is inherited unchanged from FPSumHeadModel. Note the
@@ -231,11 +243,13 @@ class FPRefDeltaSumHeadModel(FPSumHeadModel):
         ref_index: torch.Tensor,
         normalize: bool = True,
         warm_start_embeddings: torch.Tensor | None = None,
+        pool: str = "sum",
     ) -> None:
         super().__init__(
             model, emb_dim,
             normalize=normalize,
             warm_start_embeddings=warm_start_embeddings,
+            pool=pool,
         )
         # (n_fps,) long; row i -> cache row of fingerprint i's reference window.
         # Registered as a buffer so it follows .to(device) and round-trips in the
@@ -313,8 +327,8 @@ class FPRefDeltaSumHeadModel(FPSumHeadModel):
         # fp_emb is only the batch's unique windows, not the full cache.
         idx    = self.ref_index if ref_index is None else ref_index
         delta  = fp_emb - fp_emb[idx]                               # (n_fps, D)
-        summed = F.embedding_bag(gather_ind, delta, mode="mean")    # (B, D)
-        return self.model(self.norm(summed))
+        pooled = F.embedding_bag(gather_ind, delta, mode=self.pool)  # (B, D)
+        return self.model(self.norm(pooled))
 
 
 class FPGatherHeadModel(nn.Module):
