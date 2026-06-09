@@ -8,7 +8,7 @@ The output is a saved ckpt file with the head's state_dict and metadata needed t
 
 Pipeline
 --------
-1.   Load the fixed window cache (from embed_windows.py / generate_cache.py).
+1.   Load the fixed window cache (from embed_windows.py).
 1.a  Pre-sum it into one (n_samples, D) embedding per sample — for a frozen
      cache the per-sample sum never changes, so we do the embedding_bag once
      up front and train through FPSumHeadModel.forward_postsum (no re-gather
@@ -83,6 +83,10 @@ parser.add_argument("--wandb-project", type=str, default=None,
 parser.add_argument("--wandb-name", type=str, default=None,
                     help="Optional wandb run name; defaults to wandb's auto name.")
 
+parser.add_argument("--split", type=str, default="splits/sativas413_seed42.pt",
+                    help="Path to a cached train/val split .pt file. Must be built from "
+                         "the same VCF and windowing as the cache. Generate with "
+                         "python scripts/cache_split.py --output <SPLIT_PATH>.")
 # I/O
 parser.add_argument("--output", type=str, required=True, help="Path to write model.pt.")
 
@@ -110,7 +114,7 @@ print(f"Logging metrics to {logger.metrics_path}")
 # ── Dataset, targets, and the shared train/val split ──────────────────────────
 # Generate the split first with: python scripts/cache_split.py --output <SPLIT_PATH>
 
-SPLIT_PATH = "splits/sativas413_seed42.pt"
+SPLIT_PATH = args.split
 data = prepare_data(split_path=SPLIT_PATH)
 dataset    = data["dataset"]
 Y          = data["Y"]
@@ -187,7 +191,7 @@ print(f"Head: {args.head} ({n_params:,} params)  normalize={not args.no_normaliz
 # ── 3. Train ──────────────────────────────────────────────────────────────────
 # Explicit epochs: each pass over train_loader shows the model every training
 # sample exactly once, so --epochs is the number of times it sees each sample.
-# Train metrics log on a step cadence; val is the full split once per epoch.
+# Train metrics log k steps; val is the full split once per epoch. 
 
 n_train = len(train_ds)
 print(f"\nTraining {args.epochs} epochs over {n_train} samples at lr={args.lr} …")
