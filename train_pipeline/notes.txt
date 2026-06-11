@@ -20,3 +20,24 @@ python train_pipeline/train_head.py --cache checkpoints/sativas413_embeddings_10
 python train_pipeline/train_head.py --cache checkpoints/sativas413_embeddings.ckpt.pt --head linear --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/linear_sum/model.pt
 
 python train_pipeline/train_end2end.py --head-checkpoint trained_heads/linear_sum/model.pt --epochs 2 --batch-size 16 --chunk-size 32 
+
+- Model trained on subtracted references, no standardizer + downstream end2end
+ python train_pipeline/train_head.py --cache checkpoints/sweep/sativas413_hw500.ckpt.pt --head linear --epochs 15 --lr 1e-3 --subtract-reference --no-normalize --output trained_heads/linear_mean_ns/model.pt
+python train_pipeline/train_end2end.py     --head-checkpoint trained_heads/linear_mean_ns/model.pt     --half-window 500  --buffer 0     --epochs 5 --lr 1e-5 --batch-size 8 --chunk-size 32     --precision fp32 --track-activations --log-every 1     --output trained_e2e/linear_hw500_mean_ns_sr/model.pt
+python train_pipeline/train_end2end.py     --head-checkpoint trained_heads/linear_mean_ns/model.pt     --half-window 500  --buffer 0     --epochs 5 --lr 1e-5 --batch-size 128 --chunk-size 64     --precision fp32 --track-activations --log-every 1     --output trained_e2e/linear_hw500_mean_ns_sr_v2/model.pt
+
+- Carbon-500M backend (HuggingFaceBio/Carbon-500M, decoder-only causal LM; loads in bf16, emb cast to fp32 for pooling). hw500 absolute linear, mirrors the dnabert2 flow.
+# 1. Embed windows with carbon (smaller batch — 500M params). Defaults --model-path to HuggingFaceBio/Carbon-500M.
+python train_pipeline/embed_windows.py --backend carbon --half-window 500 --buffer 0 --max-length 2048 --batch-size 16 --output checkpoints/carbon/sativas413_carbon500m_hw500.ckpt.pt
+# (optional snp-only variant — now supported on carbon via the <dna>-shifted offset mapping)
+python train_pipeline/embed_windows.py --backend carbon --half-window 500 --buffer 0 --max-length 2048 --batch-size 16 --output checkpoints/carbon/sativas413_carbon500m_hw500.ckpt.pt
+
+# 2. Train an absolute linear head on the carbon cache.
+python train_pipeline/train_head.py --cache checkpoints/carbon/sativas413_carbon500m_hw500.ckpt.pt --half-window 500 --buffer 0 --head linear --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/carbon/linear_hw500/model.pt
+
+# 3. End-to-end finetune carbon backbone + head (must pass --backend carbon to build the live embedder).
+python train_pipeline/train_end2end.py --backend carbon --head-checkpoint trained_heads/carbon/linear_hw500/model.pt --half-window 500 --buffer 0 --epochs 5 --lr 1e-5 --batch-size 8 --chunk-size 16 --precision fp32 --track-activations --log-every 1 --output trained_e2e/carbon_linear_hw500/model.pt
+
+python train_pipeline/train_head.py --cache checkpoints/carbon/sativas413_carbon500m_hw500.ckpt.pt --half-window 500 --buffer 0 --head mlp --n-layers=9 --hidden-dim=1500 --dropout=0.5 --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/carbon/linear_hw500/model.pt
+
+python train_pipeline/train_head.py --cache checkpoints/sweep_carbon/sativas413_carbon_hw1000.ckpt.pt --half-window 1000 --buffer 0 --head mlp --n-layers=9 --hidden-dim=1500 --dropout=0.5 --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/carbon/test/model.pt

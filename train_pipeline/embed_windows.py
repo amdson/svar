@@ -75,19 +75,21 @@ parser = argparse.ArgumentParser(
 )
 
 # Model
-parser.add_argument("--backend", choices=["dnabert2", "plantcad"], default="dnabert2",
+parser.add_argument("--backend", choices=["dnabert2", "plantcad", "carbon"], default="dnabert2",
                     help="Encoder family. Picks default --model-path if --model-path "
                          "is left unset, and routes loading / forward semantics.")
 parser.add_argument("--model-path", type=str, default=None,
                     help="HuggingFace repo or local dir for the DNA encoder. "
-                         "Defaults to zhihan1996/DNABERT-2-117M for dnabert2 and "
-                         "kuleshov-group/PlantCaduceus_l32 for plantcad.")
+                         "Defaults to zhihan1996/DNABERT-2-117M for dnabert2, "
+                         "kuleshov-group/PlantCaduceus_l32 for plantcad, and "
+                         "HuggingFaceBio/Carbon-500M for carbon.")
 parser.add_argument("--max-length", type=int, default=2048,
                     help="Tokenizer truncation length. PlantCAD caps at 512.")
 parser.add_argument("--snp-only", action="store_true",
                     help="Pool only SNP-containing tokens (falls back to "
                          "full-window pool on pure-reference windows). "
-                         "dnabert2 backend only.")
+                         "Supported on dnabert2 and carbon; not plantcad "
+                         "(Caduceus tokenizer returns no offset mapping).")
 parser.add_argument("--output-layer", type=int, default=None, metavar="N",
                     help="Extract hidden states from encoder layer N (0-based; "
                          "negative counts from the end) instead of the final layer.")

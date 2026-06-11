@@ -93,7 +93,7 @@ SPLIT_PATH = "splits/sativas413_seed42.pt"
 parser = argparse.ArgumentParser(description="Train encoder + head end-to-end.")
 
 # Embedder
-parser.add_argument("--backend", choices=["dnabert2", "plantcad"], default="dnabert2")
+parser.add_argument("--backend", choices=["dnabert2", "plantcad", "carbon"], default="dnabert2")
 parser.add_argument("--model-path", type=str, default=None,
                     help="HF repo or local dir. Defaults per --backend.")
 parser.add_argument("--max-length", type=int, default=2048,
@@ -651,10 +651,19 @@ for epoch in range(start_epoch, args.epochs):
         if is_log:
             train_m = _compute_metrics(pred.detach().float(), targets, trait_cols, "train")
             act_m = tracker.collect() if tracker is not None else {}
+            # Grad norms (post-backward, pre-zero_grad: AdamW.step doesn't clear .grad,
+            # and zero_grad runs at the top of the next iter, so they're still live here).
+            # E.grad is dL/dE from pass 1; head/encoder norms are the two parameter sets.
+            grad_m = {
+                "grad/head_norm":    _grad_global_norm(head.parameters()),
+                "grad/encoder_norm": _grad_global_norm(encoder.parameters()),
+                "grad/E_norm":       E.grad.detach().float().norm().item(),
+            }
             print(f"epoch {epoch:4d} step {step:6d}"
                   f"  loss={train_m.get('train/mean_mse', loss.item()):.4f}"
-                  f"  pcc={train_m.get('train/mean_pcc', float('nan')):.3f}")
-            logger.log({"epoch": epoch, "step": step, **train_m, **act_m})
+                  f"  pcc={train_m.get('train/mean_pcc', float('nan')):.3f}"
+                  f"  |g|head={grad_m['grad/head_norm']:.2e} enc={grad_m['grad/encoder_norm']:.2e}")
+            logger.log({"epoch": epoch, "step": step, **train_m, **act_m, **grad_m})
         step += 1
 
     # End-of-epoch validation over the full split (eval/no_grad, chunked embed).
