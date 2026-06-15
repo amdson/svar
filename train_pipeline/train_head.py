@@ -37,8 +37,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from models.fp_head_model import (
+from crop_embed.models.fp_head_model import (
     MLPModel, LinearModel, FPSumHeadModel,
 )
 from crop_embed import FixedWindowEmbedder, MetricLogger, metrics_path_for
@@ -140,6 +139,7 @@ print(f"  {cache.shape[0]:,} fingerprints × {emb_dim} dims; {sample_fp_index.sh
 # ── 1.a Pre-sum into one embedding per sample ─────────────────────────────────
 # Frozen cache → the per-sample sum is constant, so compute it once. embedding_bag
 # fuses the gather+sum so the (n_samples, n_windows, D) intermediate never exists.
+
 
 summed = F.embedding_bag(sample_fp_index, cache, mode="sum")   # (n_samples, D)
 
