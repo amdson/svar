@@ -30,11 +30,12 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from models.fp_head_model import (
-    MLPModel, LinearModel, FPSumHeadModel, _LearnedStandardizer,
+from crop_embed.models.fp_head_model import (
+    MLPModel, LinearModel, FPSumHeadModel, FPRefDeltaSumHeadModel, _LearnedStandardizer,
 )
 from crop_embed import (
     DEFAULT_MODEL_PATHS, build_window_embedder, MetricLogger, metrics_path_for,
+    ActivationTracker,
 )
 from crop_embed.data.loading import prepare_data
 from crop_embed.train import masked_mse, _compute_metrics
@@ -92,11 +93,18 @@ SPLIT_PATH = "splits/sativas413_seed42.pt"
 parser = argparse.ArgumentParser(description="Train encoder + head end-to-end.")
 
 # Embedder
-parser.add_argument("--backend", choices=["dnabert2", "plantcad"], default="dnabert2")
+parser.add_argument("--backend", choices=["dnabert2", "plantcad", "carbon"], default="dnabert2")
 parser.add_argument("--model-path", type=str, default=None,
                     help="HF repo or local dir. Defaults per --backend.")
 parser.add_argument("--max-length", type=int, default=2048,
                     help="Tokenizer truncation length (PlantCAD caps at 512).")
+
+# Genome windowing — must match the cache/head being fine-tuned (the dataset is
+# rebuilt here for the split + targets, so a mismatch breaks the head's ref index).
+parser.add_argument("--half-window", type=int, default=500,
+                    help="Windowing half-window; must match the loaded head/cache.")
+parser.add_argument("--buffer", type=int, default=0,
+                    help="Windowing buffer; must match the loaded head/cache.")
 
 # Head. By default the head is loaded from a train_head.py checkpoint so the e2e
 # run fine-tunes an already-trained head rather than a fresh one. The architecture
@@ -120,6 +128,15 @@ parser.add_argument("--dropout", type=float, default=0.0,
 parser.add_argument("--no-normalize", action="store_true",
                     help="Disable the FPSumHeadModel standardizer. Fresh-init only "
                          "(--init-head-from-scratch).")
+parser.add_argument("--subtract-reference", action="store_true",
+                    help="Fresh-init only: build an FPRefDeltaSumHeadModel (subtract each "
+                         "window's reference embedding before pooling) instead of "
+                         "FPSumHeadModel. When loading --head-checkpoint this is taken "
+                         "from the checkpoint's head_config.")
+parser.add_argument("--pool", choices=["sum", "mean"], default="sum",
+                    help="Window pooling mode for a fresh head. When loading "
+                         "--head-checkpoint this is taken from the checkpoint's "
+                         "head_config instead.")
 
 # Optimization
 parser.add_argument("--epochs", type=int, default=50)
@@ -135,6 +152,11 @@ parser.add_argument("--precision", choices=["fp32", "bf16"], default="fp32",
                     help="fp32 for debugging; bf16 for speed/memory once stable.")
 parser.add_argument("--log-every", type=int, default=20,
                     help="Log train metrics every N optimizer steps.")
+parser.add_argument("--track-activations", action="store_true",
+                    help="Log per-layer head activation/input summary stats (mean/std/"
+                         "absmax/frac_zero) alongside train metrics, via forward hooks on "
+                         "the head's leaf modules. Captured only on --log-every steps. "
+                         "(Hooks the head only, not the chunked encoder.)")
 parser.add_argument("--seed", type=int, default=42)
 
 # wandb
@@ -227,13 +249,45 @@ def accumulate_encoder_grads(encoder, sequences, fingerprints, grad,
         e_c.backward(gradient=grad[start:start + n].to(e_c.dtype))
         start += n
 
+def extend_with_references(sequences, fingerprints):
+    """Append each window's variant-free reference fingerprint (chrom, ws, we, ())
+    to the batch's window set when it isn't already present, and return a LOCAL
+    reference index mapping every (extended) row to the row of its reference.
+
+    The e2e head only embeds the batch's unique windows, but a window's reference
+    is in that set only if some batch sample is all-reference there. Adding the
+    missing references lets FPRefDeltaSumHeadModel do its `E - E[ref]` subtraction
+    against the batch-local tensor (and the encoder gets gradients for the
+    reference windows too). `inverse` stays valid: appended rows go after the
+    originals, so the original local indices are unchanged.
+    """
+    seqs = list(sequences)
+    fps = list(fingerprints)
+    fp_to_local = {fp: i for i, fp in enumerate(fps)}
+    for fp in fingerprints:
+        ref_fp = (fp[0], fp[1], fp[2], ())
+        if ref_fp not in fp_to_local:
+            fp_to_local[ref_fp] = len(fps)
+            fps.append(ref_fp)
+            seqs.append(dataset.extract_sequence(ref_fp))
+    ref_local = torch.tensor(
+        [fp_to_local[(fp[0], fp[1], fp[2], ())] for fp in fps], dtype=torch.long
+    )
+    return seqs, fps, ref_local
+
 
 def predict_nograd(encoder, head, dataset, sample_indices):
     """Full forward with no graph: chunked-embed the batch's windows, then head."""
     sequences, fingerprints, inverse = dataset.gather_batch(sample_indices.cpu())
+    ref_local = None
+    if isinstance(head, FPRefDeltaSumHeadModel):
+        sequences, fingerprints, ref_local = extend_with_references(sequences, fingerprints)
+        ref_local = ref_local.to(device)
     E = embed_chunked_nograd(encoder, sequences, fingerprints)
     with torch.no_grad(), autocast_ctx():
-        return head(E, inverse.to(device))
+        if ref_local is None:
+            return head(E, inverse.to(device))
+        return head(E, inverse.to(device), ref_index=ref_local)
 
 
 def _grad_global_norm(params):
@@ -245,7 +299,7 @@ def _grad_global_norm(params):
 DIAG_STEPS = 5   # fire first_batch_diagnostics on this many leading steps
 
 @torch.no_grad()
-def first_batch_diagnostics(step, head, E, inv, pred, loss):
+def first_batch_diagnostics(step, head, E, inv, pred, loss, ref_index=None):
     """Probe the first few steps, BEFORE opt.step(), to watch the head's operating
     point drift across updates. Run after both backward passes so grads exist.
 
@@ -257,7 +311,10 @@ def first_batch_diagnostics(step, head, E, inv, pred, loss):
     model's input, hence the prediction) explodes. Watch `resid` and `normed.std`
     grow while `summed`/`mean` stay ~1500.
     """
-    summed = F.embedding_bag(inv, E.detach(), mode="sum")   # (B, D) — the head.norm input
+    # The head pools E (plain) or the reference-delta E - E[ref] (refdelta), using the
+    # head's own pool mode so this reconstruction matches what forward actually feeds norm.
+    table  = E.detach() if ref_index is None else (E.detach() - E.detach()[ref_index])
+    summed = F.embedding_bag(inv, table, mode=head.pool)   # (B, D) — the head.norm input
     normed = head.norm(summed)                               # what the inner model actually sees
     print(f"\n── diagnostics @ step {step} (pre-update) ──")
     print(f"  loss (pre-update)        : {loss.item():.4f}")
@@ -312,6 +369,16 @@ def run_sanity_check(encoder, head, dataset, n_traits):
     inv = torch.randint(0, n_win, (B_fake, w), generator=gen).to(device)
     targets = torch.randn(B_fake, n_traits, generator=gen).to(device)
 
+    # A refdelta head's stored ref_index is global (full cache); for the synthetic
+    # window set, pass a local index. Use a roll (window i -> i+1) rather than
+    # identity so the deltas (and thus the encoder grads being validated) are
+    # nonzero and the subtraction path is actually exercised.
+    ref_local = ((torch.arange(n_win, device=device) + 1) % n_win
+                 if isinstance(head, FPRefDeltaSumHeadModel) else None)
+
+    def call_head(emb):
+        return head(emb, inv) if ref_local is None else head(emb, inv, ref_index=ref_local)
+
     tracked = list(encoder.named_parameters()) + [("head." + n, p) for n, p in head.named_parameters()]
 
     def snapshot():
@@ -322,7 +389,7 @@ def run_sanity_check(encoder, head, dataset, n_traits):
     head.zero_grad(set_to_none=True)
     with autocast_ctx():
         E_ref = encoder(sequences, fps)
-        loss_ref = masked_mse(head(E_ref, inv), targets)
+        loss_ref = masked_mse(call_head(E_ref), targets)
     loss_ref.backward()
     ref = snapshot()
 
@@ -331,7 +398,7 @@ def run_sanity_check(encoder, head, dataset, n_traits):
     head.zero_grad(set_to_none=True)
     E = embed_chunked_nograd(encoder, sequences, fps).requires_grad_(True)
     with autocast_ctx():
-        loss_tp = masked_mse(head(E, inv), targets)
+        loss_tp = masked_mse(call_head(E), targets)
     loss_tp.backward()
     accumulate_encoder_grads(encoder, sequences, fps, E.grad)
     tp = snapshot()
@@ -361,7 +428,8 @@ def run_sanity_check(encoder, head, dataset, n_traits):
 
 # ── Build everything ──────────────────────────────────────────────────────────
 
-data = prepare_data(split_path=SPLIT_PATH)
+data = prepare_data(split_path=SPLIT_PATH,
+                    half_window=args.half_window, buffer=args.buffer)
 dataset    = data["dataset"]
 Y          = data["Y"]
 trait_cols = data["trait_cols"]
@@ -401,7 +469,20 @@ def build_head(head_config: dict) -> FPSumHeadModel:
     else:
         inner = MLPModel(emb_dim, n_traits, hidden_dim=head_config["hidden_dim"],
                          n_layers=head_config["n_layers"], dropout=head_config["dropout"])
-    return FPSumHeadModel(inner, emb_dim=emb_dim, normalize=head_config["normalize"]).to(device)
+    # Pooling mode: older checkpoints predate this key, so default to "sum" (what
+    # train_head.py pre-pooled with before --pool existed).
+    pool = head_config.get("pool", "sum")
+    if head_config.get("subtract_reference") or head_config.get("model_class") == "FPRefDeltaSumHeadModel":
+        # Reference-delta head. The global ref index (this dataset's fingerprints,
+        # cache-row order) matches the train_head.py --subtract-reference checkpoint's
+        # ref_index buffer so the state_dict loads; per-batch LOCAL indices at forward.
+        ref_index = FPRefDeltaSumHeadModel.build_ref_index(dataset.unique_fingerprints)
+        return FPRefDeltaSumHeadModel(
+            inner, emb_dim=emb_dim, ref_index=ref_index,
+            normalize=head_config["normalize"], pool=pool,
+        ).to(device)
+    return FPSumHeadModel(inner, emb_dim=emb_dim,
+                          normalize=head_config["normalize"], pool=pool).to(device)
 
 
 if args.head_checkpoint:
@@ -429,8 +510,16 @@ else:
         "head": args.head, "emb_dim": emb_dim, "n_traits": n_traits,
         "hidden_dim": args.hidden_dim, "n_layers": args.n_layers,
         "dropout": args.dropout, "normalize": not args.no_normalize,
+        "subtract_reference": args.subtract_reference,
+        "model_class": "FPRefDeltaSumHeadModel" if args.subtract_reference else "FPSumHeadModel",
+        "pool": args.pool,
     }
     head = build_head(head_config)
+
+is_refdelta = isinstance(head, FPRefDeltaSumHeadModel)
+if is_refdelta:
+    print("Reference-delta head: subtracting per-window reference embeddings each step "
+          "(batches extended with their missing reference windows).")
 
 # ── Sanity-check mode: run on a small synthetic problem and exit ──────────────
 
@@ -462,6 +551,13 @@ n_enc = sum(p.numel() for p in encoder.parameters())
 n_head = sum(p.numel() for p in head.parameters())
 print(f"Encoder {n_enc:,} params (trainable) | head {n_head:,} params "
       f"| precision={args.precision} chunk_size={args.chunk_size}")
+
+# Optional per-layer head activation/input tracking via forward hooks (no forward-pass
+# edits). Hooks the head only: the encoder runs chunked under no_grad over many chunks
+# per step, so hooking it would fire per-chunk and overwrite itself. The head sees the
+# pooled embedding once per step, which is the operating point first_batch_diagnostics
+# already probes. Armed only on --log-every steps so other steps stay overhead-free.
+tracker = ActivationTracker(head) if args.track_activations else None
 
 # ── Train ─────────────────────────────────────────────────────────────────────
 
@@ -519,34 +615,55 @@ for epoch in range(start_epoch, args.epochs):
         sequences, fingerprints, inverse = dataset.gather_batch(global_indices.cpu())
         inv = inverse.to(device)
 
+        # Reference-delta head: extend the batch's window set with the missing
+        # reference windows and build a batch-local reference index so the head can
+        # subtract each window's live reference embedding. `inverse` is unchanged.
+        ref_local = None
+        if is_refdelta:
+            sequences, fingerprints, ref_local = extend_with_references(sequences, fingerprints)
+            ref_local = ref_local.to(device)
+
         # PASS 1 — no encoder graph; get head grads + E.grad (= dL/dE).
         E = embed_chunked_nograd(encoder, sequences, fingerprints,
                                  desc="embed (pass 1)").requires_grad_(True)
         opt.zero_grad()
+        is_log = step % args.log_every == 0
+        if tracker is not None and is_log:
+            tracker.arm()                       # record this head forward's activations
         with autocast_ctx():
-            pred = head(E, inv)
+            pred = head(E, inv) if ref_local is None else head(E, inv, ref_index=ref_local)
             loss = masked_mse(pred, targets)
         loss.backward()
 
         # Probe the first few steps, before each update, to watch the drift.
         if step < DIAG_STEPS:
-            first_batch_diagnostics(step, head, E, inv, pred, loss)
+            first_batch_diagnostics(step, head, E, inv, pred, loss, ref_index=ref_local)
 
         # PASS 2 — recompute chunks WITH grad to accumulate encoder grads.
         accumulate_encoder_grads(encoder, sequences, fingerprints, E.grad)
 
         # Probe the first few steps, before each update, to watch the drift.
         if step < DIAG_STEPS:
-            first_batch_diagnostics(step, head, E, inv, pred, loss)
+            first_batch_diagnostics(step, head, E, inv, pred, loss, ref_index=ref_local)
 
         opt.step()
 
-        if step % args.log_every == 0:
+        if is_log:
             train_m = _compute_metrics(pred.detach().float(), targets, trait_cols, "train")
+            act_m = tracker.collect() if tracker is not None else {}
+            # Grad norms (post-backward, pre-zero_grad: AdamW.step doesn't clear .grad,
+            # and zero_grad runs at the top of the next iter, so they're still live here).
+            # E.grad is dL/dE from pass 1; head/encoder norms are the two parameter sets.
+            grad_m = {
+                "grad/head_norm":    _grad_global_norm(head.parameters()),
+                "grad/encoder_norm": _grad_global_norm(encoder.parameters()),
+                "grad/E_norm":       E.grad.detach().float().norm().item(),
+            }
             print(f"epoch {epoch:4d} step {step:6d}"
                   f"  loss={train_m.get('train/mean_mse', loss.item()):.4f}"
-                  f"  pcc={train_m.get('train/mean_pcc', float('nan')):.3f}")
-            logger.log({"epoch": epoch, "step": step, **train_m})
+                  f"  pcc={train_m.get('train/mean_pcc', float('nan')):.3f}"
+                  f"  |g|head={grad_m['grad/head_norm']:.2e} enc={grad_m['grad/encoder_norm']:.2e}")
+            logger.log({"epoch": epoch, "step": step, **train_m, **act_m, **grad_m})
         step += 1
 
     # End-of-epoch validation over the full split (eval/no_grad, chunked embed).
@@ -583,4 +700,6 @@ print(f"\nSaved to {out_path}")
 if ckpt_path.exists():
     ckpt_path.unlink()
 
+if tracker is not None:
+    tracker.remove()
 logger.close()

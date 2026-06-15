@@ -1,0 +1,63 @@
+variant_mlm/
+============
+Train + evaluate DNABERT2 on the VARIANT MLM objective: mask the BPE tokens that
+overlap a SNP/alt position and predict them. Motivation: the variant-cache
+encoder (DNABERT2_modules/variant_cache_layers.py) is an approximation (it freezes
+the reference residual stream). Variant-MLM loss is both:
+  1. the adaptation objective ("predict the variant nucleotide") to fine-tune the
+     model toward the variant task / make it aware of the cache approximation, and
+  2. the benign-ness diagnostic: compare variant-MLM loss through the EXACT model
+     vs. the CACHE model — matching loss => approximation is benign for what the
+     model actually computes.
+
+Backends (--backend on both scripts)
+  exact            standard BertForMaskedLM (load_dnabert2_mlm).
+  cache            VariantCacheBertForMaskedLM, efficient LSE encoder.
+  cache-bruteforce VariantCacheBertForMaskedLM, full-sequence oracle.
+The cache backends treat the masked tokens (labels > 0) as the "variant"
+positions; identical inputs to exact, differing only by the frozen-reference
+approximation. Run eval.py with each backend and compare cross-entropy: that IS
+the benign-ness number. (Cache backends process one window at a time — distinct
+references can't share a batch — so they're slower than exact here.)
+
+Files
+-----
+  data.py   build_variant_window_dataset() + VariantMLMCollator. Reuses
+            embed_windows' SNPWindowPartitioner / UniqueWindowDataset, so windows
+            match the embedder cache. --half-window is the window-size parameter.
+            Variant tokens are found via the tokenizer offset mapping
+            (crop_embed.embedder._build_snp_mask). Labels follow DNABERT2's
+            BertForMaskedLM convention (labels > 0 = masked set; -100 ignored).
+  eval.py   Deterministic full masking ([MASK] on every variant token); reports
+            cross-entropy, perplexity, top-1 accuracy. This is the diagnostic.
+            --backend {exact,cache,cache-bruteforce}.
+  train.py  80/10/10-style masking, AdamW, per-epoch val, saves best model.
+            --freeze-backbone trains only the MLM head (drift-free option).
+            --backend as above (train through the cache to adapt to it).
+  compare_backends.py
+            Runs exact + a cache backend over the SAME masked windows in one
+            process; prints corpus CE gap, per-window CE, per-token KL(exact||
+            cache); saves a 3-panel matplotlib figure (--output PNG) and a .npz
+            of the raw arrays. This is the headline benign-ness plot.
+            e.g. python variant_mlm/compare_backends.py --half-window 500 \
+                     --limit 2000 --output variant_mlm/backend_compare.png
+
+Status / TODO
+-------------
+- Exact + cache + cache-bruteforce backends are all wired in (above). On real
+  DNABERT-2 weights, cache==cache-bruteforce to ~2e-5 and exact==cache to ~8e-5
+  on a sparse-mask smoke test (approximation is ~free at high sparsity).
+  VariantCacheBertEncoder exposes the two cache backends directly:
+    forward()            — efficient (log-sum-exp merge, reference kept at batch 1)
+    forward_bruteforce() — full-sequence oracle, clamps non-variant positions to
+                           the cached reference each layer (matches forward() ~1e-7).
+- LoRA/adapter fine-tuning (recommended over full fine-tuning at high sparsity)
+  is not wired up — would slot into train.py's param/optimizer setup (needs peft).
+- No random-token masking baseline; objective is variant-token only by design.
+
+Examples
+--------
+  python variant_mlm/eval.py  --half-window 500 --batch-size 32
+  python variant_mlm/train.py --output checkpoints/variant_mlm/dnabert2.pt \
+      --half-window 500 --epochs 3 --batch-size 16 --lr 5e-5
+  python variant_mlm/eval.py  --checkpoint checkpoints/variant_mlm/dnabert2.pt

@@ -28,6 +28,7 @@ from crop_embed.embedder import WindowEmbedder
 DEFAULT_MODEL_PATHS = {
     "dnabert2": "zhihan1996/DNABERT-2-117M",
     "plantcad": "kuleshov-group/PlantCaduceus_l32",
+    "carbon":   "HuggingFaceBio/Carbon-500M",
 }
 
 
@@ -37,6 +38,7 @@ def load_encoder_model(
     *,
     device: str | torch.device | None = None,
     dtype: torch.dtype | None = None,
+    attn_impl: str = "torch",
 ):
     """
     Load an encoder + tokenizer for `backend`, defaulting `model_path` per backend.
@@ -44,6 +46,11 @@ def load_encoder_model(
     Returns (model, tokenizer) — the pair `SampleEmbedder.fill_embedding_table`
     and `WindowEmbedder` consume. `device`/`dtype` are forwarded to the backend
     loader (dnabert2 ignores `dtype`).
+
+    `attn_impl` selects the DNABERT-2 attention backend: "torch" (the default,
+    pure-PyTorch matmul — needs no flash-attn/CUDA) or "flash" (FlashAttention,
+    requires CUDA + the flash-attn package). Ignored by the plantcad/carbon
+    backends.
     """
     if backend not in DEFAULT_MODEL_PATHS:
         raise ValueError(f"Unknown backend {backend!r}; expected one of {list(DEFAULT_MODEL_PATHS)}.")
@@ -60,9 +67,16 @@ def load_encoder_model(
         model, _ = load_dnabert2(
             repo_id=model_path,
             add_pooling_layer=False,
-            config_overrides={"pad_token_id": tokenizer.pad_token_id},
+            config_overrides={"pad_token_id": tokenizer.pad_token_id, "attn_impl": attn_impl},
             device=device,
         )
+        return model, tokenizer
+
+    if backend == "carbon":
+        from CARBON_modules import load_carbon
+        # dtype=None lets load_carbon pick its bfloat16 default (the published
+        # Carbon recipe); pass dtype through to override.
+        model, tokenizer = load_carbon(repo_id=model_path, device=device, dtype=dtype)
         return model, tokenizer
 
     # plantcad
@@ -80,9 +94,12 @@ def build_window_embedder(
     snp_only: bool = False,
     output_layer: int | None = None,
     dtype: torch.dtype | None = None,
+    attn_impl: str = "torch",
 ) -> WindowEmbedder:
     """Load an encoder and wrap it in a WindowEmbedder (moved to `device` if given)."""
-    model, tokenizer = load_encoder_model(backend, model_path, device=device, dtype=dtype)
+    model, tokenizer = load_encoder_model(
+        backend, model_path, device=device, dtype=dtype, attn_impl=attn_impl,
+    )
     embedder = WindowEmbedder(
         model, tokenizer, max_length=max_length,
         snp_only=snp_only, output_layer=output_layer, backend=backend,

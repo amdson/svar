@@ -28,6 +28,8 @@ FASTA_PATH   = str(_DATA_DIR / "Oryza_sativa.IRGSP-1.0.dna_sm.toplevel.fa")
 VCF_PATH     = str(_DATA_DIR / "RiceDiversity_44K_Genotypes_PLINK" / "sativas413.vcf")
 FLANKING_PATH = str(_DATA_DIR / "RiceDiversity.44K.MSU6.SNP_flanking_seq.txt")
 SNP_INFO_PATH = str(_DATA_DIR / "RiceDiversity.44K.MSU6.SNP_Information.MSU7.txt")
+DEFAULT_VCF_PATH = str(_DATA_DIR / "sativas413_msu7_final.vcf")
+DEFAULT_PHENO_PATH = str(_DATA_DIR / "RiceDiversity_44K_Phenotypes_34traits_PLINK.txt")
 
 
 # ---------------------------------------------------------------------------

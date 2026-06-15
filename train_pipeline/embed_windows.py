@@ -34,7 +34,8 @@ Examples
     # DNABERT-2 (default)
     python scripts/generate_cache.py \\
         --half-window 500 --buffer 0 --max-length 2048 --batch-size 64 \\
-        --output checkpoints/v1/sativas413_embeddings.ckpt.pt
+        --output checkpoints/sativas413_embeddings.ckpt.pt
+    python train_pipeline/embed_windows.py --half-window 500 --buffer 0 --max-length 2048 --batch-size 64 --output checkpoints/sativas413_embeddings.ckpt.pt
 
     # PlantCAD — note half_window <= 256 (PlantCAD's input cap is 512 bp)
     python scripts/generate_cache.py --backend plantcad \\
@@ -64,7 +65,8 @@ from crop_embed import (
 from crop_embed.data.coords import FASTA_PATH
 from crop_embed.data.vcf import load_snps_from_vcf
 
-DEFAULT_VCF_PATH    = "/home/andrew.dickson/rice_data/sativas413_msu7_final.vcf"
+# DEFAULT_VCF_PATH    = "/home/andrew.dickson/rice_data/sativas413_msu7_final.vcf"
+DEFAULT_VCF_PATH    = "/home/andrew/rice_data/sativas413_msu7_final.vcf"
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -73,22 +75,28 @@ parser = argparse.ArgumentParser(
 )
 
 # Model
-parser.add_argument("--backend", choices=["dnabert2", "plantcad"], default="dnabert2",
+parser.add_argument("--backend", choices=["dnabert2", "plantcad", "carbon"], default="dnabert2",
                     help="Encoder family. Picks default --model-path if --model-path "
                          "is left unset, and routes loading / forward semantics.")
 parser.add_argument("--model-path", type=str, default=None,
                     help="HuggingFace repo or local dir for the DNA encoder. "
-                         "Defaults to zhihan1996/DNABERT-2-117M for dnabert2 and "
-                         "kuleshov-group/PlantCaduceus_l32 for plantcad.")
+                         "Defaults to zhihan1996/DNABERT-2-117M for dnabert2, "
+                         "kuleshov-group/PlantCaduceus_l32 for plantcad, and "
+                         "HuggingFaceBio/Carbon-500M for carbon.")
 parser.add_argument("--max-length", type=int, default=2048,
                     help="Tokenizer truncation length. PlantCAD caps at 512.")
 parser.add_argument("--snp-only", action="store_true",
                     help="Pool only SNP-containing tokens (falls back to "
                          "full-window pool on pure-reference windows). "
-                         "dnabert2 backend only.")
+                         "Supported on dnabert2 and carbon; not plantcad "
+                         "(Caduceus tokenizer returns no offset mapping).")
 parser.add_argument("--output-layer", type=int, default=None, metavar="N",
                     help="Extract hidden states from encoder layer N (0-based; "
                          "negative counts from the end) instead of the final layer.")
+parser.add_argument("--attn-impl", choices=["torch", "flash"], default="torch",
+                    help="DNABERT-2 attention backend: 'torch' (default, pure-PyTorch "
+                         "matmul; needs no flash-attn) or 'flash' (FlashAttention; "
+                         "requires CUDA + the flash-attn package). dnabert2 backend only.")
 
 # Data / windowing
 parser.add_argument("--vcf-path",   type=str, default=DEFAULT_VCF_PATH)
@@ -155,7 +163,9 @@ print(f"  {len(dataset):,} unique windows to embed "
 # ── Load model ────────────────────────────────────────────────────────────────
 
 print(f"\nLoading {args.backend} encoder from {args.model_path} …")
-model, tokenizer = load_encoder_model(args.backend, args.model_path, device=device)
+model, tokenizer = load_encoder_model(
+    args.backend, args.model_path, device=device, attn_impl=args.attn_impl
+)
 
 # ── Embed unique windows (with checkpoint/resume) ────────────────────────────
 
@@ -194,6 +204,7 @@ metadata = {
     "max_length":    args.max_length,
     "snp_only":      args.snp_only,
     "output_layer":  args.output_layer,
+    "attn_impl":     args.attn_impl,
     "emb_dim":       emb_dim,
 
     # Dataset reconstruction
