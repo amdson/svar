@@ -3,10 +3,11 @@
 # run_sweep.sh
 # ------------
 # Generate embedding caches and train heads for every combination of
-#   half-window ∈ {250, 500, 1000}  ×  snp-only ∈ {off, on}   = 6 caches
-# and, for each cache, train both head VARIANTS (absolute + reference-delta),
-# each as a linear and an mlp head:
-#   6 caches × 2 variants × 2 heads                            = 24 head runs.
+#   half-window ∈ HALF_WINDOWS  ×  snp-only ∈ {off, on}   = N caches
+# and, for each cache, train every head VARIANT (absolute + reference-delta + centered),
+# each as a linear and an mlp head, over the POOL × WARM_START_STANDARDIZER product
+# (sum-pool + no-standardizer skipped):
+#   N caches × |VARIANTS| × |HEADS| × (|POOL|·|WARM_START| − skips)  head runs.
 #
 # Consolidates the old run_window_sweep.sh (absolute heads) and
 # run_refdelta_sweep.sh (reference-delta heads) — the reference delta is computed
@@ -22,33 +23,40 @@
 # START/DONE markers go to this script's stdout so you can watch progress.
 #
 #   bash train_pipeline/run_sweep.sh
-#
+# 
 set -uo pipefail
 
 cd /home/andrew/svar
 PY=/home/andrew/anaconda3/envs/svar/bin/python
 
-CACHE_DIR=checkpoints/sweep_flash
-HEAD_DIR=trained_heads/sweep_flash
-LOG_DIR=logs/sweep_flash
+CACHE_DIR=checkpoints/sweep
+HEAD_DIR=trained_heads/sweep
+LOG_DIR=logs/sweep
 mkdir -p "$CACHE_DIR" "$HEAD_DIR" "$LOG_DIR"
 
 # ── Sweep knobs ───────────────────────────────────────────────────────────────
-HALF_WINDOWS=(250 500 1000)
+HALF_WINDOWS=(1000)
 HEADS=(linear mlp)
-VARIANTS=(absolute refdelta)   # absolute = FPSumHeadModel, refdelta = ref-subtracted
-POOL=mean               # window pooling mode (sum|mean); passed to train_head.py
-BACKEND=flash          # attention backend for embedding generation
+VARIANTS=(absolute centered refdelta)   # absolute=FPSumHeadModel, refdelta=ref-subtracted, centered=per-window-mean-subtracted
+POOL=(mean sum)        # window pooling modes to sweep (sum|mean); passed to train_head.py
+BACKEND=torch          # attention backend for embedding generation
 BATCH=64               # embed batch size
 MAXLEN=2048            # tokenizer truncation (>= longest 2*half-window in tokens)
 EPOCHS=15
 LR=1e-3
+WARM_START_STANDARDIZER=(0 1)   # 0 = train WITHOUT --warm-start-standardizer, 1 = with it
+
+# Heads train over the full POOL × WARM_START_STANDARDIZER product, EXCEPT sum-pool + no-standardizer
+# (unbounded pooled magnitude with no normalization), which is skipped in the loop below. That leaves:
+#   mean + warm-start, mean + no-warm-start, sum + warm-start
+# Delete the `continue` guard in run_config to also run sum + no-warm-start (the full 4-way product).
 
 # Extra train_head.py flags per head variant ('' for absolute).
 variant_flags() {
   case $1 in
     absolute) echo "" ;;
     refdelta) echo "--subtract-reference" ;;
+    centered) echo "--center-windows" ;;
     *) echo "!!! unknown variant: $1" >&2; return 1 ;;
   esac
 }
@@ -76,13 +84,24 @@ run_config() {
     for variant in "${VARIANTS[@]}"; do
       local vflags; vflags=$(variant_flags "$variant") || return 1
       for head in "${HEADS[@]}"; do
-        echo "######## $(date) :: train $variant $head $tag ########"
-        $PY train_pipeline/train_head.py \
-            --cache "$cache" --head "$head" $vflags --pool "$POOL" \
-            --half-window "$hw" \
-            --epochs "$EPOCHS" --lr "$LR" --warm-start-standardizer \
-            --output "$HEAD_DIR/${variant}/${head}_${tag}/model.pt" \
-          || echo "!!! TRAIN FAILED: $variant $head $tag"
+        for pool in "${POOL[@]}"; do
+          for ws in "${WARM_START_STANDARDIZER[@]}"; do
+            # Skip sum-pool without the standardizer (unbounded magnitude). Delete to run all 4.
+            if [[ "$pool" == "sum" && $ws -eq 0 ]]; then continue; fi
+
+            local ws_flag="" ws_tag="ws0"
+            if [[ $ws -eq 1 ]]; then ws_flag="--warm-start-standardizer"; ws_tag="ws1"; fi
+            local run="${head}_${tag}_${pool}_${ws_tag}"
+
+            echo "######## $(date) :: train $variant $run ########"
+            $PY train_pipeline/train_head.py \
+                --cache "$cache" --head "$head" $vflags --pool "$pool" \
+                --half-window "$hw" \
+                --epochs "$EPOCHS" --lr "$LR" $ws_flag \
+                --output "$HEAD_DIR/${variant}/${run}/model.pt" \
+              || echo "!!! TRAIN FAILED: $variant $run"
+          done
+        done
       done
     done
   } >> "$log" 2>&1
@@ -116,8 +135,8 @@ lane() {
   done
 }
 
-echo "Sweep: ${#configs[@]} caches × ${#VARIANTS[@]} variants × ${#HEADS[@]} heads on 3 GPUs (backend=$BACKEND, pool=$POOL)"
-echo "  variants: ${VARIANTS[*]}"
+echo "Sweep: ${#configs[@]} caches × ${#VARIANTS[@]} variants × ${#HEADS[@]} heads × {pool×warmstart} on 3 GPUs (backend=$BACKEND)"
+echo "  variants: ${VARIANTS[*]}  |  pool: ${POOL[*]}  |  warm-start: ${WARM_START_STANDARDIZER[*]} (sum+nostd skipped)"
 echo "  gpu0: ${gpu0[*]}"
 echo "  gpu1: ${gpu1[*]}"
 echo "  gpu2: ${gpu2[*]}"

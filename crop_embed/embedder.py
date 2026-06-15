@@ -20,7 +20,20 @@ from crop_embed.dataset import UniqueWindowDataset
 from crop_embed.fingerprint import Fingerprint
 
 
-Backend = Literal["dnabert2", "plantcad"]
+Backend = Literal["dnabert2", "plantcad", "carbon"]
+
+# Literal marker that routes Carbon's dual-mode tokenizer into 6-mer DNA mode.
+# Prepended to each sequence as text; it always tokenizes to exactly one leading
+# token, after which the DNA is split into contiguous, non-overlapping k-mers.
+_CARBON_DNA_PREFIX = "<dna>"
+# Carbon's DNA k-mer size and how many tokens the <dna> marker occupies. Carbon's
+# tokenizer is a *slow* (Python) tokenizer with no offset_mapping, but in <dna>
+# mode it chunks the sequence into fixed, non-overlapping 6-mers (a final short
+# chunk is padded into one k-mer token; an N-run becomes a single <oov> token),
+# so DNA character c lands in token (n_prefix_tokens + c // k) — computed
+# analytically by _build_snp_mask_kmer instead of from offsets.
+_CARBON_KMER = 6
+_CARBON_N_PREFIX_TOKENS = 1
 
 
 class WindowEmbedder(nn.Module):
@@ -44,6 +57,17 @@ class WindowEmbedder(nn.Module):
         into ``outputs.hidden_states`` (negatives count from the end). Caduceus
         tokenizers don't expose offset mappings, so ``snp_only`` isn't
         supported on this backend yet.
+
+      * ``backend="carbon"`` — Carbon (HuggingFaceBio/Carbon-*), a decoder-only
+        causal LM. Each sequence is prefixed with ``<dna>`` to route the
+        tokenizer into 6-mer DNA mode (with ``add_special_tokens=False``, since
+        the marker is the special token), then hidden states are read from
+        ``output_hidden_states=True``; ``output_layer`` indexes into
+        ``outputs.hidden_states`` (negatives count from the end). ``snp_only``
+        *is* supported: Carbon's slow tokenizer exposes no offset mapping, but in
+        ``<dna>`` mode it splits the sequence into fixed, non-overlapping 6-mers
+        after the single marker token, so the SNP→token mask is computed
+        analytically (:func:`_build_snp_mask_kmer`) instead of from offsets.
 
     Parameters
     ----------
@@ -70,13 +94,15 @@ class WindowEmbedder(nn.Module):
         backend: Backend = "dnabert2",
     ) -> None:
         super().__init__()
-        if backend not in ("dnabert2", "plantcad"):
-            raise ValueError(f"Unknown backend {backend!r}; expected 'dnabert2' or 'plantcad'.")
+        if backend not in ("dnabert2", "plantcad", "carbon"):
+            raise ValueError(
+                f"Unknown backend {backend!r}; expected 'dnabert2', 'plantcad' or 'carbon'."
+            )
         if snp_only and backend == "plantcad":
             raise NotImplementedError(
                 "snp_only=True is not supported with backend='plantcad' — the "
                 "Caduceus tokenizer doesn't return offset_mapping. Pass "
-                "snp_only=False or fall back to the dnabert2 backend."
+                "snp_only=False or fall back to the dnabert2/carbon backend."
             )
         self.model        = model
         self.tokenizer    = tokenizer
@@ -98,13 +124,29 @@ class WindowEmbedder(nn.Module):
             max_length=self.max_length,
             truncation=True,
         )
-        if self.snp_only:
+        # dnabert2 derives SNP-token spans from the fast tokenizer's offset
+        # mapping; carbon's slow tokenizer has none, so its mask is computed
+        # analytically from the fixed 6-mer layout (below) and needs no offsets.
+        if self.snp_only and self.backend != "carbon":
             tok_kwargs["return_offsets_mapping"] = True
+
+        if self.backend == "carbon":
+            # Carbon's tokenizer is dual-mode: a leading <dna> marker (supplied
+            # as literal text) routes the input into 6-mer DNA tokenization, so
+            # auto special tokens are disabled.
+            sequences = [f"{_CARBON_DNA_PREFIX}{s}" for s in sequences]
+            tok_kwargs["add_special_tokens"] = False
 
         inputs = self.tokenizer(sequences, **tok_kwargs)
         if self.snp_only:
-            offset_mapping = inputs.pop("offset_mapping")    # not a model input
-            snp_mask = _build_snp_mask(offset_mapping, fingerprints)
+            if self.backend == "carbon":
+                snp_mask = _build_snp_mask_kmer(
+                    inputs["input_ids"].shape, fingerprints,
+                    k=_CARBON_KMER, n_prefix_tokens=_CARBON_N_PREFIX_TOKENS,
+                )
+            else:
+                offset_mapping = inputs.pop("offset_mapping")    # not a model input
+                snp_mask = _build_snp_mask(offset_mapping, fingerprints)
         inputs = inputs.to(device)
 
         if self.backend == "dnabert2":
@@ -114,6 +156,14 @@ class WindowEmbedder(nn.Module):
                 hidden = outputs.intermediate_hidden_state
             else:
                 hidden = outputs.last_hidden_state
+        elif self.backend == "carbon":  # decoder-only causal LM
+            outputs   = self.model(**inputs, output_hidden_states=True)
+            layer_idx = -1 if self.output_layer is None else self.output_layer
+            # Cast up so downstream statistics aren't quantized by the bf16
+            # checkpoint. The leading <dna> marker token is pooled in alongside
+            # the DNA tokens (one extra position out of hundreds) — same as
+            # dnabert2 pools its CLS/SEP under the attention mask.
+            hidden = outputs.hidden_states[layer_idx].float()
         else:  # plantcad — Caduceus exposes layers via output_hidden_states
             from PlantCAD_modules import average_rc_embeddings
             outputs   = self.model(**inputs, output_hidden_states=True)
@@ -496,7 +546,8 @@ def _build_snp_mask(
 ) -> torch.Tensor:
     """
     Build a (B, T) bool mask that is True for tokens whose character span
-    contains at least one SNP position.
+    contains at least one SNP position. For tokenizers that expose offsets
+    (dnabert2's fast tokenizer); see _build_snp_mask_kmer for carbon.
 
     offset_mapping : (B, T, 2) int tensor from the tokenizer.  Special tokens
                      and padding entries both have offset (0, 0) and will never
@@ -524,4 +575,39 @@ def _build_snp_mask(
         e_row  = ends[b].unsqueeze(0)      # (1, T)
         mask[b] = ((s_row <= p_col) & (p_col < e_row)).any(dim=0)
 
+    return mask
+
+
+def _build_snp_mask_kmer(
+    shape: tuple[int, int],
+    fingerprints: list[Fingerprint],
+    k: int,
+    n_prefix_tokens: int = 1,
+) -> torch.Tensor:
+    """
+    Build a (B, T) bool SNP-token mask analytically for fixed-stride k-mer
+    tokenizers that don't expose an offset mapping (carbon's <dna> 6-mer mode).
+
+    The DNA sequence is split into contiguous, non-overlapping k-mers after
+    ``n_prefix_tokens`` leading marker tokens, so DNA character c (0-based within
+    the window string, i.e. genomic pos - w_start) falls in token
+    ``n_prefix_tokens + c // k``. A final short chunk still occupies one k-mer
+    token, so the formula holds for windows whose length isn't a multiple of k.
+
+    shape           : (B, T) shape of the padded input_ids batch.
+    fingerprints    : Fingerprint tuples (chrom, w_start, w_end, alt_positions).
+    k               : k-mer size (Carbon = 6).
+    n_prefix_tokens : tokens before the first DNA k-mer (Carbon's <dna> = 1).
+    """
+    B, T = shape
+    mask = torch.zeros(B, T, dtype=torch.bool)
+    for b, fp in enumerate(fingerprints):
+        alt_positions = fp[3]
+        if not alt_positions:
+            continue  # pure-reference window; caller falls back to attention mask
+        w_start = fp[1]
+        for p in alt_positions:
+            tok_idx = n_prefix_tokens + (p - w_start) // k
+            if 0 <= tok_idx < T:   # guards SNPs past a max_length truncation
+                mask[b, tok_idx] = True
     return mask

@@ -24,9 +24,21 @@ validation pass is chunked (--eval-chunk) rather than run over the whole split a
 once. AttentionHead's K queries make the attention itself cheap (scores are
 (B, K, n_windows)); the linear K/V projections over all windows dominate.
 
+Per-window centering (the default). Absolute window embeddings are dominated by a
+large shared per-window component; the per-sample signal sits ~4 orders of
+magnitude below it, so attention over the raw windows (with LayerNorm normalizing
+that shared part away) can't learn — it just predicts the mean. Subtracting each
+window's across-sample mean m_j (window_means, fit on TRAIN samples) makes each
+window vector *be* its per-sample deviation. With centering + the head's LayerNorm
+this reaches val_pcc ~0.5 on the absolute hw1000 cache vs ~0 without and ~0.11 for
+the mean-pool head. It's ON by default; --no-center-windows disables it. (Centering
+is a no-op for the sum/mean pooling heads — a constant shift the standardizer
+absorbs — so it lives here, not in train_head.py.)
+
 Metrics land in the same JSONL sidecar (train/val mean_mse, mean_pcc, and
 per-trait mse/pcc) as train_head.py, so the track_training notebook plots these
-runs identically.
+runs identically. Also logs window/aggregate norms (norm/*) each --log-every step
+so you can watch the centering effect and aggregate scale during training.
 
 Example
 -------
@@ -45,7 +57,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from crop_embed.models.fp_head_model import (
-    AttentionHead, FPGatherHeadModel, window_position_features,
+    AttentionHead, FPGatherHeadModel, window_position_features, window_means,
 )
 from crop_embed import FixedWindowEmbedder, MetricLogger, metrics_path_for, ActivationTracker
 from crop_embed.data.loading import prepare_data
@@ -70,6 +82,17 @@ parser.add_argument("--n-heads", type=int, default=4,
                     help="Attention heads in the cross-attention layer (must divide emb_dim).")
 parser.add_argument("--hidden-dim", type=int, default=None,
                     help="MLP hidden width after attention. Defaults to emb_dim.")
+parser.add_argument("--mlp-layers", type=int, default=0,
+                    help="Residual GELU blocks in the MLP head on top of the attention. "
+                         "0 (default) = the original 2-layer (proj→output) head; raise "
+                         "for a deeper head.")
+parser.add_argument("--mlp-dropout", type=float, default=0.0,
+                    help="Dropout in the MLP head (projection + residual blocks).")
+parser.add_argument("--center-windows", action=argparse.BooleanOptionalAction, default=True,
+                    help="Subtract each window's across-sample mean (fit on TRAIN samples) "
+                         "before attention, so each window vector is its per-sample "
+                         "deviation. ON by default — it's what makes attention learn on "
+                         "absolute embeddings. --no-center-windows disables it.")
 parser.add_argument("--positional", action="store_true",
                     help="Add a learnable per-chromosome embedding + fixed sinusoidal "
                          "position encoding to each window before attention (else the "
@@ -107,11 +130,14 @@ parser.add_argument("--split", type=str, default="splits/sativas413_seed42.pt",
 # I/O
 parser.add_argument("--output", type=str, required=True, help="Path to write model.pt.")
 
+parser.add_argument("--device", type=int, default=0,
+                    help="CUDA device index to use. Defaults to 0.")
+
 args = parser.parse_args()
 torch.manual_seed(args.seed)
 eval_chunk = args.eval_chunk or args.batch_size
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
 
 # Local JSONL metrics sidecar (always on) + optional wandb.
 logger = MetricLogger(
@@ -168,9 +194,17 @@ if args.positional:
     w_chroms, w_positions = window_position_features(dataset)
     pos_kwargs = dict(positional=True, window_chroms=w_chroms, window_positions=w_positions)
 
+# Per-window across-sample mean (TRAIN samples only — no val leak), subtracted from
+# each window before attention. This is the default and the key to learning here.
+window_mean = None
+if args.center_windows:
+    window_mean = window_means(cache, sample_fp_index, train_idx)   # (n_windows, D)
+
 inner = AttentionHead(
     emb_dim, n_traits,
     n_queries=args.n_queries, n_heads=args.n_heads, hidden_dim=args.hidden_dim,
+    mlp_layers=args.mlp_layers, mlp_dropout=args.mlp_dropout,
+    window_mean=window_mean,
     **pos_kwargs,
 )
 head = FPGatherHeadModel(inner).to(device)
@@ -188,6 +222,7 @@ opt = torch.optim.AdamW(
 
 n_params = sum(p.numel() for p in head.parameters())
 print(f"Head: attention (n_queries={args.n_queries}, n_heads={args.n_heads}, "
+      f"mlp_layers={args.mlp_layers}, center_windows={args.center_windows}, "
       f"positional={args.positional}) — {n_params:,} params")
 
 tracker = ActivationTracker(head) if args.track_activations else None
@@ -210,6 +245,29 @@ def predict_chunked(sample_idx: torch.Tensor) -> torch.Tensor:
         b = sample_idx[i:i + eval_chunk].to(device)
         preds.append(head(cache, sample_fp_index[b]))
     return torch.cat(preds, dim=0)
+
+
+@torch.no_grad()
+def norm_metrics(gather_ind: torch.Tensor) -> dict:
+    """Per-batch window-level and aggregate-level L2 norms, logged on each --log-every
+    step so the centering effect (window_raw → window_centered collapse) and the
+    aggregate scale/signal are visible alongside the loss.
+
+      norm/window_raw        : mean ‖window vector‖ as cached (pre-centering)
+      norm/window_centered   : mean ‖window vector‖ fed to attention (post-centering)
+      norm/aggregate         : mean ‖attended summary‖ (the per-sample aggregate)
+      norm/aggregate_sample_std : across-sample std of the aggregate — the signal that
+                                  must be non-trivial for the head to discriminate samples
+    """
+    g = cache[gather_ind]                                  # (B, n_windows, D) raw
+    m = head.model
+    out = {"norm/window_raw": g.norm(dim=-1).mean().item()}
+    if m.center_windows:
+        out["norm/window_centered"] = (g - m.window_mean).norm(dim=-1).mean().item()
+    feats = m.attend(g)                                    # (B, K*D) attended summary
+    out["norm/aggregate"] = feats.norm(dim=-1).mean().item()
+    out["norm/aggregate_sample_std"] = feats.std(0).mean().item()
+    return out
 
 
 n_train = len(train_idx)
@@ -236,10 +294,13 @@ for epoch in range(args.epochs):
         if is_log:
             train_m = _compute_metrics(pred.detach(), y, trait_cols, "train")
             act_m = tracker.collect() if tracker is not None else {}
+            norm_m = norm_metrics(gather_ind)
             print(f"epoch {epoch:4d} step {step:6d}"
                   f"  loss={train_m.get('train/mean_mse', loss.item()):.4f}"
-                  f"  pcc={train_m.get('train/mean_pcc', float('nan')):.3f}")
-            logger.log({"epoch": epoch, "step": step, **train_m, **act_m})
+                  f"  pcc={train_m.get('train/mean_pcc', float('nan')):.3f}"
+                  f"  |agg|={norm_m['norm/aggregate']:.3f}"
+                  f"  agg_sstd={norm_m['norm/aggregate_sample_std']:.4f}")
+            logger.log({"epoch": epoch, "step": step, **train_m, **act_m, **norm_m})
         step += 1
 
     # End-of-epoch validation over the full split (chunked forward).
@@ -265,7 +326,13 @@ torch.save({
         "n_queries": args.n_queries,
         "n_heads": args.n_heads,
         "hidden_dim": args.hidden_dim,
+        "mlp_layers": args.mlp_layers,
+        "mlp_dropout": args.mlp_dropout,
         "positional": args.positional,
+        # window_mean (the per-window centering baseline) round-trips in the
+        # state_dict as a buffer; this flag tells a loader to size that buffer.
+        "center_windows": args.center_windows,
+        "n_windows": n_windows,
     },
     "cache_path": args.cache,
     "split_path": SPLIT_PATH,

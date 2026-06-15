@@ -39,7 +39,7 @@ mkdir -p "$CACHE_DIR" "$HEAD_DIR" "$LOG_DIR"
 # ── Sweep knobs ───────────────────────────────────────────────────────────────
 HALF_WINDOWS=(2000)
 HEADS=(linear mlp)
-VARIANTS=(absolute refdelta)   # absolute = FPSumHeadModel, refdelta = ref-subtracted
+VARIANTS=(absolute refdelta centered)   # absolute=FPSumHeadModel, refdelta=ref-subtracted, centered=per-window-mean-subtracted
 POOL=mean               # window pooling mode (sum|mean); passed to train_head.py
 MODEL_PATH=HuggingFaceBio/Carbon-500M   # encoder repo (swap to Carbon-3B to scale up)
 BATCH=16               # embed batch size (500M backbone — smaller than dnabert2's 64)
@@ -52,6 +52,7 @@ variant_flags() {
   case $1 in
     absolute) echo "" ;;
     refdelta) echo "--subtract-reference" ;;
+    centered) echo "--center-windows" ;;
     *) echo "!!! unknown variant: $1" >&2; return 1 ;;
   esac
 }

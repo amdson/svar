@@ -48,6 +48,7 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from crop_embed.models.fp_head_model import (
     MLPModel, LinearModel, FPSumHeadModel, FPRefDeltaSumHeadModel,
+    FPCenteredSumHeadModel, window_means,
 )
 from crop_embed import FixedWindowEmbedder, MetricLogger, metrics_path_for, ActivationTracker
 from crop_embed.data.loading import prepare_data
@@ -79,11 +80,27 @@ parser.add_argument("--subtract-reference", action="store_true",
                          "variant-free reference embedding before pooling, so the head "
                          "learns from deltas-from-reference. Default is the absolute "
                          "FPSumHeadModel.")
+parser.add_argument("--center-windows", action="store_true",
+                    help="Train an FPCenteredSumHeadModel: subtract each window's "
+                         "across-sample MEAN (fit on TRAIN samples) before pooling — the "
+                         "symmetric counterpart to --subtract-reference (no window is "
+                         "forced to zero). NOTE: with the learned standardizer on this is "
+                         "a constant shift it absorbs, so it equals the absolute head; it "
+                         "only differs from absolute under --no-normalize (the meaningful "
+                         "comparison vs --subtract-reference). Mutually exclusive with it.")
 parser.add_argument("--pool", choices=["sum", "mean"], default="sum",
                     help="How windows are pooled into the per-sample vector. 'sum' "
                          "magnitude grows with #windows; 'mean' is window-count "
                          "invariant. The pre-pool here and the head's forward use this "
                          "same mode, and it's saved in head_config for reconstruction.")
+parser.add_argument("--center-ln-pool", action="store_true",
+                    help="DIAGNOSTIC aggregator: instead of plain pooling, mean-pool the "
+                         "per-window-CENTERED, per-window-LayerNorm'd (parameter-free) "
+                         "embeddings — exactly what an AttentionHead sees under uniform "
+                         "('random') attention weights. Gives the floor attention should "
+                         "beat. Forces mean pooling; incompatible with --subtract-reference. "
+                         "The saved checkpoint does NOT reproduce this transform at inference "
+                         "(it's for measuring val pcc, not deployment).")
 
 # Warm-starting (2.a / 2.b — mutually exclusive)
 parser.add_argument("--warm-start-head", type=str, default=None,
@@ -128,6 +145,9 @@ if args.warm_start_head and args.warm_start_standardizer:
         "--warm-start-head and --warm-start-standardizer are mutually exclusive: a "
         "pretrained head already carries a standardizer fit on its own embeddings."
     )
+
+if args.subtract_reference and args.center_windows:
+    parser.error("--subtract-reference and --center-windows are mutually exclusive.")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -181,16 +201,41 @@ print(f"  {cache.shape[0]:,} fingerprints × {emb_dim} dims; {sample_fp_index.sh
 # absolute embedding; ref_index[i] is the cache row of fingerprint i's variant-free
 # reference window. The delta table is likewise frozen, so it pre-sums the same way.
 
-if args.subtract_reference:
+if args.center_ln_pool:
+    # Diagnostic: mean-pool the per-window-centered, per-window-LayerNorm'd windows
+    # — the exact representation an AttentionHead averages under uniform attention.
+    # Done in sample-chunks so the (n_samples, n_windows, D) gather never materializes.
+    if args.subtract_reference:
+        parser.error("--center-ln-pool is incompatible with --subtract-reference")
+    ref_index = None
+    cache_d = cache.to(device)
+    sfi_d   = sample_fp_index.to(device)
+    wmean   = window_means(cache_d, sfi_d, train_idx.to(device))      # (n_windows, D), train-only
+    parts = []
+    for i in range(0, sfi_d.shape[0], 16):
+        g = cache_d[sfi_d[i:i + 16]] - wmean                          # center  (b, nw, D)
+        g = F.layer_norm(g, (g.shape[-1],))                          # param-free per-window LN
+        parts.append(g.mean(dim=1).cpu())                            # mean-pool over windows
+    summed = torch.cat(parts, dim=0)                                 # (n_samples, D)
+    print(f"  center-ln-pool: mean over centered+LayerNorm'd windows (uniform-attention floor)")
+elif args.subtract_reference:
     ref_index = FPRefDeltaSumHeadModel.build_ref_index(dataset.unique_fingerprints)
     table = FPRefDeltaSumHeadModel.subtract_reference(cache, ref_index)   # (n_fps, D)
+    summed = F.embedding_bag(sample_fp_index, table, mode=args.pool)      # (n_samples, D)
+elif args.center_windows:
+    ref_index = None
+    window_center = FPCenteredSumHeadModel.build_window_center(
+        cache.to(device), sample_fp_index.to(device), train_idx.to(device)
+    ).cpu()                                                               # (n_fps, D), train-only
+    table = FPCenteredSumHeadModel.subtract_center(cache, window_center)  # (n_fps, D)
+    summed = F.embedding_bag(sample_fp_index, table, mode=args.pool)      # (n_samples, D)
+    print(f"  center-windows: pool each window's deviation from its across-sample mean")
 else:
     ref_index = None
     table = cache
-
-# Pre-pool with the SAME mode the head's forward uses, so forward_postsum trains on
-# the same scale the head would see at inference (--pool, default "sum").
-summed = F.embedding_bag(sample_fp_index, table, mode=args.pool)   # (n_samples, D)
+    # Pre-pool with the SAME mode the head's forward uses, so forward_postsum trains on
+    # the same scale the head would see at inference (--pool, default "sum").
+    summed = F.embedding_bag(sample_fp_index, table, mode=args.pool)      # (n_samples, D)
 
 train_ds = TensorDataset(summed[train_idx], Y[train_idx])
 val_x = summed[val_idx].to(device)
@@ -212,6 +257,13 @@ warm_start_embeddings = summed[train_idx] if args.warm_start_standardizer else N
 if args.subtract_reference:
     head = FPRefDeltaSumHeadModel(
         inner, emb_dim=emb_dim, ref_index=ref_index,
+        normalize=not args.no_normalize,
+        warm_start_embeddings=warm_start_embeddings,
+        pool=args.pool,
+    ).to(device)
+elif args.center_windows:
+    head = FPCenteredSumHeadModel(
+        inner, emb_dim=emb_dim, window_center=window_center,
         normalize=not args.no_normalize,
         warm_start_embeddings=warm_start_embeddings,
         pool=args.pool,
@@ -298,8 +350,11 @@ torch.save({
     "head_state_dict": head.state_dict(),
     "head_config": {
         "head": args.head,
-        "model_class": "FPRefDeltaSumHeadModel" if args.subtract_reference else "FPSumHeadModel",
+        "model_class": ("FPRefDeltaSumHeadModel" if args.subtract_reference
+                        else "FPCenteredSumHeadModel" if args.center_windows
+                        else "FPSumHeadModel"),
         "subtract_reference": args.subtract_reference,
+        "center_windows": args.center_windows,
         "pool": args.pool,
         "emb_dim": emb_dim,
         "n_traits": n_traits,

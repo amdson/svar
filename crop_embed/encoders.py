@@ -28,6 +28,7 @@ from crop_embed.embedder import WindowEmbedder
 DEFAULT_MODEL_PATHS = {
     "dnabert2": "zhihan1996/DNABERT-2-117M",
     "plantcad": "kuleshov-group/PlantCaduceus_l32",
+    "carbon":   "HuggingFaceBio/Carbon-500M",
 }
 
 
@@ -48,7 +49,8 @@ def load_encoder_model(
 
     `attn_impl` selects the DNABERT-2 attention backend: "torch" (the default,
     pure-PyTorch matmul — needs no flash-attn/CUDA) or "flash" (FlashAttention,
-    requires CUDA + the flash-attn package). Ignored by the plantcad backend.
+    requires CUDA + the flash-attn package). Ignored by the plantcad/carbon
+    backends.
     """
     if backend not in DEFAULT_MODEL_PATHS:
         raise ValueError(f"Unknown backend {backend!r}; expected one of {list(DEFAULT_MODEL_PATHS)}.")
@@ -68,6 +70,13 @@ def load_encoder_model(
             config_overrides={"pad_token_id": tokenizer.pad_token_id, "attn_impl": attn_impl},
             device=device,
         )
+        return model, tokenizer
+
+    if backend == "carbon":
+        from CARBON_modules import load_carbon
+        # dtype=None lets load_carbon pick its bfloat16 default (the published
+        # Carbon recipe); pass dtype through to override.
+        model, tokenizer = load_carbon(repo_id=model_path, device=device, dtype=dtype)
         return model, tokenizer
 
     # plantcad

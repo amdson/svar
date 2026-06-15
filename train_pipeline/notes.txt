@@ -13,6 +13,10 @@ python train_pipeline/embed_windows.py --half-window 2000 --buffer 0 --max-lengt
 python train_pipeline/train_head.py --cache checkpoints/sativas413_embeddings_500_snponly.ckpt.pt --head mlp --n-layers=9 --hidden-dim=1500 --dropout=0.65 --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/mlp_sum/model_snponly.pt
 python train_pipeline/train_head.py --cache checkpoints/sativas413_embeddings_1000_snponly.ckpt.pt --head mlp --n-layers=9 --hidden-dim=1500 --dropout=0.65 --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/mlp_sum/model_1000_snponly.pt
 
+
+python train_pipeline/train_head.py --cache checkpoints/sweep/sativas413_hw1000.ckpt.pt --head mlp --n-layers=9 --hidden-dim=1500 --dropout=0.65 --epochs 100 --lr 1e-3 --warm-start-standardizer --centered --output trained_heads/centered-mlp_mean/model_1000_snponly.pt
+
+
 python train_pipeline/train_head.py --cache checkpoints/sativas413_embeddings.ckpt.pt --head mlp --n-layers=9 --hidden-dim=1500 --dropout=0.5 --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/mlp_sum/model.pt
 python train_pipeline/train_head.py --cache checkpoints/sativas413_embeddings.ckpt.pt --head linear --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/linear_sum/model.pt
 
@@ -25,6 +29,7 @@ python train_pipeline/train_end2end.py --head-checkpoint trained_heads/linear_su
  python train_pipeline/train_head.py --cache checkpoints/sweep/sativas413_hw500.ckpt.pt --head linear --epochs 15 --lr 1e-3 --subtract-reference --no-normalize --output trained_heads/linear_mean_ns/model.pt
 python train_pipeline/train_end2end.py     --head-checkpoint trained_heads/linear_mean_ns/model.pt     --half-window 500  --buffer 0     --epochs 5 --lr 1e-5 --batch-size 8 --chunk-size 32     --precision fp32 --track-activations --log-every 1     --output trained_e2e/linear_hw500_mean_ns_sr/model.pt
 python train_pipeline/train_end2end.py     --head-checkpoint trained_heads/linear_mean_ns/model.pt     --half-window 500  --buffer 0     --epochs 5 --lr 1e-5 --batch-size 128 --chunk-size 64     --precision fp32 --track-activations --log-every 1     --output trained_e2e/linear_hw500_mean_ns_sr_v2/model.pt
+
 
 - Carbon-500M backend (HuggingFaceBio/Carbon-500M, decoder-only causal LM; loads in bf16, emb cast to fp32 for pooling). hw500 absolute linear, mirrors the dnabert2 flow.
 # 1. Embed windows with carbon (smaller batch — 500M params). Defaults --model-path to HuggingFaceBio/Carbon-500M.
@@ -41,3 +46,23 @@ python train_pipeline/train_end2end.py --backend carbon --head-checkpoint traine
 python train_pipeline/train_head.py --cache checkpoints/carbon/sativas413_carbon500m_hw500.ckpt.pt --half-window 500 --buffer 0 --head mlp --n-layers=9 --hidden-dim=1500 --dropout=0.5 --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/carbon/linear_hw500/model.pt
 
 python train_pipeline/train_head.py --cache checkpoints/sweep_carbon/sativas413_carbon_hw1000.ckpt.pt --half-window 1000 --buffer 0 --head mlp --n-layers=9 --hidden-dim=1500 --dropout=0.5 --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/carbon/test/model.pt
+
+- Attention aggregator head (FPGatherHeadModel(AttentionHead)) on the absolute hw1000 cache. Per-window centering (subtract each window's across-sample mean) is ON by default and is what makes it learn — reaches val_pcc ~0.5 vs ~0.11 for the mean-pool head. Logs norm/window_* and norm/aggregate_* alongside the usual train/val metrics.
+python train_pipeline/train_attention_head.py --cache checkpoints/sweep/sativas413_hw1000.ckpt.pt --half-window 1000 --buffer 0 --n-queries 8 --n-heads 4 --batch-size 16 --epochs 50 --lr 1e-3 --output trained_heads/attention/hw1000_abs/model.pt
+# ablation: --no-center-windows reproduces the stuck (~0 pcc) baseline. --positional adds per-chrom + sinusoidal window position encodings.
+python train_pipeline/train_attention_head.py --cache checkpoints/sweep/sativas413_hw1000.ckpt.pt --half-window 1000 --buffer 0 --batch-size 16 --epochs 50 --lr 1e-3 --no-center-windows --output trained_heads/attention/hw1000_abs_nocenter/model.pt
+# deeper MLP head on top of the attention (residual GELU blocks + dropout); mlp-layers 0 (default) = the original 2-layer head.
+python train_pipeline/train_attention_head.py --cache checkpoints/sweep/sativas413_hw1000.ckpt.pt --positional --half-window 1000 --buffer 0 --batch-size 24 --epochs 50 --lr 1e-3 --mlp-layers 9 --mlp-dropout 0.5 --output trained_heads/attention/hw1000_abs_mlp5/model.pt
+python train_pipeline/train_attention_head.py --cache checkpoints/sweep/sativas413_hw1000.ckpt.pt --half-window 1000 --buffer 0 --batch-size 24 --epochs 50 --lr 1e-3 --mlp-layers 9 --mlp-dropout 0.5 --output trained_heads/attention/hw1000_abs_mlp5/model.pt
+
+
+- DEBUG center-windows: full reproduction (embed hw1000 -> train mlp head with per-window centering).
+#   The mean-pool flag is --center-windows (NOT --centered; that arg does not exist). With mean
+#   pooling, per-window centering should match the absolute head's train pcc (~0.99); the current
+#   run sits at train ~0.12, so the FPCenteredSumHeadModel pre-pool path is the suspect.
+# 1. Embed hw1000 windows (dnabert2 default backend). Same config as the sweep's sativas413_hw1000 cache.
+python train_pipeline/embed_windows.py --backend dnabert2 --half-window 1000 --buffer 0 --max-length 2048 --batch-size 64 --output checkpoints/debug/sativas413_hw1000.ckpt.pt
+# 2. Train an mlp head with windows centered (default 2-layer/hidden-768 mlp, mean pool, warm-started standardizer).
+python train_pipeline/train_head.py --cache checkpoints/debug/sativas413_hw1000.ckpt.pt --half-window 1000 --buffer 0 --head mlp --pool mean --center-windows --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/debug/centered_mlp_hw1000/model.pt
+# baseline for comparison (same cache, no centering -> expect train ~0.99, val ~0.61):
+python train_pipeline/train_head.py --cache checkpoints/debug/sativas413_hw1000.ckpt.pt --half-window 1000 --buffer 0 --head mlp --pool mean --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/debug/absolute_mlp_hw1000/model.pt
