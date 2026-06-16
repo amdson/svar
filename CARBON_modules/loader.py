@@ -71,16 +71,34 @@ def load_carbon(
 
     if dtype is None:
         dtype = torch.bfloat16
-    model = AutoModelForCausalLM.from_pretrained(
-        repo_id,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-        local_files_only=local,
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            repo_id,
+            trust_remote_code=True,
+            torch_dtype=dtype,
+            local_files_only=local,
+        )
+    except AttributeError:
+        # transformers <4.43 crashes in from_pretrained when a safetensors
+        # checkpoint was saved without a `__metadata__` header: it does
+        # `metadata.get("format")` on a `None` metadata. Carbon's published
+        # model.safetensors has no metadata, so build the (vanilla Llama) model
+        # from config and load the weights directly, bypassing that code path.
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(
+            repo_id, trust_remote_code=True, local_files_only=local
+        )
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+        state_dict = _download_carbon_weights(repo_id)
+        # `lm_head.weight` is tied to the embeddings and absent from the file;
+        # load non-strict and re-tie.
+        model.load_state_dict(state_dict, strict=False)
+        model.tie_weights()
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device).eval()
+    model = model.to(device=device, dtype=dtype).eval()
     return model, tokenizer
 
 

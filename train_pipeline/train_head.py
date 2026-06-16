@@ -46,7 +46,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from crop_embed.models.fp_head_model import (
-    MLPModel, LinearModel, FPSumHeadModel,
+    MLPModel, LinearModel, FPSumHeadModel, FPCenteredSumHeadModel)
 from crop_embed import FixedWindowEmbedder, MetricLogger, metrics_path_for, ActivationTracker
 from crop_embed.data.loading import prepare_data
 from crop_embed.train import masked_mse, _compute_metrics

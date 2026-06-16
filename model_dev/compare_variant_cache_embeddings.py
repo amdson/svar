@@ -72,6 +72,10 @@ def main() -> int:
     p.add_argument("--max-eval", type=int, default=None,
                    help="Stop after evaluating this many qualifying windows.")
     p.add_argument("--device", type=str, default=None)
+    p.add_argument("--csv-out", type=str, default=None,
+                   help="If set, write the per-window records (one row per window: "
+                        "n_snp, var_cos, cache_pool_cos, ref_pool_cos, cache_relerr, "
+                        "ref_relerr) to this CSV for plotting.")
     args = p.parse_args()
 
     device = torch.device(
@@ -159,6 +163,15 @@ def main() -> int:
     if not records:
         print("No windows with variant tokens found.")
         return 1
+
+    if args.csv_out:
+        import csv
+        with open(args.csv_out, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["n_snp", "var_cos", "cache_pool_cos", "ref_pool_cos",
+                        "cache_relerr", "ref_relerr"])
+            w.writerows(records)
+        print(f"Wrote {len(records):,} records to {args.csv_out}")
 
     _report(records)
     return 0
