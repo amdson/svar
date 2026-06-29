@@ -1,0 +1,12 @@
+# Track ONLY the recipes and provenance notes — never the data itself.
+# Data is large, often license-restricted, and fully re-buildable with `make`,
+# so it lives off in scratch (see common.mk) and is never committed.
+
+# Ignore everything by default …
+*
+# … except the directory structure and the files that describe how to rebuild it.
+!*/
+!.gitignore
+!*.mk
+!Makefile
+!*.md
