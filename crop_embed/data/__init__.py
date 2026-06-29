@@ -1,4 +1,5 @@
 from crop_embed.data.vcf import SNPRecord, load_snps_from_vcf
+from crop_embed.data.pgen import load_snps_from_pgen
 from crop_embed.data.preprocessing import (
     load_vcf_sparse,
     load_phenotypes,
@@ -30,8 +31,8 @@ from crop_embed.data.loading import (
 )
 
 __all__ = [
-    # vcf
-    "SNPRecord", "load_snps_from_vcf",
+    # vcf / pgen
+    "SNPRecord", "load_snps_from_vcf", "load_snps_from_pgen",
     # preprocessing
     "load_vcf_sparse", "load_phenotypes", "align_samples",
     "align_targets_to_dataset",

@@ -42,6 +42,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from crop_embed.data.coords import FASTA_PATH
+from crop_embed import MetricLogger, metrics_path_for
 from CARBON_modules import load_carbon_local, load_carbon_variant_cache
 from variant_mlm.data import build_variant_window_dataset, split_indices
 from variant_ar.loss import evaluate_next_token, snp_next_token_nll
@@ -115,6 +116,9 @@ def main() -> int:
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--output", type=str, required=True,
                    help="Path to write the best fine-tuned model.pt.")
+    p.add_argument("--wandb-project", type=str, default=None,
+                   help="If set, also mirror metrics to this wandb project.")
+    p.add_argument("--wandb-name", type=str, default=None)
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -128,6 +132,16 @@ def main() -> int:
             from contextlib import nullcontext
             return nullcontext()
         return torch.autocast(device_type=device.type, dtype=amp_dtype)
+
+    # ── Metric logging (local JSONL sidecar next to --output; optional wandb) ───
+    # Mirrors train_pipeline/train_head.py so AR runs are tracked identically.
+    # Log-likelihood on SNP tokens is just the negation of the next-token NLL.
+    logger = MetricLogger(
+        metrics_path_for(args.output),
+        wandb_project=args.wandb_project, wandb_name=args.wandb_name,
+        config=vars(args),
+    )
+    print(f"Logging metrics to {logger.metrics_path}")
 
     # ── Data ──────────────────────────────────────────────────────────────────
     print(f"Device: {device}  backend={args.backend}  half_window={args.half_window}")
@@ -184,12 +198,17 @@ def main() -> int:
 
             if step % args.log_every == 0:
                 print(f"epoch {epoch} step {step}  train_loss={loss.item():.4f}")
+                logger.log({"epoch": epoch, "step": step,
+                            "train/nll": loss.item(), "train/ll": -loss.item()})
             step += 1
 
         val = evaluate_next_token(model, tokenizer, val_loader, backend=args.backend,
                                   max_length=args.max_length, device=device)
         print(f"epoch {epoch}  [val] nll={val['mean_nll']:.4f}  "
               f"ppl={val['perplexity']:.3f}  (n_tokens={val['n_tokens']:,})")
+        logger.log({"epoch": epoch, "step": step,
+                    "val/nll": val["mean_nll"], "val/ll": -val["mean_nll"],
+                    "val/perplexity": val["perplexity"], "val/n_tokens": val["n_tokens"]})
 
         if val["mean_nll"] < best_val:
             best_val = val["mean_nll"]
@@ -204,6 +223,7 @@ def main() -> int:
             print(f"  saved best model (val_nll={best_val:.4f}) -> {out_path}")
 
     print(f"\nDone. Best val nll: {best_val:.4f}")
+    logger.close()
     return 0
 
 

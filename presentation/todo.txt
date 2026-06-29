@@ -1,0 +1,12 @@
+1. Calculate number of unique windows in dataset for windows going from 1 to 1e6 in length. 
+    - Plot in matplotlib
+    - Also plot mean tokens per window and #unique window variants per window
+2. Plot effect of each model training diff on MSE/PCC curves for both train and val head models. 
+    - Recreate plots for each model training diff for specific traits
+3. Plot UMAP/T-SNE visualizations of all the difference preprocessing options for embeddings + Carbon vs DNABert2
+    - All vs snp-only
+    - Carbon vs DNABert2
+    - Centered + normed -> average vs summed and standardized
+4. Plot degradation of SNP embeddings vs reference when using variant cache approximation with 1-10 SNPs in context
+5. Plot training curves for Carbon AR model fine-tuned on 90% subset of SNP windows using variant cache method 
+    - train + val, log-likelihood on SNP tokens

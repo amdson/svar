@@ -25,10 +25,20 @@ from transformers import AutoTokenizer
 
 from crop_embed.embedder import WindowEmbedder
 
+# Carbon ships in several sizes under one repo-naming scheme
+# (HuggingFaceBio/Carbon-<size>); they share architecture + tokenizer, so the
+# carbon loader / embedder handle all of them identically — only the repo id
+# differs. Keyed by the size label exposed on the CLI (--carbon-size).
+CARBON_MODEL_PATHS = {
+    "500M": "HuggingFaceBio/Carbon-500M",
+    "3B":   "HuggingFaceBio/Carbon-3B",
+    "8B":   "HuggingFaceBio/Carbon-8B",
+}
+
 DEFAULT_MODEL_PATHS = {
     "dnabert2": "zhihan1996/DNABERT-2-117M",
     "plantcad": "kuleshov-group/PlantCaduceus_l32",
-    "carbon":   "HuggingFaceBio/Carbon-500M",
+    "carbon":   CARBON_MODEL_PATHS["500M"],
 }
 
 

@@ -38,6 +38,7 @@ Example
 python train_pipeline/train_head.py --cache checkpoints/sativas413_embeddings.ckpt.pt --head linear --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/linear_sum/model.pt
 """
 import argparse
+import pickle
 import sys
 from pathlib import Path
 
@@ -46,7 +47,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from crop_embed.models.fp_head_model import (
-    MLPModel, LinearModel, FPSumHeadModel, FPCenteredSumHeadModel)
+    MLPModel, LinearModel, FPSumHeadModel, FPCenteredSumHeadModel, FPRefDeltaSumHeadModel)
 from crop_embed import FixedWindowEmbedder, MetricLogger, metrics_path_for, ActivationTracker
 from crop_embed.data.loading import prepare_data
 from crop_embed.train import masked_mse, _compute_metrics
@@ -72,6 +73,22 @@ parser.add_argument("--n-layers", type=int, default=2, help="MLP residual blocks
 parser.add_argument("--dropout", type=float, default=0.0, help="MLP dropout (--head mlp).")
 parser.add_argument("--no-normalize", action="store_true",
                     help="Disable the learned de-mean/rescale standardizer in the head.")
+parser.add_argument("--standardizer", choices=["perdim", "rms"], default="perdim",
+                    help="Standardizer when normalize is on. 'perdim' rescales each "
+                         "dim by its own std (the original). 'rms' de-means per-dim "
+                         "but rescales the whole vector by a single RMS scalar — prefer "
+                         "it for --pool mean, where per-dim stds collapse to ~eps and "
+                         "the per-dim divisor ill-conditions the head / inflates the "
+                         "embedder gradient by 1/scale.")
+parser.add_argument("--freeze-standardizer", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="Freeze the standardizer's mean/scale after warm-start (no "
+                         "gradients). Default: frozen whenever --warm-start-standardizer "
+                         "is set. Strongly recommended for --pool mean: the ~1e-5 signal "
+                         "needs a ~2e4x amplification to reach unit scale, and a trainable "
+                         "mean/log_scale jitters by ~lr per step in absolute units, which "
+                         "that amplification turns into a signal-swamping output swing. "
+                         "Pass --no-freeze-standardizer to keep it trainable (old behavior).")
 parser.add_argument("--subtract-reference", action="store_true",
                     help="Train an FPRefDeltaSumHeadModel: subtract each window's "
                          "variant-free reference embedding before pooling, so the head "
@@ -163,8 +180,25 @@ print(f"Logging metrics to {logger.metrics_path}")
 
 
 SPLIT_PATH = args.split
-data = prepare_data(split_path=SPLIT_PATH,
-                    half_window=args.half_window, buffer=args.buffer)
+
+# Quick hack: building the window dataset (VCF -> partitioner -> UniqueWindowDataset)
+# is slow and identical across runs with the same windowing + split, so pickle the
+# prepare_data result and reload it when those inputs match. The key only covers
+# half_window/buffer/split (train_head always uses default VCF/FASTA/pheno paths) —
+# delete .prepare_data_cache/ if you change those defaults.
+_data_cache = Path(".prepare_data_cache") / (
+    f"hw{args.half_window}_buf{args.buffer}_{Path(SPLIT_PATH).stem}.pkl")
+if _data_cache.exists():
+    print(f"Loading cached dataset from {_data_cache}")
+    with open(_data_cache, "rb") as f:
+        data = pickle.load(f)
+else:
+    data = prepare_data(split_path=SPLIT_PATH,
+                        half_window=args.half_window, buffer=args.buffer)
+    _data_cache.parent.mkdir(parents=True, exist_ok=True)
+    with open(_data_cache, "wb") as f:
+        pickle.dump(data, f)
+    print(f"Cached dataset to {_data_cache}")
 
 dataset    = data["dataset"]
 Y          = data["Y"]
@@ -251,12 +285,17 @@ else:
 # When --subtract-reference, `summed` is the per-sample delta sum, so the standardizer
 # is fit on the delta distribution the head actually sees.
 warm_start_embeddings = summed[train_idx] if args.warm_start_standardizer else None
+# Default: freeze the standardizer whenever it was warm-started (see --freeze-standardizer).
+freeze_standardizer = (args.warm_start_standardizer if args.freeze_standardizer is None
+                       else args.freeze_standardizer)
 if args.subtract_reference:
     head = FPRefDeltaSumHeadModel(
         inner, emb_dim=emb_dim, ref_index=ref_index,
         normalize=not args.no_normalize,
         warm_start_embeddings=warm_start_embeddings,
         pool=args.pool,
+        standardizer=args.standardizer,
+        freeze_standardizer=freeze_standardizer,
     ).to(device)
 elif args.center_windows:
     head = FPCenteredSumHeadModel(
@@ -264,6 +303,8 @@ elif args.center_windows:
         normalize=not args.no_normalize,
         warm_start_embeddings=warm_start_embeddings,
         pool=args.pool,
+        standardizer=args.standardizer,
+        freeze_standardizer=freeze_standardizer,
     ).to(device)
 else:
     head = FPSumHeadModel(
@@ -271,6 +312,8 @@ else:
         normalize=not args.no_normalize,
         warm_start_embeddings=warm_start_embeddings,
         pool=args.pool,
+        standardizer=args.standardizer,
+        freeze_standardizer=freeze_standardizer,
     ).to(device)
 
 # 2.a warm-start the whole head from a pretrained checkpoint (same architecture).
@@ -280,9 +323,12 @@ if args.warm_start_head:
     head.load_state_dict(ckpt["head_state_dict"])
 
 # Weight decay only on inner Linear weights (not biases, not the standardizer).
+# Skip frozen params (e.g. a frozen standardizer) so they aren't handed to the optimizer.
 linear_weight_ids = {id(m.weight) for m in head.modules() if isinstance(m, torch.nn.Linear)}
 decay, nodecay = [], []
 for p in head.parameters():
+    if not p.requires_grad:
+        continue
     (decay if id(p) in linear_weight_ids else nodecay).append(p)
 opt = torch.optim.AdamW(
     [{"params": decay, "weight_decay": args.weight_decay},
@@ -292,7 +338,9 @@ opt = torch.optim.AdamW(
 
 n_params = sum(p.numel() for p in head.parameters())
 head_label = f"refdelta-{args.head}" if args.subtract_reference else args.head
-print(f"Head: {head_label} ({n_params:,} params)  normalize={not args.no_normalize}")
+norm_desc = (f"{args.standardizer}{'(frozen)' if freeze_standardizer else ''}"
+             if not args.no_normalize else "off")
+print(f"Head: {head_label} ({n_params:,} params)  normalize={norm_desc}")
 
 # Optional per-layer activation/input tracking via forward hooks (no forward-pass
 # edits). Armed only on --log-every steps so non-logged steps stay overhead-free.
@@ -359,6 +407,8 @@ torch.save({
         "n_layers": args.n_layers,
         "dropout": args.dropout,
         "normalize": not args.no_normalize,
+        "standardizer": args.standardizer,
+        "freeze_standardizer": freeze_standardizer,
     },
     "cache_path": args.cache,
     "split_path": SPLIT_PATH,

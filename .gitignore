@@ -15,3 +15,5 @@ __pycache__/
 # Ignore .egg-info directories, which are created when installing Python packages in editable mode.
 *.egg-info/
 sativas413_embeddings.*
+# Ignore the train_head.py prepare_data pickle cache (large reference-sequence blobs).
+.prepare_data_cache/

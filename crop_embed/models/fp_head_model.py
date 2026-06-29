@@ -163,6 +163,55 @@ class _LearnedStandardizer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.mean) * torch.exp(-self.log_scale)
 
+class _RMSStandardizer(nn.Module):
+    """
+    Per-dimension de-meaning + a SINGLE scalar rescale: out = (x - mean) / scale.
+
+    Same shape API and warm-start contract as _LearnedStandardizer (learnable,
+    drifts during training, scale = exp(log_scale) to stay positive), with one
+    difference: `mean` is per-dim (D,) but `log_scale` is a scalar, so the whole
+    vector is divided by one number — its root-mean-square magnitude — rather than
+    each dim by its own std.
+
+    Why a scalar scale: per-dim whitening divides dim j by its own across-sample
+    std σ_j. Under mean pooling, averaging over thousands of windows collapses every
+    σ_j to ~1e-5, so the per-dim divisor (i) needs an absolute eps floor that then
+    sits right in the signal and clamps ~a quarter of the dims, and (ii) amplifies
+    the lowest-variance, least-informative dims by up to 1/σ_j — ill-conditioning
+    the head and, because the standardizer backward multiplies the gradient into the
+    windows by 1/scale, inflating the embedder gradient by the same factor (the very
+    blow-up sum pooling is avoided to dodge). A single RMS scale lifts the vector to
+    ~unit magnitude with no per-dim amplification, so it is scale-invariant across
+    pool modes and gradient-safe for end-to-end. Near-constant dims simply stay small
+    instead of being whitened up to unit variance.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-8) -> None:
+        super().__init__()
+        self.eps = eps
+        self.mean = nn.Parameter(torch.zeros(dim))
+        self.log_scale = nn.Parameter(torch.zeros(()))    # scalar; scale = exp(0) = 1
+
+    @torch.no_grad()
+    def warm_start(self, embeddings: torch.Tensor) -> None:
+        """
+        Initialize mean (per-dim) and the scalar scale from a (N, D) tensor of
+        representative embeddings — ideally the *pooled* per-sample vectors this
+        layer will actually see. The scale is the RMS magnitude of the de-meaned
+        embeddings over all elements, so the de-meaned vector lands at ~unit RMS.
+        """
+        if embeddings.dim() != 2 or embeddings.size(1) != self.mean.numel():
+            raise ValueError(
+                f"expected (N, {self.mean.numel()}) embeddings, got {tuple(embeddings.shape)}"
+            )
+        emb = embeddings.float()
+        self.mean.copy_(emb.mean(dim=0))
+        rms = (emb - self.mean).pow(2).mean().sqrt().clamp_min(self.eps)   # scalar
+        self.log_scale.copy_(rms.log())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) * torch.exp(-self.log_scale)
+
 class _ScalarScale(nn.Module):
     """Multiply by a single learnable scalar. A *linear* (additivity-preserving)
     alternative to LayerNorm for lifting tiny centered window vectors to a usable
@@ -209,11 +258,21 @@ class FPSumHeadModel(nn.Module):
     Parametrized head model that gathers and sums over fingerprint embeddings and then applies an arbitrary
     model to predict traits. The model can be a simple linear layer, an MLP, or any other architecture that takes in a (B, D) tensor and outputs (B, n_traits).
 
-    The summed embeddings pass through a learned de-mean + rescale layer
-    (`_LearnedStandardizer`) before the model, which conditions the otherwise
-    large/biased sum so early gradients are meaningful. Disable with
-    `normalize=False`. Pass `warm_start_embeddings` (an (N, D) tensor of
-    representative summed embeddings) to initialize that layer from real stats.
+    The summed embeddings pass through a learned de-mean + rescale layer before
+    the model, which conditions the otherwise large/biased sum so early gradients
+    are meaningful. `standardizer` picks the layer: "perdim" (`_LearnedStandardizer`,
+    per-dim std rescale) or "rms" (`_RMSStandardizer`, a single scalar RMS rescale —
+    prefer it for mean pooling, where per-dim stds collapse to ~eps). Disable either
+    with `normalize=False`. Pass `warm_start_embeddings` (an (N, D) tensor of
+    representative pooled embeddings) to initialize the layer from real stats.
+
+    `freeze_standardizer` makes the warm-started mean/scale non-trainable. Strongly
+    recommended (and the train_head.py default) when warm-starting under mean pooling:
+    lifting the ~1e-5 signal to unit scale needs a ~1/scale ≈ 2e4 amplification, and
+    a trainable mean/log_scale jitters by ~lr each AdamW step in *absolute* units — so
+    that jitter gets multiplied by the amplification into a huge swing in the layer's
+    output, swamping the signal. Freezing pins the stats so the input stays at unit
+    scale. (For sum pooling the amplification is ~1, so it matters far less there.)
     """
     def __init__(
         self,
@@ -222,21 +281,36 @@ class FPSumHeadModel(nn.Module):
         normalize: bool = True,
         warm_start_embeddings: torch.Tensor | None = None,
         pool: str = "sum",
+        standardizer: str = "perdim",
+        freeze_standardizer: bool = False,
     ) -> None:
         super().__init__()
         if pool not in ("sum", "mean"):
             raise ValueError(f"pool must be 'sum' or 'mean', got {pool!r}")
+        if standardizer not in ("perdim", "rms"):
+            raise ValueError(f"standardizer must be 'perdim' or 'rms', got {standardizer!r}")
         # How windows are pooled into the (B, D) per-sample vector: "sum" (magnitude
         # grows with #windows) or "mean" (window-count invariant). Plain string, so it
         # is NOT in state_dict — reconstruction must pass it (saved in head_config).
         # forward_postsum callers (train_head.py) must pre-pool with this SAME mode, or
         # the head trains/infers on a different scale than it was built for.
         self.pool = pool
+        # Which standardizer the .norm slot holds. Also a plain string (the chosen
+        # layer's parameter SHAPES differ — per-dim vs scalar log_scale — so a
+        # reconstructing caller must pass the same value before load_state_dict).
+        self.standardizer = standardizer
+        # Whether the standardizer's stats are frozen. requires_grad is NOT part of the
+        # state_dict, so a reconstructing caller must pass this again to match.
+        self.freeze_standardizer = freeze_standardizer
         self.model = model
         if normalize:
-            self.norm: nn.Module = _LearnedStandardizer(emb_dim)
+            std_cls = _RMSStandardizer if standardizer == "rms" else _LearnedStandardizer
+            self.norm: nn.Module = std_cls(emb_dim)
             if warm_start_embeddings is not None:
                 self.norm.warm_start(warm_start_embeddings)
+            if freeze_standardizer:
+                for p in self.norm.parameters():
+                    p.requires_grad_(False)
         else:
             if warm_start_embeddings is not None:
                 raise ValueError("warm_start_embeddings is only valid when normalize=True")
@@ -299,12 +373,16 @@ class FPRefDeltaSumHeadModel(FPSumHeadModel):
         normalize: bool = True,
         warm_start_embeddings: torch.Tensor | None = None,
         pool: str = "sum",
+        standardizer: str = "perdim",
+        freeze_standardizer: bool = False,
     ) -> None:
         super().__init__(
             model, emb_dim,
             normalize=normalize,
             warm_start_embeddings=warm_start_embeddings,
             pool=pool,
+            standardizer=standardizer,
+            freeze_standardizer=freeze_standardizer,
         )
         # (n_fps,) long; row i -> cache row of fingerprint i's reference window.
         # Registered as a buffer so it follows .to(device) and round-trips in the
@@ -420,12 +498,16 @@ class FPCenteredSumHeadModel(FPSumHeadModel):
         normalize: bool = True,
         warm_start_embeddings: torch.Tensor | None = None,
         pool: str = "sum",
+        standardizer: str = "perdim",
+        freeze_standardizer: bool = False,
     ) -> None:
         super().__init__(
             model, emb_dim,
             normalize=normalize,
             warm_start_embeddings=warm_start_embeddings,
             pool=pool,
+            standardizer=standardizer,
+            freeze_standardizer=freeze_standardizer,
         )
         # (n_fps, D): row i is the across-sample mean of fingerprint i's window.
         # Buffer so it follows .to(device) and round-trips in the state_dict.

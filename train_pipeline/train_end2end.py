@@ -472,6 +472,10 @@ def build_head(head_config: dict) -> FPSumHeadModel:
     # Pooling mode: older checkpoints predate this key, so default to "sum" (what
     # train_head.py pre-pooled with before --pool existed).
     pool = head_config.get("pool", "sum")
+    # Standardizer variant: older checkpoints predate this key and were all per-dim.
+    # Its parameter shapes differ (per-dim vs scalar log_scale), so it must match the
+    # checkpoint for load_state_dict to succeed.
+    standardizer = head_config.get("standardizer", "perdim")
     if head_config.get("subtract_reference") or head_config.get("model_class") == "FPRefDeltaSumHeadModel":
         # Reference-delta head. The global ref index (this dataset's fingerprints,
         # cache-row order) matches the train_head.py --subtract-reference checkpoint's
@@ -479,10 +483,11 @@ def build_head(head_config: dict) -> FPSumHeadModel:
         ref_index = FPRefDeltaSumHeadModel.build_ref_index(dataset.unique_fingerprints)
         return FPRefDeltaSumHeadModel(
             inner, emb_dim=emb_dim, ref_index=ref_index,
-            normalize=head_config["normalize"], pool=pool,
+            normalize=head_config["normalize"], pool=pool, standardizer=standardizer,
         ).to(device)
     return FPSumHeadModel(inner, emb_dim=emb_dim,
-                          normalize=head_config["normalize"], pool=pool).to(device)
+                          normalize=head_config["normalize"], pool=pool,
+                          standardizer=standardizer).to(device)
 
 
 if args.head_checkpoint:
