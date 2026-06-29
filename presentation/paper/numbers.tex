@@ -1,0 +1,28 @@
+% numbers.tex — canonical quantities, cited once so prose never disagrees.
+% Canonical window config: half_window = 500 bp (1 kb window), buffer = 0.
+% Counts at this config come from presentation/window_sweep.csv (row length=1000).
+%
+% NOTE: pipeline_summary.md quotes 26,267 windows for the legacy demo config
+% (buffer = 50). This document standardizes on buffer = 0.
+
+% Windowing (half_window = 500, buffer = 0)
+\newcommand{\nWindows}{23{,}138}            % total windows over the VCF
+\newcommand{\variantsPerWindow}{2.31}       % mean distinct haplotypes per window
+\newcommand{\meanTokens}{168}               % mean Carbon 6-mer tokens / 1 kb window
+
+% Forward-call accounting: naive vs. variant cache
+\newcommand{\naiveForwards}{8{,}861{,}854}   % naive sample x window full forwards
+\newcommand{\cacheRefForwards}{23{,}138}     % full reference forwards under the cache
+\newcommand{\cacheFactor}{383$\times$}       % naive -> variant-cache reduction
+
+% Embedding fidelity (fig 04 / vc_degradation.csv; Carbon-500M, fp32)
+\newcommand{\varCosMean}{0.99996}            % mean per-SNP-token cosine vs true alt
+\newcommand{\poolCosMean}{0.99999}           % mean window-pooled cosine vs true alt
+\newcommand{\relerrOneSnp}{2.5\times10^{-3}} % pooled rel. L2 error at 1 SNP
+\newcommand{\relerrEightSnp}{8.4\times10^{-3}} % pooled rel. L2 error at ~8 SNPs
+
+% Autoregressive SNP fine-tune (fig 05; Carbon-500M via the cache, 90% train)
+\newcommand{\arNllStart}{5.94}
+\newcommand{\arNllEnd}{5.03}
+\newcommand{\arPplStart}{382}
+\newcommand{\arPplEnd}{153}

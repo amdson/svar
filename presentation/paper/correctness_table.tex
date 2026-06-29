@@ -1,0 +1,21 @@
+% Placeholder — regenerate with presentation/make_correctness_table.py (needs the
+% Carbon-500M checkpoint). Values below are the expected/representative outcomes
+% of model_dev/test_carbon_variant_cache.py and are overwritten by that script.
+\begin{table}[t]
+  \centering
+  \caption{Variant-cache correctness checks on Carbon-500M (fp32). The efficient
+  log-sum-exp merge matches the brute-force oracle to numerical precision, and
+  the identity probe reproduces the ordinary forward; real substitutions are an
+  approximation, reported (not asserted). \emph{Placeholder values --- rerun
+  \texttt{make\_correctness\_table.py}.}}
+  \label{tab:correctness}
+  \begin{tabular}{lcc}
+    \toprule
+    Check & max abs.\ diff & cosine \\
+    \midrule
+    Efficient vs.\ brute-force        & $<10^{-3}$ & $1.0000$ \\
+    Identity probe vs.\ full forward  & $<10^{-3}$ & $1.0000$ \\
+    Real substitutions (approx.)      & ---        & $\sim 0.99$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}

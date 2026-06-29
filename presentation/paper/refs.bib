@@ -1,0 +1,110 @@
+% Bibliography for the variant-cache writeup.
+
+% ── DNA / genomic language models ────────────────────────────────────────────
+@article{zhou2023dnabert2,
+  title   = {DNABERT-2: Efficient Foundation Model and Benchmark for
+             Multi-Species Genome},
+  author  = {Zhou, Zhihan and Ji, Yanrong and Li, Weijian and Dutta, Pratik
+             and Davuluri, Ramana and Liu, Han},
+  journal = {arXiv preprint arXiv:2306.15006},
+  year    = {2023}
+}
+
+@article{dallatorre2023nucleotide,
+  title   = {The Nucleotide Transformer: Building and Evaluating Robust
+             Foundation Models for Human Genomics},
+  author  = {Dalla-Torre, Hugo and Gonzalez, Liam and Mendoza-Revilla, Javier
+             and others},
+  journal = {bioRxiv},
+  year    = {2023},
+  doi     = {10.1101/2023.01.11.523679}
+}
+
+@misc{carbon2024,
+  title        = {Carbon: A Genome Language Model for DNA},
+  author       = {{HuggingFaceBio}},
+  howpublished = {\url{https://huggingface.co/HuggingFaceBio/Carbon-500M}},
+  year         = {2024},
+  note         = {Decoder-only (Llama-architecture) DNA language model;
+                  500M/3B/8B checkpoints}
+}
+
+% ── Transformer architecture & positional encodings ──────────────────────────
+@inproceedings{vaswani2017attention,
+  title     = {Attention Is All You Need},
+  author    = {Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and Uszkoreit,
+               Jakob and Jones, Llion and Gomez, Aidan N. and Kaiser, {\L}ukasz
+               and Polosukhin, Illia},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2017}
+}
+
+@article{touvron2023llama,
+  title   = {LLaMA: Open and Efficient Foundation Language Models},
+  author  = {Touvron, Hugo and Lavril, Thibaut and Izacard, Gautier and others},
+  journal = {arXiv preprint arXiv:2302.13971},
+  year    = {2023}
+}
+
+@article{su2021rope,
+  title   = {RoFormer: Enhanced Transformer with Rotary Position Embedding},
+  author  = {Su, Jianlin and Lu, Yu and Pan, Shengfeng and Wen, Bo and Liu,
+             Yunfeng},
+  journal = {arXiv preprint arXiv:2104.09864},
+  year    = {2021}
+}
+
+@inproceedings{press2022alibi,
+  title     = {Train Short, Test Long: Attention with Linear Biases Enables
+               Input Length Extrapolation},
+  author    = {Press, Ofir and Smith, Noah A. and Lewis, Mike},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2022}
+}
+
+@article{ainslie2023gqa,
+  title   = {GQA: Training Generalized Multi-Query Transformer Models from
+             Multi-Head Checkpoints},
+  author  = {Ainslie, Joshua and Lee-Thorp, James and de Jong, Michiel and
+             Zemlyanskiy, Yury and Lebr{\'o}n, Federico and Sanghai, Sumit},
+  journal = {arXiv preprint arXiv:2305.13245},
+  year    = {2023}
+}
+
+% ── Online softmax / log-sum-exp merge (the cache's attention combine) ────────
+@article{milakov2018online,
+  title   = {Online Normalizer Calculation for Softmax},
+  author  = {Milakov, Maxim and Gimelshein, Natalia},
+  journal = {arXiv preprint arXiv:1805.02867},
+  year    = {2018}
+}
+
+@inproceedings{dao2022flashattention,
+  title     = {FlashAttention: Fast and Memory-Efficient Exact Attention with
+               IO-Awareness},
+  author    = {Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri
+               and R{\'e}, Christopher},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2022}
+}
+
+% ── Visualization ────────────────────────────────────────────────────────────
+@article{mcinnes2018umap,
+  title   = {UMAP: Uniform Manifold Approximation and Projection for Dimension
+             Reduction},
+  author  = {McInnes, Leland and Healy, John and Melville, James},
+  journal = {arXiv preprint arXiv:1802.03426},
+  year    = {2018}
+}
+
+% ── Rice diversity panel (the dataset) ───────────────────────────────────────
+@article{zhao2011rice,
+  title   = {Genome-Wide Association Mapping Reveals a Rich Genetic Architecture
+             of Complex Traits in {Oryza sativa}},
+  author  = {Zhao, Keyan and Tung, Chih-Wei and Eizenga, Georgia C. and others},
+  journal = {Nature Communications},
+  volume  = {2},
+  pages   = {467},
+  year    = {2011},
+  doi     = {10.1038/ncomms1467}
+}
