@@ -38,6 +38,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("file_a")
     parser.add_argument("file_b")
+    parser.add_argument("--csv-out", type=str, default=None,
+                        help="If set, write one row per shared window "
+                             "(n_snp, diff_norm, ref_norm, rel_diff) to this CSV "
+                             "for plotting (presentation/plot_cache_vs_fullforward.py).")
     args = parser.parse_args()
 
     rows_a = _load_rows(args.file_a)
@@ -57,6 +61,19 @@ def main():
     print(f"max diff norm:  {max_norm:.6g}")
     print(f"mean diff norm: {diff_norms.mean().item():.6g}")
     print(f"mean overall norm: {torch.stack([v.norm() for v in rows_a.values()]).mean().item():.6g}")
+
+    if args.csv_out:
+        import csv
+        # key = (chrom, w_start, w_end, alt_positions); #SNP = len(alt_positions).
+        with open(args.csv_out, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["n_snp", "diff_norm", "ref_norm", "rel_diff"])
+            for k in shared:
+                ref_norm = rows_a[k].norm().item()
+                diff = (rows_a[k] - rows_b[k]).norm().item()
+                w.writerow([len(k[3]), diff, ref_norm,
+                            diff / ref_norm if ref_norm else float("nan")])
+        print(f"wrote per-window CSV: {args.csv_out}  ({len(shared):,} rows)")
 
 
 if __name__ == "__main__":

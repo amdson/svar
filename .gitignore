@@ -15,5 +15,13 @@ __pycache__/
 # Ignore .egg-info directories, which are created when installing Python packages in editable mode.
 *.egg-info/
 sativas413_embeddings.*
+# Rice dataset VCFs — data lives on cluster scratch ($DATA_ROOT/rice), never in
+# git (see datasets/common.mk). Rebuild with `make -C datasets/rice`.
+*.vcf
 # Ignore the train_head.py prepare_data pickle cache (large reference-sequence blobs).
 .prepare_data_cache/
+# These are symlinks into cluster scratch (/90daydata/...) — see env.sh. They hold
+# generated embedding caches, trained head weights, and wandb runs; never commit them.
+/checkpoints
+/wandb
+/trained_heads

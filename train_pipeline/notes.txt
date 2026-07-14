@@ -53,7 +53,7 @@ python train_pipeline/train_head.py --cache checkpoints/carbon/sativas413_carbon
 # 3. End-to-end finetune carbon backbone + head (must pass --backend carbon to build the live embedder).
 python train_pipeline/train_end2end.py --backend carbon --head-checkpoint trained_heads/carbon/linear_hw500/model.pt --half-window 500 --buffer 0 --epochs 5 --lr 1e-5 --batch-size 8 --chunk-size 16 --precision fp32 --track-activations --log-every 1 --output trained_e2e/carbon_linear_hw500/model.pt
 
-python train_pipeline/train_head.py --cache checkpoints/carbon/sativas413_carbon500m_hw500.ckpt.pt --half-window 500 --buffer 0 --head mlp --n-layers=9 --hidden-dim=1500 --dropout=0.5 --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/carbon/linear_hw500/model.pt
+python train_pipeline/train_head.py --cache /home/andrew.dickson/svar/checkpoints/manual/sativas413_carbon500m_hw500.ckpt.pt --half-window 500 --buffer 0 --head mlp --n-layers=9 --hidden-dim=1500 --dropout=0.5 --epochs 15 --lr 1e-3 --warm-start-standardizer --output trained_heads/carbon/linear_hw500/model.pt
 
 python train_pipeline/train_head.py --cache checkpoints/sweep_carbon/sativas413_carbon_hw1000.ckpt.pt --half-window 1000 --buffer 0 --head mlp --n-layers=9 --hidden-dim=1500 --dropout=0.5 --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/carbon/test/model.pt
 
@@ -76,3 +76,19 @@ python train_pipeline/embed_windows.py --backend dnabert2 --half-window 1000 --b
 python train_pipeline/train_head.py --cache checkpoints/debug/sativas413_hw1000.ckpt.pt --half-window 1000 --buffer 0 --head mlp --pool mean --center-windows --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/debug/centered_mlp_hw1000/model.pt
 # baseline for comparison (same cache, no centering -> expect train ~0.99, val ~0.61):
 python train_pipeline/train_head.py --cache checkpoints/debug/sativas413_hw1000.ckpt.pt --half-window 1000 --buffer 0 --head mlp --pool mean --epochs 100 --lr 1e-3 --warm-start-standardizer --output trained_heads/debug/absolute_mlp_hw1000/model.pt
+
+# Big carbon model embeddings
+# 3B, half-window 500
+python train_pipeline/embed_windows.py \
+    --backend carbon --carbon-size 3B \
+    --vcf-path /home/andrew.dickson/rice_data/sativas413_msu7_final.vcf \
+    --half-window 500 --buffer 0 \
+    --output checkpoints/manual/sativas413_carbon3b_hw500.ckpt.pt
+
+# 3B, half-window 1000
+python train_pipeline/embed_windows.py \
+    --backend carbon --carbon-size 3B \
+    --vcf-path /home/andrew.dickson/rice_data/sativas413_msu7_final.vcf \
+    --half-window 1000 --buffer 0 \
+    --max-length 4096 \
+    --output checkpoints/manual/sativas413_carbon3b_hw1000.ckpt.pt

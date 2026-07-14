@@ -122,6 +122,10 @@ parser.add_argument("--warm-start-head", type=str, default=None,
 parser.add_argument("--warm-start-standardizer", action="store_true",
                     help="Fit the standardizer on the training embeddings before training.")
 
+"""
+ python train_pipeline/train_head.py --cache /home/andrew.dickson/svar/checkpoints/manual/sativas413_carbon500m_hw500.ckpt.pt --half-window 500 --buffer 0 --head mlp --n-layers=14 --hidden-dim=2200 --dropout=0.6 --epochs 150 --lr 1e-3 --warm-start-standardizer --standardizer perdim --pool mean --output trained_heads/carbon/big_hw500/model.pt
+"""
+
 # Optimization
 parser.add_argument("--epochs", type=int, default=100,
                     help="Number of full passes over the training set.")

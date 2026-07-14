@@ -21,8 +21,20 @@ from pyfaidx import Fasta
 # ---------------------------------------------------------------------------
 # Data paths
 # ---------------------------------------------------------------------------
+# Rice data is migrated to cluster scratch (see svar/env.sh + datasets/common.mk):
+# ``$DATA_ROOT/rice``, with ``DATA_ROOT`` defaulting to ``$SVAR_SCRATCH/datasets``.
+# Prefer the scratch copy; fall back to the legacy ~/rice_data build if scratch
+# isn't populated yet, so this keeps working mid-migration.
 
-_DATA_DIR    = Path(__file__).resolve().parents[3] / "rice_data"
+def _rice_data_dir() -> Path:
+    scratch = os.environ.get("SVAR_SCRATCH", "/90daydata/small_grains/andrew.dickson")
+    data_root = os.environ.get("DATA_ROOT", str(Path(scratch) / "datasets"))
+    scratch_rice = Path(data_root) / "rice"
+    legacy_rice = Path(__file__).resolve().parents[3] / "rice_data"
+    return scratch_rice if scratch_rice.exists() else legacy_rice
+
+
+_DATA_DIR    = _rice_data_dir()
 
 FASTA_PATH   = str(_DATA_DIR / "Oryza_sativa.IRGSP-1.0.dna_sm.toplevel.fa")
 VCF_PATH     = str(_DATA_DIR / "RiceDiversity_44K_Genotypes_PLINK" / "sativas413.vcf")

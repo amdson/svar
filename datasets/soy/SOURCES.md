@@ -85,26 +85,3 @@ UniqueWindowDataset(half_window=500, 50 samples): 75,058 unique windows,
 - The SoyBase datastore directory pages are JS file browsers, but the **direct file
   URLs** above are wget-able. NCBI `GCF_000004515.4` is a stable genome fallback.
 
----
-
-## Parked: the GP-WAITER `soybean14460` paper panel
-
-The original goal was the paper's exact panel — 14,460 accessions × 39,707 SNPs +
-11 traits (Li et al., *Nat. Commun.* 2026, 17:4427). It is **blocked on a missing
-column→SNP map**, recorded here so it can be resumed:
-
-- **Genotype + phenotype:** Zenodo record **18779208** (CC-BY-4.0),
-  `soybean14460.zip` → `soybean14460_gen.csv` + `_phe.csv`. (The DOI first cited,
-  `10.5281/zenodo.18809685`, is the GP-WAITER *software* release; its README points
-  to the data. Equivalent panels also appear in record 18476279.)
-- **Verified format:** `…_gen.csv` is a **headerless** 14,460 × 39,707 matrix of
-  **{-1, 0, 1}** — no accession IDs (positional, aligned to the phenotype by row)
-  and **no SNP IDs or positions**. `…_phe.csv` is 11 trait columns
-  (`protein,oil,Linoleic,Linolenic,R1,R8,Hgt,Ldg,SQ,SdWgt,Yield`), no ID column.
-- **The blocker:** with unlabeled SNP columns, you cannot attach REF/ALT. The
-  column→SNP map is in neither Zenodo record nor the GP-WAITER repo (only the demo
-  "O" panel shipped a per-column site file) — it must come from the paper supplement
-  or the authors. With it, the plan was: map columns → SNP → REF/ALT from the
-  SoySNP50K VCF's 5 fixed columns, **check code polarity** (paper: 1=hom-ref,
-  −1=hom-alt, 0=het — verify per-SNP mean vs VCF allele freq; a flip swaps every
-  REF/ALT), decode to A/C/G/T, emit a VCF, then run the same QC tail as above.

@@ -55,6 +55,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from crop_embed import (
+    CARBON_MODEL_PATHS,
     DEFAULT_MODEL_PATHS,
     FixedWindowEmbedder,
     SampleEmbedder,
@@ -81,8 +82,13 @@ parser.add_argument("--backend", choices=["dnabert2", "plantcad", "carbon"], def
 parser.add_argument("--model-path", type=str, default=None,
                     help="HuggingFace repo or local dir for the DNA encoder. "
                          "Defaults to zhihan1996/DNABERT-2-117M for dnabert2, "
-                         "kuleshov-group/PlantCaduceus_l32 for plantcad, and "
-                         "HuggingFaceBio/Carbon-500M for carbon.")
+                         "kuleshov-group/PlantCaduceus_l32 for plantcad, and the "
+                         "--carbon-size checkpoint for carbon (500M by default). "
+                         "Overrides --carbon-size when set explicitly.")
+parser.add_argument("--carbon-size", choices=list(CARBON_MODEL_PATHS), default="500M",
+                    help="Which Carbon checkpoint to use (carbon backend only): "
+                         f"{', '.join(CARBON_MODEL_PATHS)}. Ignored when --model-path "
+                         "is given. Defaults to 500M.")
 parser.add_argument("--max-length", type=int, default=2048,
                     help="Tokenizer truncation length. PlantCAD caps at 512.")
 parser.add_argument("--snp-only", action="store_true",
@@ -121,7 +127,10 @@ parser.add_argument("--checkpoint-path", type=str, default=None,
 args = parser.parse_args()
 
 if args.model_path is None:
-    args.model_path = DEFAULT_MODEL_PATHS[args.backend]
+    if args.backend == "carbon":
+        args.model_path = CARBON_MODEL_PATHS[args.carbon_size]
+    else:
+        args.model_path = DEFAULT_MODEL_PATHS[args.backend]
 if args.backend == "plantcad" and args.snp_only:
     parser.error("--snp-only is not supported with --backend plantcad")
 if args.backend == "plantcad" and args.half_window > 256:

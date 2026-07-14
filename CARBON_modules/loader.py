@@ -250,26 +250,59 @@ def load_carbon_variant_cache(
 
 
 def _download_carbon_weights(repo_id: str) -> dict[str, torch.Tensor]:
-    """Load Carbon weights from a local directory or the HuggingFace Hub."""
-    if os.path.isdir(repo_id):
-        safetensors_path = os.path.join(repo_id, "model.safetensors")
-        if os.path.exists(safetensors_path):
-            from safetensors.torch import load_file
-            return load_file(safetensors_path)
-        bin_path = os.path.join(repo_id, "pytorch_model.bin")
-        return torch.load(bin_path, map_location="cpu", weights_only=True)
+    """
+    Load Carbon weights from a local directory or the HuggingFace Hub.
 
-    from huggingface_hub import hf_hub_download
+    Handles both single-file checkpoints (Carbon-500M ships one
+    ``model.safetensors``) and sharded ones (Carbon-3B/8B ship
+    ``model-0000N-of-...safetensors`` plus a ``model.safetensors.index.json``
+    weight map). safetensors is preferred; ``pytorch_model.bin[.index.json]`` is
+    the fallback for either layout.
+    """
+    import json
 
-    try:
-        path = hf_hub_download(repo_id, "model.safetensors")
-        from safetensors.torch import load_file
-        return load_file(path)
-    except Exception:
-        pass
+    from safetensors.torch import load_file
 
-    path = hf_hub_download(repo_id, "pytorch_model.bin")
-    return torch.load(path, map_location="cpu", weights_only=True)
+    def _resolve(filename: str) -> str:
+        """Return a local path for `filename`, fetching from the Hub if needed."""
+        if os.path.isdir(repo_id):
+            return os.path.join(repo_id, filename)
+        from huggingface_hub import hf_hub_download
+        return hf_hub_download(repo_id, filename)
+
+    def _exists(filename: str) -> bool:
+        if os.path.isdir(repo_id):
+            return os.path.exists(os.path.join(repo_id, filename))
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.utils import EntryNotFoundError
+        try:
+            hf_hub_download(repo_id, filename)
+            return True
+        except EntryNotFoundError:
+            return False
+
+    def _load_sharded(index_filename: str, loader) -> dict[str, torch.Tensor]:
+        """Merge every shard referenced by a `*.index.json` weight map."""
+        with open(_resolve(index_filename)) as fh:
+            weight_map = json.load(fh)["weight_map"]
+        state_dict: dict[str, torch.Tensor] = {}
+        for shard in sorted(set(weight_map.values())):
+            state_dict.update(loader(_resolve(shard)))
+        return state_dict
+
+    # safetensors: single file, then sharded.
+    if _exists("model.safetensors"):
+        return load_file(_resolve("model.safetensors"))
+    if _exists("model.safetensors.index.json"):
+        return _load_sharded("model.safetensors.index.json", load_file)
+
+    # pytorch_model.bin: single file, then sharded.
+    def _load_bin(path: str) -> dict[str, torch.Tensor]:
+        return torch.load(path, map_location="cpu", weights_only=True)
+
+    if _exists("pytorch_model.bin.index.json"):
+        return _load_sharded("pytorch_model.bin.index.json", _load_bin)
+    return _load_bin(_resolve("pytorch_model.bin"))
 
 
 def load_carbon_lm(
