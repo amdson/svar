@@ -12,7 +12,10 @@ datasets/
 ├── rice/            # Oryza sativa, 44K RiceDiversity panel (complete)
 │   ├── Makefile
 │   └── SOURCES.md
-└── soy/             # Glycine max (in progress — scaffold)
+├── soy/             # Glycine max, USDA SoySNP50K panel + SoyDNGP phenotypes (complete)
+│   ├── Makefile
+│   └── SOURCES.md
+└── arabidopsis/     # Arabidopsis thaliana, 1001 Genomes panel (TAIR10)
     ├── Makefile
     └── SOURCES.md
 ```
