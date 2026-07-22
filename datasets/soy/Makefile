@@ -46,6 +46,18 @@ VCF_SRC := $(DATA)/glyma.$(DIV_KEY).vcf.gz
 URL_VCF := https://data.soybase.org/Glycine/max/diversity/$(DIV_KEY)/glyma.$(DIV_KEY).vcf.gz
 CHR_MAP := $(DATA)/chrom_map.tsv        # "glyma.Wm82.gnm2.Gm01<TAB>1" ... per line
 
+# ── Phenotypes — SoyDNGP data.csv, keyed by USDA accession id ──────────────────
+# The 11 traits (protein, oil, Linoleic, Linolenic, R1, R8, Hgt, Ldg, SQ, SdWgt,
+# Yield) come from the SoyDNGP project repo — the source GP-WAITER's anonymised
+# "soybean14460" panel was built from. `make pheno` downloads it and joins it onto
+# our VCF sample list BY ACCESSION ID, so the ~14,460 complete-phenotype accessions
+# land on our own PI-keyed, coordinate-carrying genotypes. See SOURCES.md.
+PHENO_SRC      := $(DATA)/soydngp_data_source.csv
+URL_PHENO_SRC  := https://raw.githubusercontent.com/IndigoFloyd/SoybeanWebsite/main/data.csv
+PHENO_ALIGNED  := $(DATA)/soy_pheno_aligned.csv
+PHENO_COMPLETE := $(DATA)/soy_pheno_complete.csv
+PSAM           := $(DATA)/$(STEM)_final.psam    # co-produced with $(PGEN) below
+
 # ── QC + pruning options (override on the make command line) ──────────────────
 # Defaults follow the GP-WAITER paper's QC (PLINK), done here with plink2:
 #   MAF < 0.01, variant missing rate > 0.2, and multi-allelic sites filtered out
@@ -81,11 +93,11 @@ endif
 
 REPO := $(abspath ../..)
 
-.PHONY: all download build check clean distclean
-all: build
+.PHONY: all download build pheno check clean distclean
+all: build pheno
 
 # ── Download + prep references ────────────────────────────────────────────────
-download: $(FASTA) $(FASTA).fai $(VCF_SRC)
+download: $(FASTA) $(FASTA).fai $(VCF_SRC) $(PHENO_SRC)
 
 $(FASTA_GZ): | $(DATA)
 	$(WGET) "$(URL_FASTA)"
@@ -98,6 +110,10 @@ $(FASTA).fai: $(FASTA)
 
 $(VCF_SRC): | $(DATA)
 	$(WGET) -O "$(VCF_SRC)" "$(URL_VCF)"
+
+# SoyDNGP phenotype table (small; from GitHub). -O to a stable, provenance-clear name.
+$(PHENO_SRC): | $(DATA)
+	$(WGET) -O "$(PHENO_SRC)" "$(URL_PHENO_SRC)"
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 build: $(VCF_OUT) $(PGEN)
@@ -136,6 +152,15 @@ $(VCF_PRUNED): $(VCF_QC)
 $(PGEN) $(VCF_OUT) &: $(FINAL_IN) $(FASTA) $(FASTA).fai
 	$(PLINK2) --vcf $< --fa $(FASTA) --ref-from-fa force \
 	          --make-pgen --export vcf --out $(DATA)/$(STEM)_final
+
+# ── Phenotypes ────────────────────────────────────────────────────────────────
+# Join the SoyDNGP phenotype table onto our VCF samples by accession id. Depends
+# on $(PGEN) because the join needs $(PSAM) (VCF sample order), which is produced
+# together with the .pgen by the grouped build rule above.
+pheno: $(PHENO_ALIGNED)
+$(PHENO_ALIGNED) $(PHENO_COMPLETE) &: $(PHENO_SRC) $(PGEN)
+	$(CONDA_RUN) python $(REPO)/scripts/build_soy_phenotypes.py \
+	    --data-csv $(PHENO_SRC) --psam $(PSAM) --out-dir $(DATA)
 
 # ── Sanity check ──────────────────────────────────────────────────────────────
 # Confirm every VCF REF allele agrees with the reference genome.
