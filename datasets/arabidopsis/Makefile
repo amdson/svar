@@ -68,17 +68,24 @@ else
 FINAL_IN := $(VCF_QC)
 endif
 
-# ── Phenotypes — AraPheno REST (optional, independent of the genotype build) ──
-PHENO_DIR  := $(DATA)/phenotypes
-PHENO_LIST := $(PHENO_DIR)/phenotype_list.csv
+# ── Phenotypes — AraPheno REST ────────────────────────────────────────────────
+# `make phenotypes` downloads the raw tables; `make pheno` aligns them onto the
+# VCF sample set (needs $(PSAM), so it depends on the genotype build).
+PHENO_DIR   := $(DATA)/phenotypes
+PHENO_LIST  := $(PHENO_DIR)/phenotype_list.csv
+PHENO_STAMP := $(PHENO_DIR)/.download_complete   # touched when all values.csv are in
 URL_PHENO_LIST := https://arapheno.1001genomes.org/rest/phenotype/list.csv
 # Per-phenotype values are pulled by looping the IDs in phenotype_list.csv:
 #   https://arapheno.1001genomes.org/rest/phenotype/<id>/values.csv
+PSAM         := $(DATA)/$(STEM)_final.psam       # co-produced with $(PGEN)
+PHENO_LONG   := $(DATA)/arabidopsis_pheno_long.csv
+PHENO_MATRIX := $(DATA)/arabidopsis_pheno_matrix.csv
+PHENO_COVER  := $(DATA)/arabidopsis_pheno_coverage.csv
 
 REPO := $(abspath ../..)
 
-.PHONY: all download build check phenotypes clean distclean
-all: build
+.PHONY: all download build check phenotypes pheno clean distclean
+all: build pheno
 
 # ── Download + prep references ────────────────────────────────────────────────
 download: $(FASTA) $(FASTA).fai $(VCF_SRC)
@@ -145,10 +152,14 @@ $(PGEN) $(VCF_OUT) &: $(FINAL_IN) $(FASTA) $(FASTA).fai
 check: $(VCF_OUT) $(FASTA)
 	$(BCFTOOLS) norm --check-ref w -f $(FASTA) $(VCF_OUT) -o /dev/null
 
-# ── Phenotypes (optional, standalone) ─────────────────────────────────────────
-# Pull the AraPheno phenotype index, then every phenotype's values.csv (keyed by
-# accession). Independent of the genotype build; join later on accession id.
-phenotypes: $(PHENO_LIST)
+# ── Phenotypes ────────────────────────────────────────────────────────────────
+# Two stages, mirroring soy: (1) `phenotypes` downloads the raw AraPheno tables;
+# (2) `pheno` aligns them onto our VCF sample set by accession id.
+
+# (1) Download the phenotype index, then every phenotype's values.csv (keyed by
+# accession). A stamp file records completion so `pheno` can depend on it.
+phenotypes: $(PHENO_STAMP)
+$(PHENO_STAMP): $(PHENO_LIST)
 	@echo "Downloading all AraPheno phenotype value tables into $(PHENO_DIR) ..."
 	@tail -n +2 "$(PHENO_LIST)" | cut -d, -f2 | while read id; do \
 	    case "$$id" in ''|*[!0-9]*) continue;; esac; \
@@ -156,10 +167,20 @@ phenotypes: $(PHENO_LIST)
 	        "https://arapheno.1001genomes.org/rest/phenotype/$$id/values.csv" \
 	        && echo "  phenotype $$id" || echo "  phenotype $$id FAILED"; \
 	done
+	@touch "$(PHENO_STAMP)"
 $(PHENO_LIST): | $(PHENO_DIR)
 	wget -c -O "$(PHENO_LIST)" "$(URL_PHENO_LIST)"
 $(PHENO_DIR):
 	mkdir -p "$(PHENO_DIR)"
+
+# (2) Align onto the VCF samples (exact accession-id match). Depends on $(PSAM),
+# so `make pheno` builds the genotypes first if needed. Emits a tidy long table, a
+# wide sample×trait matrix (VCF order), and a coverage guide — see the script.
+PHENO_SCRIPT := $(REPO)/scripts/build_arabidopsis_phenotypes.py
+pheno: $(PHENO_LONG)
+$(PHENO_LONG) $(PHENO_MATRIX) $(PHENO_COVER) &: $(PHENO_STAMP) $(PSAM) $(PHENO_SCRIPT)
+	$(CONDA_RUN) python $(PHENO_SCRIPT) \
+	    --pheno-dir $(PHENO_DIR) --psam $(PSAM) --out-dir $(DATA)
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 clean:        # remove build intermediates; keep downloads + final outputs

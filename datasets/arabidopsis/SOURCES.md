@@ -86,5 +86,25 @@ filtered out, matching the VCF's 5-chromosome restriction), so no rename is need
 - **Two larger VCFs exist in the release** — `…_with_tair10_only_ACGTN.vcf.gz`
   (132 GB, whole-genome incl. invariant sites) is **not** what we want; the
   `snp-short-indel_only` file is the variants-only call set.
-- **Phenotypes are decoupled** from the genotype build (own `make phenotypes`
-  target). Join to genotypes on the accession id later.
+- **Phenotypes** download independently (`make phenotypes`); `make pheno` then
+  aligns them onto the genotypes (see below).
+
+## Phenotypes → aligned onto the genotypes
+
+The AraPheno accession ids **are** the VCF sample IIDs (both are 1001-Genomes
+accession numbers), so the join is an exact id match — no key translation. Of the
+1,135 genotyped accessions, **1,041** have ≥1 phenotype (94 have none; 476
+phenotyped accessions aren't in this VCF).
+
+`make pheno` runs `scripts/build_arabidopsis_phenotypes.py`, restricting every
+AraPheno table to genotyped accessions and emitting three views:
+
+| Output | Shape | Use |
+|--------|-------|-----|
+| `arabidopsis_pheno_matrix.csv` | rows keyed `(IID, rep)` in `.psam` order × cols = ~536 phenotype ids | the "one big matrix" — Y for modelling. Replicates kept on **separate rows** (never averaged): within each (accession, trait) the k values fill rows 0..k-1, so an accession spans as many rows as its most-replicated trait (~3,900 rows total). For a trait, select its column and `dropna`. **Sparse** — most cells NaN. |
+| `arabidopsis_pheno_long.csv` | tidy: `IID, phenotype_id, phenotype_name, study, value` (replicates kept) | filter to one trait without carrying a mostly-empty matrix. |
+| `arabidopsis_pheno_coverage.csv` | per phenotype: `phenotype_id, name, study, n_genotyped, n_values`, sorted by coverage | pick well-powered traits — `n_genotyped` is the real per-GWAS sample size (median ~a few hundred). |
+
+The matrix is deliberately **not** filtered to complete cases (unlike soy's
+`soy_pheno_complete.csv`): with ~536 heterogeneous traits there is no common
+complete set, so you subset per analysis (use the coverage guide).
