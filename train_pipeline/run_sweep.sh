@@ -94,7 +94,7 @@ run_config() {
             local run="${head}_${tag}_${pool}_${ws_tag}"
 
             echo "######## $(date) :: train $variant $run ########"
-            $PY train_pipeline/train_head.py \
+            $PY -m training.emb_nn.run \
                 --cache "$cache" --head "$head" $vflags --pool "$pool" \
                 --half-window "$hw" \
                 --epochs "$EPOCHS" --lr "$LR" $ws_flag \

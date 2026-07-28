@@ -23,7 +23,7 @@
 # 
 set -uo pipefail
 
-cd /home/andrew.dickson/svar
+cd "$(dirname "${BASH_SOURCE[0]}")/.."      # repo root (script lives in train_pipeline/)
 PY=${PY:-python}
 
 HEAD_DIR=trained_heads/vc_comparison
@@ -108,7 +108,7 @@ for cache in "${CACHES[@]}"; do
                   if [[ "${DRYRUN:-0}" -ne 1 && -s "$out" ]]; then
                     echo "[$(date +%H:%M:%S)] SKIP  $run (exists)"; continue
                   fi
-                  cmd="$PY train_pipeline/train_head.py \
+                  cmd="$PY -m training.emb_nn.run \
 --cache $cache --half-window $hw --head $head $vflags $hdr_flags \
 --pool $pool --standardizer $std $ws_flag --lr $lr --weight-decay $wd --epochs $ep --batch-size $BATCH \
 --output $out"

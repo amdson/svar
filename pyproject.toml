@@ -17,6 +17,7 @@ dependencies = [
     "biopython",
     "pyfaidx",
     "pysam",
+    "Pgenlib",   # binary .pgen reader — fast genotype loading (pgen.py, genotype_matrix.py)
     # deep learning + HF stack
     "torch",
     "transformers",

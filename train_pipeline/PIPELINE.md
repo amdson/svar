@@ -50,7 +50,7 @@ table `(n_unique_windows, D)` + `sample_fp_index` + metadata, loadable via
 One deterministic train/val split by sample ID, plus z-scored targets, so every
 model trains/evaluates on identical points.
 
-### 7. Windows → per-sample vector → trait prediction (the trained head) — `train_pipeline/train_head.py` + `crop_embed/models/fp_head_model.py`
+### 7. Windows → per-sample vector → trait prediction (the trained head) — `training/emb_nn/run.py` + `crop_embed/models/fp_head_model.py`
 For a frozen cache the per-sample pooled vector never changes, so it's
 **pre-pooled once** via `embedding_bag` (sum or mean over each sample's window
 fingerprints) into `(n_samples, D)`. Then a head — `FPSumHeadModel` wrapping a

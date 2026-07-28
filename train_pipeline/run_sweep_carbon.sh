@@ -81,7 +81,7 @@ run_config() {
       local vflags; vflags=$(variant_flags "$variant") || return 1
       for head in "${HEADS[@]}"; do
         echo "######## $(date) :: train $variant $head $tag ########"
-        $PY train_pipeline/train_head.py \
+        $PY -m training.emb_nn.run \
             --cache "$cache" --head "$head" $vflags --pool "$POOL" \
             --half-window "$hw" \
             --epochs "$EPOCHS" --lr "$LR" --warm-start-standardizer \
