@@ -37,7 +37,9 @@ training/
 ├── snp_sklearn/            # modality: snp     (run.py + estimators.py)
 ├── emb_sklearn/            # modality: emb     (run.py, shares estimators)
 ├── emb_nn/                 # was train_pipeline/train_head.py (moved here, on common)
-└── e2e/                    # train_pipeline/train_end2end.py (pending move)
+├── e2e/                    # was train_pipeline/train_end2end.py (moved here, on common)
+├── sweep.py                # generic grid driver over the runners (resumable)
+└── sweeps/                 # sweep config modules (example.py)
 ```
 
 The GLM trainers move into `emb_nn`/`e2e` (files relocated, external refs updated),
@@ -113,6 +115,31 @@ version of how `embed_windows.py` already names them), with an explicit
 Metrics are per-trait everywhere: Pearson, R², MSE, MAE, NaN-masked, on **val and
 test**.
 
+## Sweeps (`sweep.py`) — declare a grid, resume, compare
+
+Two layers of hyperparameter search, deliberately separated:
+
+- **Within-run** — each sklearn estimator is a `GridSearchCV`, so per-trait model
+  tuning (ridge α, krr α×γ, …) happens *inside* one run and the winning
+  `best_params_` land in `run.json`. Nothing to script.
+- **Across-run** — `python -m training.sweep --config <cfg.py>` drives a
+  Cartesian-product sweep over the *pipeline* axes (runner, model, dataset,
+  traits, `--svd`/`--sparse`, backbone/half-window, NN knobs). The grid is a
+  plain Python module exporting `SWEEP` (one block dict or a list); each block
+  has `runner`, `grid` (swept axes), `fixed` (constants), optional `gpu` and
+  `output_template`. See `training/sweeps/example.py`.
+
+The driver expands points, builds each runner command (`--key value`, `True`→bare
+flag), and shells out — **sequential by default**, `--jobs N` for a worker pool,
+`--gpus 0,1,2` to round-robin GPU-pinned (`gpu: True`) blocks. It is **resumable**:
+a per-sweep `ledger.jsonl` records each point (keyed by a hash of its resolved
+command) and re-runs skip completed points (`--force` to override); NN blocks with
+an `output_template` also skip if the output file already exists. Per-point
+stdout/stderr → `logs/sweeps/<cfg>/logs/<label>.log`. `--dry-run`/`--list` preview
+the expansion. The driver collects **no** metrics itself — every point already
+appends to the run manifest, so `run_record.load_runs()` is the one-read
+comparison surface afterward.
+
 ## Run records (`run_record.py`) — lightweight, decoupled
 
 A dataclass + `build/write/load`. No wandb, no search framework, no
@@ -151,6 +178,9 @@ field. Runs are written under scratch (`$SVAR_SCRATCH/runs/`, gitignored like
 ## Status
 
 - [x] Phase 1: `common` + `snp_sklearn` + `emb_sklearn`, verified on soy.
-- [~] Phase 2: `emb_nn` done (train_head → `training/emb_nn/run.py`, on `common`,
-  parity-checked on rice, sweep/repro refs updated); `e2e` (train_end2end) pending.
+  Comprehensive SNP ML (sparse→SVD→model) and RBF heads (svr/krr) added + verified.
+- [x] Phase 2: `emb_nn` (train_head → `training/emb_nn/run.py`, parity-checked on
+  rice) and `e2e` (train_end2end → `training/e2e/run.py`, two-pass sanity PASSED)
+  both moved onto `common`; sweep/repro refs updated.
+- [x] Sweeps: generic `sweep.py` grid driver + `sweeps/` configs.
 - [ ] Phase 3: cleanup + notebook/`predict_crop_phenotype.py` migration.
