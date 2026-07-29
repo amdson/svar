@@ -15,6 +15,9 @@ datasets/
 ├── soy/             # Glycine max, USDA SoySNP50K panel + SoyDNGP phenotypes (complete)
 │   ├── Makefile
 │   └── SOURCES.md
+├── wheat/           # Triticum aestivum, CIMMYT SeeDs Iranian landraces, DArTSeq (complete)
+│   ├── Makefile
+│   └── SOURCES.md
 └── arabidopsis/     # Arabidopsis thaliana, 1001 Genomes panel (TAIR10)
     ├── Makefile
     └── SOURCES.md
