@@ -25,3 +25,16 @@ sativas413_embeddings.*
 /checkpoints
 /wandb
 /trained_heads
+
+# ── Raw data archives & generated outputs (large; never commit — see datasets/) ──
+# Access-gated / re-downloadable genotype+phenotype download archives, and the
+# per-dataset staging dir that holds them. Recipes are committed; data is not.
+*.zip
+*.zip.gz
+/DArTSeq_*
+/persian_wheat/
+# Large generated model-embedding / end-to-end training outputs (regenerable).
+/trained_e2e/
+/Cropformer/
+/logs/
+/splits/
