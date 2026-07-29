@@ -111,6 +111,11 @@ version of how `embed_windows.py` already names them), with an explicit
   standardizers, pooling variants), moved from `train_head.py`, **multi-task**.
 - **`e2e`** — encoder+head fine-tuning (two-pass activation checkpointing), moved
   from `train_end2end.py`, **multi-task**.
+- **`cropformer`** — the Cropformer baseline (Conv1d → self-attention → linear;
+  jiekesen/Cropformer) wrapped as an sklearn-style regressor on the `snp` matrix,
+  so it reuses `run_sklearn`: **one trait at a time**, MIC top-`--mic-k` SNP
+  selection + target standardization fit on train, early stopping on val Pearson.
+  Directly comparable to `snp_sklearn`.
 
 Metrics are per-trait everywhere: Pearson, R², MSE, MAE, NaN-masked, on **val and
 test**.
