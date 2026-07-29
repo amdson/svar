@@ -15,13 +15,15 @@ import numpy as np
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.decomposition import TruncatedSVD
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.kernel_ridge import KernelRidge
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import GridSearchCV, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 
-MODELS = ("ridge", "svr", "rf", "gbm", "pls")
+# ridge = RR-BLUP-style linear; svr/krr = RBF-kernel heads; rf/gbm = trees; pls = latent-factor.
+MODELS = ("ridge", "svr", "krr", "rf", "gbm", "pls")
 
 
 def add_sklearn_args(p: argparse.ArgumentParser) -> None:
@@ -46,11 +48,32 @@ def _cv(args):
 
 
 def _prefix(args) -> list:
-    """Shared leading pipeline steps: standardize, then optional SVD."""
+    """Shared leading pipeline steps.
+
+    Dense features: standardize, then optional SVD.
+    Sparse features (--sparse): TruncatedSVD FIRST (it consumes the CSR directly and
+    densifies it), then standardize the reduced factors. Requires --svd, since SVD is
+    what makes the sparse matrix usable by the downstream (dense) model.
+    """
+    if getattr(args, "sparse", False):
+        if not getattr(args, "svd", 0) or args.svd <= 0:
+            raise SystemExit("--sparse requires --svd N (TruncatedSVD reduces the sparse SNP matrix).")
+        return [("svd", TruncatedSVD(n_components=args.svd, random_state=args.seed)),
+                ("scale", StandardScaler())]
     steps = [("scale", StandardScaler())]
-    if args.svd and args.svd > 0:
+    if getattr(args, "svd", 0) and args.svd > 0:
         steps.append(("svd", TruncatedSVD(n_components=args.svd, random_state=args.seed)))
     return steps
+
+
+def _kernel_prefix(args) -> list:
+    """Prefix for RBF kernel models (svr/krr). RBF is scale-sensitive, so the final
+    features MUST be unit-variance -- SVD factors have decreasing variance, so append a
+    StandardScaler after SVD (kernel distances otherwise blow up -> near-constant kernel)."""
+    pre = _prefix(args)
+    if not pre or pre[-1][0] != "scale":
+        pre = pre + [("scale2", StandardScaler())]
+    return pre
 
 
 def make_estimator(name: str, args):
@@ -63,8 +86,13 @@ def make_estimator(name: str, args):
         pipe = Pipeline(_prefix(args) + [("model", Ridge())])
         grid = {"model__alpha": [0.1, 1.0, 10.0, 100.0, 1000.0]}
     elif name == "svr":
-        pipe = Pipeline(_prefix(args) + [("model", SVR(kernel="rbf"))])
+        pipe = Pipeline(_kernel_prefix(args) + [("model", SVR(kernel="rbf"))])
         grid = {"model__C": [1.0, 10.0, 100.0], "model__gamma": ["scale", "auto"]}
+    elif name == "krr":
+        # RBF kernel-ridge head (kernel RR-BLUP): closed-form, good for small/medium n.
+        pipe = Pipeline(_kernel_prefix(args) + [("model", KernelRidge(kernel="rbf"))])
+        grid = {"model__alpha": [0.01, 0.1, 1.0, 10.0],
+                "model__gamma": [None, 1e-3, 1e-2, 1e-1]}
     elif name == "rf":
         pipe = Pipeline(_prefix(args) + [("model", RandomForestRegressor(
             random_state=args.seed, n_jobs=nj))])
@@ -75,8 +103,15 @@ def make_estimator(name: str, args):
         grid = {"model__n_estimators": [200, 400], "model__max_depth": [2, 3],
                 "model__learning_rate": [0.05, 0.1]}
     elif name == "pls":
-        # PLS does its own centering/scaling; no SVD prefix.
-        pipe = Pipeline([("model", PLSRegression())])
+        # PLS does its own centering/scaling, so no prefix on dense input. On sparse
+        # input it needs a dense matrix, so reduce with SVD first (requires --svd).
+        if getattr(args, "sparse", False):
+            if not getattr(args, "svd", 0) or args.svd <= 0:
+                raise SystemExit("--sparse requires --svd N (PLS needs a dense matrix).")
+            pre = [("svd", TruncatedSVD(n_components=args.svd, random_state=args.seed))]
+        else:
+            pre = []
+        pipe = Pipeline(pre + [("model", PLSRegression())])
         grid = {"model__n_components": [2, 5, 10, 20]}
     else:
         raise SystemExit(f"unknown model {name!r}; choices: {MODELS}")

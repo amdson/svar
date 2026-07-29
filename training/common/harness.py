@@ -32,6 +32,9 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--wandb-name", default=None)
     # SNP-modality knobs
     p.add_argument("--impute", default="ref", choices=["ref", "mean"])
+    p.add_argument("--sparse", action="store_true",
+                   help="Use the raw sparse (CSR) SNP matrix instead of dense dosage; "
+                        "requires --svd (TruncatedSVD reduces + densifies it).")
     # embedding-modality knobs (ignored by snp)
     p.add_argument("--backbone", default=None)
     p.add_argument("--half-window", type=int, default=None)
@@ -55,7 +58,10 @@ def resolve_traits(spec, arg: str) -> list[str]:
 def _build_features(spec, modality: str, samples: list[str], args):
     """Return (X aligned to samples, cache_path_or_None)."""
     if modality == "snp":
-        X, _ = feat.snp_matrix(spec, samples, impute=args.impute)
+        if getattr(args, "sparse", False):
+            X, _ = feat.snp_matrix_sparse(spec, samples)
+        else:
+            X, _ = feat.snp_matrix(spec, samples, impute=args.impute)
         return X, None
     if modality == "emb":
         if not args.backbone or args.half_window is None:
@@ -107,13 +113,18 @@ def run_sklearn(modality: str, make_estimator: Callable[[], object], args) -> di
     metrics = {"val": evaluate(Y[va], yhat_val, traits),
                "test": evaluate(Y[te], yhat_test, traits)}
 
+    prep = {"svd": getattr(args, "svd", 0), "sparse": getattr(args, "sparse", False)}
+    if modality == "snp":
+        prep["impute"] = "ref" if prep["sparse"] else args.impute
+    elif modality == "emb":
+        prep["recipe"] = args.recipe
     rec = run_record.build(
         dataset=args.dataset, features=modality, model=args.model, seed=args.seed,
         traits=traits, hyperparams=selected, metrics=metrics,
         backbone=getattr(args, "backbone", None),
         half_window=getattr(args, "half_window", None),
         split_path=str(default_split_path(args.dataset, args.seed)),
-        cache_path=cache_path, strict=args.strict,
+        cache_path=cache_path, strict=args.strict, extra=prep,
     )
     rd = artifacts.run_dir(args.dataset, modality, args.model,
                            backbone=getattr(args, "backbone", None),

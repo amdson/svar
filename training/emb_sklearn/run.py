@@ -1,7 +1,8 @@
 """
 training/emb_sklearn/run.py
 ---------------------------
-Same sklearn suite as snp_sklearn, but on per-sample POOLED fixed embeddings.
+Same sklearn suite as snp_sklearn (ridge / svr-RBF / krr-RBF / rf / gbm / pls),
+but on per-sample POOLED fixed embeddings.
 Requires a window-embedding cache (see train_pipeline/embed_windows.py); address
 it by --backbone/--half-window or pass --cache directly.
 

@@ -11,7 +11,7 @@ actual Linear / GELU / LayerNorm / standardizer layers, not the Sequential /
 ModuleList containers that wrap them) and reduce each tensor to a few scalars
 (mean / std / absmax / frac_zero). Those scalars merge straight into the
 MetricLogger row, so they land in the JSONL sidecar and wandb next to the
-train/val metrics — see train_pipeline/train_head.py and train_end2end.py.
+train/val metrics — see training/emb_nn/run.py and training/e2e/run.py.
 
 Why leaves, and why both input and output: a hook only fires when a module is
 called via `module(...)` (i.e. its `__call__`/`forward`). train_head.py calls

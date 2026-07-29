@@ -28,7 +28,7 @@ Two pieces make it fit in memory (e2e does **not** use the variant cache yet):
    we embed once **without** a graph and cache `dL/dE`, then **recompute** the
    encoder in chunks to accumulate its parameter gradients.
 
-Implementation: [train_pipeline/train_end2end.py](../train_pipeline/train_end2end.py).
+Implementation: [training/e2e/run.py](../training/e2e/run.py).
 """))
 
 cells.append(code(r"""
@@ -190,7 +190,7 @@ backward gives `E.grad`); pass 2 supplies the second by recomputing each chunk's
 encoder forward and seeding its backward with the cached `E.grad` slice. With the
 encoder in `eval()` the two forwards are bit-identical, so the accumulated encoder
 grads match a single full-graph backward — verified by
-`train_end2end.py --sanity-check`. The cost is one extra encoder forward (the
+`python -m training.e2e.run --sanity-check`. The cost is one extra encoder forward (the
 recompute); the saving is never holding more than one chunk's graph at a time.
 """))
 

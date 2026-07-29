@@ -98,11 +98,17 @@ version of how `embed_windows.py` already names them), with an explicit
 
 ## Model runners
 
-- **`snp_sklearn`** / **`emb_sklearn`** — Ridge (RR-BLUP), SVR, RF, GBM, PLS.
-  `GridSearchCV` inside the train partition, select on val, report test. **One
-  trait at a time** (loop); estimator definitions shared between the two.
+- **`snp_sklearn`** / **`emb_sklearn`** — Ridge (RR-BLUP), SVR (RBF), **KRR
+  (RBF kernel-ridge)**, RF, GBM, PLS. `GridSearchCV` inside the train partition,
+  select on val, report test. **One trait at a time** (loop); estimator
+  definitions shared between the two. `snp_sklearn` takes either dense dosage or,
+  with `--sparse --svd N`, the **raw sparse SNP matrix → TruncatedSVD → model**
+  pipeline (SVD consumes the CSR directly). The SVD/sparse/impute knobs are
+  recorded in each run's `run.json` for comparison.
 - **`emb_nn`** — the existing `fp_head_model` heads (linear/mlp/attention,
-  standardizers, pooling variants) via `train_head.py`, **multi-task**.
+  standardizers, pooling variants), moved from `train_head.py`, **multi-task**.
+- **`e2e`** — encoder+head fine-tuning (two-pass activation checkpointing), moved
+  from `train_end2end.py`, **multi-task**.
 
 Metrics are per-trait everywhere: Pearson, R², MSE, MAE, NaN-masked, on **val and
 test**.

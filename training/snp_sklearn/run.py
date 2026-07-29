@@ -4,7 +4,8 @@ training/snp_sklearn/run.py
 sklearn suite on the additive SNP-dosage matrix.
 
     python -m training.snp_sklearn.run --dataset soy --model ridge --traits protein,oil
-    python -m training.snp_sklearn.run --dataset soy --model rf --svd 500
+    python -m training.snp_sklearn.run --dataset soy --model krr   --svd 500   # RBF kernel-ridge
+    python -m training.snp_sklearn.run --dataset soy --model ridge --sparse --svd 500  # sparse->SVD
 """
 from __future__ import annotations
 

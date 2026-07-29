@@ -78,6 +78,25 @@ def snp_matrix(
     return X, variant_ids
 
 
+def snp_matrix_sparse(
+    spec: DatasetSpec,
+    samples: list[str],
+) -> tuple["object", list[str]]:
+    """(X (n, V) additive-dosage CSR, variant_ids) — the raw sparse genotype matrix.
+
+    Missing calls are treated as reference (0), so the reference-homozygous majority
+    stays structurally zero and the matrix is genuinely sparse. Feed straight into
+    TruncatedSVD (which operates on sparse input) for the classical
+    sparse-SNP -> SVD -> model pipeline; see training/snp_sklearn/estimators.py.
+    """
+    from scipy import sparse
+    from crop_embed.data.genotype_matrix import load_dosage_matrix
+    # ref-fill keeps zeros structural; int8 dense first, then compress.
+    X, _, variant_ids = load_dosage_matrix(
+        spec.pgen_prefix, samples=samples, impute="ref", dtype=np.int8)
+    return sparse.csr_matrix(X, dtype=np.float32), variant_ids
+
+
 # ── modality: emb (pooled per-sample) ────────────────────────────────────────
 def pooled_embeddings(
     spec: DatasetSpec,
