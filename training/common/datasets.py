@@ -96,9 +96,12 @@ def _registry() -> dict[str, DatasetSpec]:
     rice = _rice_dir()
     soy = root / "soy"
     arab = root / "arabidopsis"
+    wheat = root / "wheat"
 
     SOY_TRAITS = ("protein", "oil", "Linoleic", "Linolenic", "R1", "R8",
                   "Hgt", "Ldg", "SQ", "SdWgt", "Yield")
+    WHEAT_TRAITS = ("DTH_heat", "DTM_heat", "DTH_drought", "DTM_drought", "PHT_drought",
+                    "tkw", "testw", "klength", "kwidth", "hardness", "protein", "SDS")
 
     return {
         "soy": DatasetSpec(
@@ -123,6 +126,16 @@ def _registry() -> dict[str, DatasetSpec]:
             fasta_path=str(arab / "Arabidopsis_thaliana.TAIR10.dna_sm.toplevel.fa"),
             pheno_csv=str(arab / "arabidopsis_pheno_aligned.csv"),
             vcf_path=str(arab / "arabidopsis_1001g_final.vcf"),
+        ),
+        # Wheat is DArTSeq-derived: markers aligned to IWGSC RefSeq, chroms 1A..7D,Un
+        # renamed to 1..22 (wheat_genome.fa matches); samples keyed by CIMMYT GID.
+        "wheat": DatasetSpec(
+            name="wheat",
+            pgen_prefix=str(wheat / "wheat_dartseq"),
+            fasta_path=str(wheat / "wheat_genome.fa"),
+            pheno_csv=str(wheat / "wheat_pheno_aligned.csv"),
+            vcf_path=str(wheat / "wheat_dartseq.vcf"),
+            trait_cols=WHEAT_TRAITS,
         ),
     }
 

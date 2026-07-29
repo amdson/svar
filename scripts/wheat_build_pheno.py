@@ -53,7 +53,8 @@ def main():
     with open(f"{a.wheat_dir}/wheat_pheno_aligned.csv", "w", newline="") as fa, \
          open(f"{a.wheat_dir}/wheat_pheno_complete.csv", "w", newline="") as fc:
         wa = csv.writer(fa); wc = csv.writer(fc)
-        wa.writerow(["GID","matched","complete"]+TRAITS); wc.writerow(["GID"]+TRAITS)
+        # key column named IID (pipeline convention); values are CIMMYT GIDs (= pgen IIDs)
+        wa.writerow(["IID","matched","complete"]+TRAITS); wc.writerow(["IID"]+TRAITS)
         for gid in sample_gids:
             d = pheno.get(gid, {}); vals = [d.get(t) for t in TRAITS]
             matched = any(v is not None for v in vals); complete = all(v is not None for v in vals)

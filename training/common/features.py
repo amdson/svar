@@ -27,7 +27,9 @@ def load_targets(
     if not Path(spec.pheno_csv).exists():
         raise FileNotFoundError(f"[{spec.name}] phenotype CSV not found: {spec.pheno_csv}")
     traits = traits or spec.resolved_trait_cols()
-    df = pd.read_csv(spec.pheno_csv).set_index("IID")
+    # IID always as string: some datasets (wheat GIDs) have purely-numeric IDs that
+    # pandas would otherwise read as int64 and fail to align to the string sample IDs.
+    df = pd.read_csv(spec.pheno_csv, dtype={"IID": str}).set_index("IID")
     missing_cols = [t for t in traits if t not in df.columns]
     if missing_cols:
         raise KeyError(f"[{spec.name}] traits not in {spec.pheno_csv}: {missing_cols}")

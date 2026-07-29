@@ -40,6 +40,7 @@ TAGS        := $(DATA)/tags.fasta
 BAM         := $(DATA)/aln.bam
 COORDS      := $(DATA)/marker_coords.tsv
 VCF         := $(DATA)/wheat_dartseq.vcf
+PGEN        := $(DATA)/wheat_dartseq.pgen   # plink2 fileset for the training pipeline
 PHENO_STAMP := $(DATA)/.pheno_extracted
 PHENO       := $(DATA)/wheat_pheno_aligned.csv
 
@@ -84,9 +85,12 @@ $(COORDS): $(BAM) $(FASTA_RAW)
 	    --genome "$(FASTA_RAW)" --min-mapq $(MIN_MAPQ) --min-ident $(MIN_IDENT)
 
 # ── Build VCF (chroms -> 1..22, REF = genome allele) ──────────────────────────
-build: $(VCF)
+build: $(VCF) $(PGEN)
 $(VCF): $(COORDS) $(MARKERS_ZIP)
 	$(PYTHON) $(REPO)/scripts/wheat_build_vcf.py --wheat-dir "$(DATA)" --markers-zip "$(MARKERS_ZIP)"
+# plink2 fileset (.pgen/.pvar/.psam) for training/common's SNP matrix loader.
+$(PGEN): $(VCF)
+	$(PLINK2) --vcf "$(VCF)" --make-pgen --out "$(DATA)/wheat_dartseq"
 
 # ── Phenotypes: unpack dataverse (.zip -> .zip.gz -> .zip -> xlsx), join by GID ─
 $(PHENO_STAMP): | $(DATA)
