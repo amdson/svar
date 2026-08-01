@@ -84,23 +84,28 @@ def make_estimator(name: str, args):
 
     if name == "ridge":
         pipe = Pipeline(_prefix(args) + [("model", Ridge())])
-        grid = {"model__alpha": [0.1, 1.0, 10.0, 100.0, 1000.0]}
+        # Widened up: the [..1000] grid pinned at 1000 for every soy trait (under-regularized).
+        grid = {"model__alpha": [1.0, 10.0, 100.0, 1000.0, 1e4, 1e5, 1e6]}
     elif name == "svr":
         pipe = Pipeline(_kernel_prefix(args) + [("model", SVR(kernel="rbf"))])
-        grid = {"model__C": [1.0, 10.0, 100.0], "model__gamma": ["scale", "auto"]}
+        # Widened C up (it touched the old max of 100).
+        grid = {"model__C": [1.0, 10.0, 100.0, 300.0, 1000.0], "model__gamma": ["scale", "auto"]}
     elif name == "krr":
         # RBF kernel-ridge head (kernel RR-BLUP): closed-form, good for small/medium n.
         pipe = Pipeline(_kernel_prefix(args) + [("model", KernelRidge(kernel="rbf"))])
-        grid = {"model__alpha": [0.01, 0.1, 1.0, 10.0],
-                "model__gamma": [None, 1e-3, 1e-2, 1e-1]}
+        # Widened gamma down (it pinned at the 1e-3 floor) and alpha down a notch.
+        grid = {"model__alpha": [0.001, 0.01, 0.1, 1.0, 10.0],
+                "model__gamma": [None, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]}
     elif name == "rf":
         pipe = Pipeline(_prefix(args) + [("model", RandomForestRegressor(
             random_state=args.seed, n_jobs=nj))])
-        grid = {"model__n_estimators": [300, 600], "model__max_depth": [None, 10, 20]}
+        # Widened trees/depth up (n_estimators pinned at the old max of 600).
+        grid = {"model__n_estimators": [600, 1000, 1500], "model__max_depth": [None, 20, 40]}
     elif name == "gbm":
         pipe = Pipeline(_prefix(args) + [("model", GradientBoostingRegressor(
             random_state=args.seed))])
-        grid = {"model__n_estimators": [200, 400], "model__max_depth": [2, 3],
+        # Widened capacity up (n_estimators, max_depth, lr all pinned at their old maxima).
+        grid = {"model__n_estimators": [400, 800, 1200], "model__max_depth": [3, 4, 5],
                 "model__learning_rate": [0.05, 0.1]}
     elif name == "pls":
         # PLS does its own centering/scaling, so no prefix on dense input. On sparse
@@ -112,7 +117,7 @@ def make_estimator(name: str, args):
         else:
             pre = []
         pipe = Pipeline(pre + [("model", PLSRegression())])
-        grid = {"model__n_components": [2, 5, 10, 20]}
+        grid = {"model__n_components": [2, 5, 10, 15, 20, 30]}
     else:
         raise SystemExit(f"unknown model {name!r}; choices: {MODELS}")
 

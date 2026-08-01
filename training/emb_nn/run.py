@@ -113,18 +113,46 @@ def main() -> None:
 
     # ── Dataset, targets, and the shared 3-way split (via training/common) ────────
     spec = get_dataset(args.dataset)
-    # Cache the (slow) window-dataset build, keyed on dataset + windowing.
-    _data_cache = Path(".prepare_data_cache") / f"{args.dataset}_hw{args.half_window}_buf{args.buffer}.pkl"
-    if _data_cache.exists():
-        print(f"Loading cached window dataset from {_data_cache}")
-        with open(_data_cache, "rb") as f:
-            dataset = pickle.load(f)
+
+    # ── 1. Load fixed window cache ────────────────────────────────────────────────
+    # Fast path: read sample_ids + fingerprint index + embeddings straight from the
+    # cache — no VCF/FASTA, since the cache carries everything the head trainer needs.
+    print(f"\nLoading cache from {args.cache} …")
+    cached = feat.load_cached_windows(args.cache)
+    if cached is not None:
+        dataset = cached
+        cache = cached.cache                         # (n_fps, D), already float
+        sample_fp_index = cached.sample_fp_index     # (n_samples, n_windows)
+        meta_hw = cached.metadata.get("half_window")
+        if meta_hw is not None and meta_hw != args.half_window:
+            parser.error(f"cache half_window={meta_hw} != --half-window {args.half_window}; "
+                         "pass the matching --half-window.")
+        print(f"  loaded from cache (no VCF): {cache.shape[0]:,} fingerprints × "
+              f"{cache.shape[1]} dims; {sample_fp_index.shape[0]} samples")
     else:
-        dataset = feat.build_window_dataset(spec, args.half_window, args.buffer)
-        _data_cache.parent.mkdir(parents=True, exist_ok=True)
-        with open(_data_cache, "wb") as f:
-            pickle.dump(dataset, f)
-        print(f"Cached window dataset to {_data_cache}")
+        # Legacy cache without sample_ids: rebuild the window dataset from the VCF
+        # (slow), memoized to an on-disk pickle keyed on dataset + windowing.
+        _data_cache = Path(".prepare_data_cache") / f"{args.dataset}_hw{args.half_window}_buf{args.buffer}.pkl"
+        if _data_cache.exists():
+            print(f"Loading cached window dataset from {_data_cache}")
+            with open(_data_cache, "rb") as f:
+                dataset = pickle.load(f)
+        else:
+            dataset = feat.build_window_dataset(spec, args.half_window, args.buffer)
+            _data_cache.parent.mkdir(parents=True, exist_ok=True)
+            with open(_data_cache, "wb") as f:
+                pickle.dump(dataset, f)
+            print(f"Cached window dataset to {_data_cache}")
+        embedder = FixedWindowEmbedder.from_file(args.cache, dataset)
+        cache = embedder.cache.float()               # (n_fps, D)
+        sample_fp_index = embedder.sample_fp_index   # (n_samples, n_windows)
+        if (sample_fp_index.shape != dataset.sample_fp_index.shape
+                or not torch.equal(sample_fp_index, dataset.sample_fp_index)):
+            raise SystemExit(
+                "Cache sample→fingerprint index doesn't match the dataset built from the "
+                "split's VCF/windowing. Regenerate the cache for this windowing.")
+        print(f"  {cache.shape[0]:,} fingerprints × {cache.shape[1]} dims; "
+              f"{sample_fp_index.shape[0]} samples")
 
     Y_np, trait_cols = feat.scaled_targets(spec, dataset.samples)   # aligned to dataset.samples, z-scored
     Y = torch.tensor(Y_np, dtype=torch.float32)
@@ -135,20 +163,8 @@ def main() -> None:
     test_idx = torch.tensor(split.indices("test", dataset.samples), dtype=torch.long)
     print(f"Split: {len(train_idx)} train / {len(val_idx)} val / {len(test_idx)} test")
 
-    # ── 1. Load fixed window cache ────────────────────────────────────────────────
-    print(f"\nLoading cache from {args.cache} …")
-    embedder = FixedWindowEmbedder.from_file(args.cache, dataset)
-    cache = embedder.cache.float()               # (n_fps, D)
-    sample_fp_index = embedder.sample_fp_index   # (n_samples, n_windows)
     emb_dim = cache.shape[1]
     n_traits = Y.shape[1]
-
-    if (sample_fp_index.shape != dataset.sample_fp_index.shape
-            or not torch.equal(sample_fp_index, dataset.sample_fp_index)):
-        raise SystemExit(
-            "Cache sample→fingerprint index doesn't match the dataset built from the "
-            "split's VCF/windowing. Regenerate the cache for this windowing.")
-    print(f"  {cache.shape[0]:,} fingerprints × {emb_dim} dims; {sample_fp_index.shape[0]} samples")
 
     # ── 1.a Pre-sum into one embedding per sample ─────────────────────────────────
     if args.center_ln_pool:

@@ -59,6 +59,38 @@ def build_window_dataset(spec: DatasetSpec, half_window: int = 500, buffer: int 
     return build_dataset(spec.vcf_path, spec.fasta_path, half_window, buffer, verbose=verbose)
 
 
+class CachedWindows:
+    """The subset of ``UniqueWindowDataset`` the head trainer actually reads, loaded
+    straight from an embedding cache (.ckpt.pt) — no VCF/FASTA. Mirrors the attributes
+    the trainer touches (``samples``, ``sample_fp_index``, ``unique_fingerprints``) plus
+    the embedding ``cache`` and ``metadata``, so downstream code is unchanged."""
+
+    def __init__(self, samples, sample_fp_index, unique_fingerprints, cache, metadata):
+        self.samples = samples
+        self.sample_fp_index = sample_fp_index
+        self.unique_fingerprints = unique_fingerprints
+        self.cache = cache
+        self.metadata = metadata
+
+
+def load_cached_windows(cache_path: str) -> "CachedWindows | None":
+    """Load everything the head trainer needs directly from a window-embedding cache,
+    skipping the (slow) VCF windowing. Returns None for legacy caches that predate the
+    ``sample_ids`` key, so the caller can fall back to ``build_window_dataset``."""
+    import torch
+    obj = torch.load(cache_path, map_location="cpu", weights_only=False)
+    if not (isinstance(obj, dict)
+            and {"cache", "sample_fp_index", "sample_ids"} <= set(obj)):
+        return None
+    return CachedWindows(
+        samples=list(obj["sample_ids"]),
+        sample_fp_index=obj["sample_fp_index"],
+        unique_fingerprints=obj.get("unique_fingerprints"),
+        cache=obj["cache"].float(),
+        metadata=obj.get("metadata", {}),
+    )
+
+
 def labeled_samples(spec: DatasetSpec, traits: list[str] | None = None) -> list[str]:
     """Canonical samples that have at least one non-NaN target — the supervised set."""
     samples = spec.samples()
