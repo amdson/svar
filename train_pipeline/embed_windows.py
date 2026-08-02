@@ -123,6 +123,13 @@ parser.add_argument("--checkpoint-every", type=int, default=500,
 parser.add_argument("--checkpoint-path", type=str, default=None,
                     help="Path for the intermediate {Fingerprint: Tensor} checkpoint. "
                          "Defaults to <output>.embtable.ckpt.pt next to --output.")
+parser.add_argument("--reuse-windows-from", type=str, default=None,
+                    help="Path to an existing embedding cache (.ckpt.pt) whose window "
+                         "structure (unique_fingerprints + sample_fp_index) to reuse, "
+                         "skipping the expensive VCF windowing / build_sample_window_map "
+                         "pass (~130 GB / >1 h on soy). Windows are backbone-independent, "
+                         "so this only re-embeds the same unique windows with the new "
+                         "backbone. Still needs --vcf-path (per-position alt bytes).")
 
 args = parser.parse_args()
 
@@ -149,25 +156,43 @@ out_path = Path(args.output)
 out_path.parent.mkdir(parents=True, exist_ok=True)
 ckpt_path = args.checkpoint_path or str(out_path) + ".embtable.ckpt.pt"
 
-# ── Build dataset ─────────────────────────────────────────────────────────────
+# ── Build (or reuse) the window dataset ──────────────────────────────────────
 
-print("Loading SNPs from VCF …")
-snps_by_chrom, samples = load_snps_from_vcf(args.vcf_path)
-n_snps = sum(len(v) for v in snps_by_chrom.values())
-print(f"  {n_snps:,} SNPs | {len(snps_by_chrom)} chromosomes | {len(samples)} samples")
+if args.reuse_windows_from:
+    print(f"Reusing window structure from {args.reuse_windows_from} "
+          f"(skipping VCF windowing / build_sample_window_map) …")
+    dataset = UniqueWindowDataset.from_cached_windows(
+        args.reuse_windows_from, args.fasta_path, vcf_path=args.vcf_path
+    )
+    src_hw = dataset.source_metadata.get("half_window")
+    if src_hw is not None and src_hw != args.half_window:
+        parser.error(
+            f"--half-window {args.half_window} != source cache half_window {src_hw}; "
+            f"the reused windows were built at hw={src_hw} (pass --half-window {src_hw})."
+        )
+    n_windows = int(dataset.sample_fp_index.shape[1])
+    print(f"  {len(dataset):,} unique windows to embed "
+          f"({dataset.sample_fp_index.shape[0]:,} samples × {n_windows:,} windows; "
+          f"no sample×window enumeration)")
+else:
+    print("Loading SNPs from VCF …")
+    snps_by_chrom, samples = load_snps_from_vcf(args.vcf_path)
+    n_snps = sum(len(v) for v in snps_by_chrom.values())
+    print(f"  {n_snps:,} SNPs | {len(snps_by_chrom)} chromosomes | {len(samples)} samples")
 
-print("Building SNPWindowPartitioner …")
-partitioner = SNPWindowPartitioner(
-    snps_by_chrom, half_window=args.half_window, buffer=args.buffer
-)
-stats = partitioner.snps_per_window_stats()
-print(f"  {stats['n_windows']:,} windows "
-      f"(mean {stats['mean']:.1f} SNPs/window)")
+    print("Building SNPWindowPartitioner …")
+    partitioner = SNPWindowPartitioner(
+        snps_by_chrom, half_window=args.half_window, buffer=args.buffer
+    )
+    stats = partitioner.snps_per_window_stats()
+    print(f"  {stats['n_windows']:,} windows "
+          f"(mean {stats['mean']:.1f} SNPs/window)")
 
-print("Building UniqueWindowDataset …")
-dataset = UniqueWindowDataset(args.vcf_path, args.fasta_path, partitioner)
-print(f"  {len(dataset):,} unique windows to embed "
-      f"(vs {len(partitioner) * len(dataset.samples):,} sample×window pairs)")
+    print("Building UniqueWindowDataset …")
+    dataset = UniqueWindowDataset(args.vcf_path, args.fasta_path, partitioner)
+    n_windows = len(partitioner)
+    print(f"  {len(dataset):,} unique windows to embed "
+          f"(vs {n_windows * len(dataset.samples):,} sample×window pairs)")
 
 # ── Load model ────────────────────────────────────────────────────────────────
 
@@ -224,7 +249,7 @@ metadata = {
 
     # Shape / identity
     "n_samples":           len(dataset.samples),
-    "n_windows":           len(partitioner),
+    "n_windows":           n_windows,
     "n_unique_windows":    len(dataset.unique_fingerprints),
 }
 

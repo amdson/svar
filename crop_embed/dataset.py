@@ -61,25 +61,12 @@ class UniqueWindowDataset(Dataset):
         # Load VCF (single pass)
         self._snps_by_chrom, self.samples = load_snps_from_vcf(vcf_path, samples)
 
-        # Build chrom_name map from FASTA key names (numeric keys only)
-        _fasta = Fasta(fasta_path)
-        self._chrom_name: dict[int, str] = {
-            int(name): name for name in _fasta.keys() if name.isdigit()
-        }
-        # Cache reference chromosomes as bytearrays (lazy: filled on first access)
-        self._ref_cache: dict[int, bytearray] = {}
-        self._fasta_keys = list(_fasta.keys())
-        # Pre-load all chromosomes that appear in the partitioner
-        for chrom in partitioner.snps_by_chrom:
-            self._ref_seq(chrom)  # warm the cache now so workers don't race
+        # FASTA reference cache + per-position alt-byte tables (cheap; VCF + reference
+        # only). Shared with from_cached_windows via _build_reference_tables.
+        self._build_reference_tables()
 
-        # Pre-compute per-position alt_byte lookup: {chrom: {pos: alt_byte}}
-        self._alt_byte: dict[int, dict[int, int]] = {
-            chrom: {rec.pos: rec.alt_byte for rec in snps}
-            for chrom, snps in self._snps_by_chrom.items()
-        }
-
-        # Build fingerprint index
+        # Build fingerprint index — the expensive dedup over every sample×window pair
+        # (hundreds of millions on soy; see from_cached_windows to skip it on re-embed).
         self.sample_window_to_fp, self.unique_fingerprints, self.fp_to_idx = (
             build_sample_window_map(partitioner, len(self.samples))
         )
@@ -91,6 +78,76 @@ class UniqueWindowDataset(Dataset):
         )
         for (s, w), fp in self.sample_window_to_fp.items():
             self.sample_fp_index[s, w] = self.fp_to_idx[fp]
+
+    # ── Reference tables + window reuse ───────────────────────────────────────
+
+    def _build_reference_tables(self) -> None:
+        """FASTA reference cache + per-position alt-byte lookup — everything
+        extract_sequence() needs, derived only from the reference and the VCF SNP
+        records (NOT from the sample×window enumeration). Requires self.fasta_path
+        and self._snps_by_chrom to be set. Shared by __init__ and from_cached_windows."""
+        _fasta = Fasta(self.fasta_path)
+        self._chrom_name: dict[int, str] = {
+            int(name): name for name in _fasta.keys() if name.isdigit()
+        }
+        # Cache reference chromosomes as bytearrays (lazy: filled on first access)
+        self._ref_cache: dict[int, bytearray] = {}
+        self._fasta_keys = list(_fasta.keys())
+        # Warm the ref cache for every chromosome that carries SNPs (workers don't race).
+        for chrom in self._snps_by_chrom:
+            self._ref_seq(chrom)
+        # Per-position alt_byte lookup: {chrom: {pos: alt_byte}}
+        self._alt_byte: dict[int, dict[int, int]] = {
+            chrom: {rec.pos: rec.alt_byte for rec in snps}
+            for chrom, snps in self._snps_by_chrom.items()
+        }
+
+    @classmethod
+    def from_cached_windows(
+        cls, cache_path: str, fasta_path: str, *, vcf_path: str | None = None
+    ) -> "UniqueWindowDataset":
+        """Reconstruct a dataset for RE-EMBEDDING ONLY, reusing the window structure
+        already computed in an existing embedding cache.
+
+        The unique-window set and the sample→window index are backbone-independent,
+        so a second backbone (e.g. Carbon-3B after Carbon-500M) loads them straight
+        from the prior cache and skips ``build_sample_window_map`` — the pathological
+        pass that materialises one fingerprint per sample×window pair (hundreds of
+        millions; ~130 GB / >1 h on soy). Only the VCF (per-position alt bytes) and
+        FASTA (reference) are still needed, both cheap.
+
+        The returned object supports __len__/__getitem__/extract_sequence and exposes
+        samples / unique_fingerprints / sample_fp_index — everything
+        fill_embedding_table + FixedWindowEmbedder.from_embedding_table read. The
+        training-only lookups (sample_window_to_fp, fp_to_idx) are left None.
+        """
+        prev = torch.load(cache_path, map_location="cpu", weights_only=False)
+        missing = [k for k in ("unique_fingerprints", "sample_fp_index", "sample_ids")
+                   if k not in prev]
+        if missing:
+            raise ValueError(
+                f"cache {cache_path} lacks {missing}; it predates window reuse "
+                f"and cannot seed a re-embed.")
+        vcf_path = vcf_path or prev.get("metadata", {}).get("vcf_path")
+        if not vcf_path:
+            raise ValueError(
+                "no --vcf-path given and none recorded in the source cache metadata; "
+                "extract_sequence still needs the VCF for per-position alt bytes.")
+
+        obj = cls.__new__(cls)
+        obj.fasta_path = fasta_path
+        obj.partitioner = None
+        obj.samples = list(prev["sample_ids"])
+        obj.unique_fingerprints = prev["unique_fingerprints"]
+        obj.sample_fp_index = prev["sample_fp_index"]
+        obj.sample_window_to_fp = None      # training-only; not needed to embed
+        obj.fp_to_idx = None
+        obj.source_metadata = prev.get("metadata", {})
+        # VCF only for alt bytes (position-keyed, sample-order-independent); load all
+        # SNPs so every fingerprint's alt positions resolve.
+        obj._snps_by_chrom, _ = load_snps_from_vcf(vcf_path, None)
+        obj._build_reference_tables()
+        return obj
 
     # ── Dataset protocol ──────────────────────────────────────────────────────
 
