@@ -45,7 +45,12 @@ from crop_embed.embedder import (
     SampleEmbedder,
     WindowEmbedder,
 )
-from crop_embed.fingerprint import Fingerprint, build_sample_window_map, make_fingerprint
+from crop_embed.fingerprint import (
+    Fingerprint,
+    build_sample_fp_index,
+    build_sample_window_map,
+    make_fingerprint,
+)
 from crop_embed.partitioner import SNPWindowPartitioner, Window
 from crop_embed.heads import AttentionHead, LinearHead, MLPHead, window_position_features
 from crop_embed.train import masked_mse, train
@@ -66,6 +71,7 @@ __all__ = [
     "Fingerprint",
     "make_fingerprint",
     "build_sample_window_map",
+    "build_sample_fp_index",
     "UniqueWindowDataset",
     "SampleDataset",
     "SampleEmbedder",

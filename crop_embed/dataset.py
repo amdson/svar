@@ -27,7 +27,7 @@ from torch.utils.data import Dataset
 from crop_embed.data.vcf import SNPRecord, load_snps_from_vcf
 from crop_embed.fingerprint import (
     Fingerprint,
-    build_sample_window_map,
+    build_sample_fp_index,
 )
 from crop_embed.partitioner import SNPWindowPartitioner
 
@@ -44,8 +44,12 @@ class UniqueWindowDataset(Dataset):
     ----------
     samples              : ordered list of sample IDs
     unique_fingerprints  : list of all unique Fingerprints (dataset index)
-    fp_to_idx            : dict[Fingerprint → int]
-    sample_window_to_fp  : dict[(sample_idx, window_idx) → Fingerprint]
+    sample_fp_index      : LongTensor[n_samples, n_windows] → row in
+                           unique_fingerprints for each (sample, window)
+    sample_window_to_fp  : None — the legacy per-pair dict is no longer built
+                           (see build_sample_fp_index); use fp_index_for().
+    fp_to_idx            : None — legacy fp→row map; unique_fingerprints is the
+                           row order, so enumerate() reconstructs it if needed.
     """
 
     def __init__(
@@ -65,19 +69,16 @@ class UniqueWindowDataset(Dataset):
         # only). Shared with from_cached_windows via _build_reference_tables.
         self._build_reference_tables()
 
-        # Build fingerprint index — the expensive dedup over every sample×window pair
-        # (hundreds of millions on soy; see from_cached_windows to skip it on re-embed).
-        self.sample_window_to_fp, self.unique_fingerprints, self.fp_to_idx = (
-            build_sample_window_map(partitioner, len(self.samples))
+        # Deduplicated window structure. build_sample_fp_index dedups each window
+        # with a single numpy pass over its SNPs' alt-flag bytes, so it never
+        # materialises the per-(sample × window) fingerprint dict the old
+        # build_sample_window_map did (hundreds of millions of entries on soy;
+        # ~130 GB / >1 h). It yields the same two artefacts, byte-identical.
+        self.unique_fingerprints, self.sample_fp_index = build_sample_fp_index(
+            partitioner, len(self.samples)
         )
-
-        # Tensor form of sample_window_to_fp, for fast batched gather during training.
-        # Shape (n_samples, n_windows), values index into self.unique_fingerprints.
-        self.sample_fp_index = torch.empty(
-            (len(self.samples), len(partitioner)), dtype=torch.long
-        )
-        for (s, w), fp in self.sample_window_to_fp.items():
-            self.sample_fp_index[s, w] = self.fp_to_idx[fp]
+        self.sample_window_to_fp = None   # legacy per-pair dict; no longer built
+        self.fp_to_idx = None             # legacy fp→row map; rebuilt lazily below
 
     # ── Reference tables + window reuse ───────────────────────────────────────
 
@@ -181,18 +182,22 @@ class UniqueWindowDataset(Dataset):
 
     # ── Direct lookup by (sample, window) ────────────────────────────────────
 
+    def fp_index_for(self, sample_idx: int, window_idx: int) -> int:
+        """Row into unique_fingerprints for a (sample_idx, window_idx) pair —
+        the sample_fp_index lookup that replaces the old sample_window_to_fp dict."""
+        return int(self.sample_fp_index[sample_idx, window_idx])
+
     def get_fingerprint(self, sample_id: str, window_idx: int) -> Fingerprint:
         """Return the fingerprint for a specific (sample, window) pair."""
         sample_idx = self.samples.index(sample_id)
-        return self.sample_window_to_fp[(sample_idx, window_idx)]
+        return self.unique_fingerprints[self.fp_index_for(sample_idx, window_idx)]
 
     def get_item_for_sample_window(
         self, sample_id: str, window_idx: int
     ) -> dict[str, Any]:
         """Same return shape as __getitem__, addressed by sample + window."""
-        fp  = self.get_fingerprint(sample_id, window_idx)
-        idx = self.fp_to_idx[fp]
-        return self.__getitem__(idx)
+        sample_idx = self.samples.index(sample_id)
+        return self.__getitem__(self.fp_index_for(sample_idx, window_idx))
 
     # ── Batched lookup for training ───────────────────────────────────────────
 

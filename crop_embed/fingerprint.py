@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import bisect
 
+import numpy as np
+import torch
+
 from crop_embed.data.vcf import SNPRecord
 from crop_embed.partitioner import SNPWindowPartitioner, Window
 
@@ -100,3 +103,85 @@ def build_sample_window_map(
                 unique_fingerprints.append(fp)
 
     return sample_window_to_fp, unique_fingerprints, fp_to_idx
+
+
+def build_sample_fp_index(
+    partitioner: SNPWindowPartitioner,
+    n_samples: int,
+) -> tuple[list[Fingerprint], "torch.Tensor"]:
+    """
+    Memory-frugal replacement for build_sample_window_map: produce the two
+    artefacts the dataset actually needs — the deduplicated ``unique_fingerprints``
+    list and the ``(n_samples, n_windows)`` index tensor — WITHOUT ever
+    materialising the per-(sample × window) fingerprint dict (hundreds of
+    millions of entries on soy → ~130 GB / >1 h). Peak extra memory here is one
+    ``(n_samples, k)`` uint8 matrix per window (k = SNPs in the window, usually 1).
+
+    Per window it stacks the per-SNP alt-flag byte vectors (``gt_alts``, already
+    one byte per sample) into an ``(n_samples, k)`` matrix and dedups with a
+    single ``np.unique(axis=0)``. Because a fingerprint embeds ``(chrom, start,
+    end)``, windows never share fingerprints, so the global list is simply each
+    window's unique rows concatenated in window order. Unique rows are emitted in
+    first-appearance-by-sample order, so the output is byte-identical to what
+    ``build_sample_window_map`` + the old index construction produced.
+
+    Returns
+    -------
+    unique_fingerprints : list[Fingerprint]                — cache-row order
+    sample_fp_index     : LongTensor[n_samples, n_windows] — indexes the list
+    """
+    sample_fp_index = torch.empty((n_samples, len(partitioner)), dtype=torch.long)
+    unique_fingerprints: list[Fingerprint] = []
+    positions_by_chrom: dict[int, list[int]] = {}
+
+    for window in partitioner:
+        chrom = window.chrom
+        snps  = partitioner.snps_by_chrom[chrom]
+
+        positions = positions_by_chrom.get(chrom)
+        if positions is None:
+            positions = [r.pos for r in snps]
+            positions_by_chrom[chrom] = positions
+
+        # Same binary-search slice build_sample_window_map uses.
+        lo = bisect.bisect_left(positions, window.start)
+        hi = bisect.bisect_left(positions, window.end)
+        snps_in_range = snps[lo:hi]
+
+        offset = len(unique_fingerprints)
+
+        if not snps_in_range:
+            # No SNPs in range → every sample is pure reference: one fingerprint.
+            unique_fingerprints.append((chrom, window.start, window.end, ()))
+            sample_fp_index[:, window.index] = offset
+            continue
+
+        # (n_samples, k) alt-flag matrix, one column per SNP in range.
+        alt = np.empty((n_samples, len(snps_in_range)), dtype=np.uint8)
+        for j, rec in enumerate(snps_in_range):
+            alt[:, j] = np.frombuffer(rec.gt_alts, dtype=np.uint8)
+
+        uniq, first_idx, inv = np.unique(
+            alt, axis=0, return_index=True, return_inverse=True
+        )
+        inv = np.asarray(inv).reshape(-1)   # np>=2 may return shape (n, 1)
+
+        # Re-order the (lexicographically sorted) unique rows into first-
+        # appearance-by-sample order so emitted indices match the old builder.
+        order = np.argsort(first_idx, kind="stable")
+        rank  = np.empty_like(order)
+        rank[order] = np.arange(order.shape[0])
+
+        snp_pos = [rec.pos for rec in snps_in_range]
+        for u in order:
+            row = uniq[u]
+            alt_positions = tuple(
+                snp_pos[c] for c in range(len(snp_pos)) if row[c]
+            )
+            unique_fingerprints.append((chrom, window.start, window.end, alt_positions))
+
+        sample_fp_index[:, window.index] = torch.from_numpy(
+            (offset + rank[inv]).astype(np.int64)
+        )
+
+    return unique_fingerprints, sample_fp_index

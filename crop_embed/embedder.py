@@ -364,12 +364,13 @@ class SampleEmbedder:
         missing = 0
 
         for window in partitioner:
-            key = (sample_idx, window.index)
-            fp  = self.dataset.sample_window_to_fp.get(key)
-            # if fp is None or not fp[3]:  # skip pure-reference windows — no sample-specific signal
+            fp  = self.dataset.unique_fingerprints[
+                self.dataset.fp_index_for(sample_idx, window.index)
+            ]
+            # if not fp[3]:  # skip pure-reference windows — no sample-specific signal
             #     continue
             if fp is None:
-                raise ValueError(f"Missing fingerprint for {window}. ({key})")
+                raise ValueError(f"Missing fingerprint for {window}.")
             vec = self.embedding_table.get(fp)
             if vec is None:
                 missing += 1
