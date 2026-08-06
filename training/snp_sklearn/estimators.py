@@ -18,12 +18,31 @@ from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.kernel_ridge import KernelRidge
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import GridSearchCV, KFold
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
 
 # ridge = RR-BLUP-style linear; svr/krr = RBF-kernel heads; rf/gbm = trees; pls = latent-factor.
 MODELS = ("ridge", "svr", "krr", "rf", "gbm", "pls")
+
+
+class _ColumnScaler(BaseEstimator, TransformerMixin):
+    """Multiply each feature column by a fixed ``scale`` (data-independent).
+
+    Placed AFTER the StandardScaler so a per-SNP prior gives column j variance
+    scale_j² instead of 1 — for ridge on whitened features that's a per-feature
+    penalty α/scale_j² (weighted GBLUP: high-weight SNPs shrunk less). A pre-scale
+    StandardScaler would divide it right back out, so this must live post-whitening."""
+
+    def __init__(self, scale):
+        self.scale = scale
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        return X * np.asarray(self.scale, dtype=X.dtype)
 
 
 def add_sklearn_args(p: argparse.ArgumentParser) -> None:
@@ -61,6 +80,12 @@ def _prefix(args) -> list:
         return [("svd", TruncatedSVD(n_components=args.svd, random_state=args.seed)),
                 ("scale", StandardScaler())]
     steps = [("scale", StandardScaler())]
+    # Per-SNP prior variance: reweight columns AFTER standardization (the harness
+    # stashes the aligned sqrt-weights on args when --snp-prior is set; guaranteed
+    # absent under --svd/--sparse, so columns are still per-SNP here).
+    prior_scale = getattr(args, "_snp_prior_scale", None)
+    if prior_scale is not None:
+        steps.append(("prior", _ColumnScaler(prior_scale)))
     if getattr(args, "svd", 0) and args.svd > 0:
         steps.append(("svd", TruncatedSVD(n_components=args.svd, random_state=args.seed)))
     return steps

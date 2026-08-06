@@ -35,6 +35,10 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--sparse", action="store_true",
                    help="Use the raw sparse (CSR) SNP matrix instead of dense dosage; "
                         "requires --svd (TruncatedSVD reduces + densifies it).")
+    p.add_argument("--snp-prior", default=None,
+                   help="Path to a per-SNP importance prior ({variant_ids, weights}); "
+                        "rescales each SNP column by sqrt(weight) before fitting "
+                        "(a Carbon-derived per-SNP prior variance / weighted GBLUP).")
     # embedding-modality knobs (ignored by snp)
     p.add_argument("--backbone", default=None)
     p.add_argument("--half-window", type=int, default=None)
@@ -58,10 +62,24 @@ def resolve_traits(spec, arg: str) -> list[str]:
 def _build_features(spec, modality: str, samples: list[str], args):
     """Return (X aligned to samples, cache_path_or_None)."""
     if modality == "snp":
-        if getattr(args, "sparse", False):
-            X, _ = feat.snp_matrix_sparse(spec, samples)
+        prior = getattr(args, "snp_prior", None)
+        sparse = getattr(args, "sparse", False)
+        if sparse:
+            X, variant_ids = feat.snp_matrix_sparse(spec, samples)
         else:
-            X, _ = feat.snp_matrix(spec, samples, impute=args.impute)
+            X, variant_ids = feat.snp_matrix(spec, samples, impute=args.impute)
+        if prior is not None:
+            # The prior is a per-SNP variance applied AFTER standardization (a
+            # StandardScaler in front of raw-column scaling would undo it). Resolve
+            # the aligned weights here and hand them to the estimator, which inserts
+            # the reweight post-scale. Incompatible with dim-reduction/sparse, where
+            # the columns are no longer per-SNP.
+            if sparse or getattr(args, "svd", 0):
+                raise SystemExit("--snp-prior is incompatible with --sparse/--svd "
+                                 "(the reweighted columns must stay per-SNP).")
+            import numpy as np
+            args._snp_prior_scale = np.sqrt(
+                feat.resolve_prior_weights(variant_ids, prior)).astype(np.float32)
         return X, None
     if modality == "emb":
         if not args.backbone or args.half_window is None:
@@ -85,6 +103,12 @@ def run_sklearn(modality: str, make_estimator: Callable[[], object], args) -> di
     X, cache_path = _build_features(spec, modality, samples, args)
     tcol = {t: i for i, t in enumerate(split.trait_cols)}
     Y = split.targets[:, [tcol[t] for t in traits]]           # (n, T) aligned to samples
+    # Per-trait z-score (NaN-safe), matching the emb_nn path. PCC/R² are invariant to
+    # this affine rescale (so metrics are unchanged for ridge/pls/krr/rf/gbm); the point
+    # is a tame, trait-comparable scale for the selected hyperparameters (e.g. ridge
+    # alpha). SVR is the one exception — its absolute epsilon-tube becomes well-scaled.
+    from crop_embed.data.preprocessing import scale_phenotypes
+    Y = scale_phenotypes(Y).astype(np.float32)
 
     tr = split.indices("train", samples)
     va = split.indices("val", samples)
@@ -113,9 +137,11 @@ def run_sklearn(modality: str, make_estimator: Callable[[], object], args) -> di
     metrics = {"val": evaluate(Y[va], yhat_val, traits),
                "test": evaluate(Y[te], yhat_test, traits)}
 
-    prep = {"svd": getattr(args, "svd", 0), "sparse": getattr(args, "sparse", False)}
+    prep = {"svd": getattr(args, "svd", 0), "sparse": getattr(args, "sparse", False),
+            "scaled_targets": True}
     if modality == "snp":
         prep["impute"] = "ref" if prep["sparse"] else args.impute
+        prep["snp_prior"] = getattr(args, "snp_prior", None)
     elif modality == "emb":
         prep["recipe"] = args.recipe
     rec = run_record.build(

@@ -29,7 +29,8 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from crop_embed.models.fp_head_model import (
     MLPModel, LinearModel, FPSumHeadModel, FPCenteredSumHeadModel,
-    FPRefDeltaSumHeadModel, window_means)
+    FPRefDeltaSumHeadModel, AttentionHead, FPGatherHeadModel, window_means,
+    window_position_features_from_cache)
 from crop_embed import FixedWindowEmbedder, MetricLogger, metrics_path_for, ActivationTracker
 from crop_embed.train import masked_mse, _compute_metrics
 
@@ -47,10 +48,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--half-window", type=int, default=500)
     p.add_argument("--buffer", type=int, default=0)
     # Head architecture
-    p.add_argument("--head", choices=["linear", "mlp"], default="mlp")
+    p.add_argument("--head", choices=["linear", "mlp", "attention"], default="mlp")
     p.add_argument("--hidden-dim", type=int, default=None, help="MLP hidden width (default emb_dim).")
     p.add_argument("--n-layers", type=int, default=2, help="MLP residual blocks (--head mlp).")
     p.add_argument("--dropout", type=float, default=0.0, help="MLP dropout (--head mlp).")
+    p.add_argument("--bottleneck-dim", type=int, default=None,
+                   help="Learnable linear bottleneck: a Linear(emb_dim -> N) with no activation "
+                        "as the MLP's first layer (a trainable analog of --svd). Blocks then run "
+                        "at --hidden-dim (defaults to N). --head mlp only.")
+    p.add_argument("--svd", type=int, default=None,
+                   help="Preprocess: reduce the pooled per-sample embeddings to N dims with "
+                        "TruncatedSVD fit on TRAIN only (like the SNP pipeline), before the "
+                        "standardizer + head. Fixed/unsupervised (cf. the learnable --bottleneck-dim).")
+    # Attention head (--head attention): K learnable queries cross-attend to the
+    # per-window embeddings, gathered per batch — no pre-pool to a single vector.
+    p.add_argument("--n-queries", type=int, default=8,
+                   help="K learnable queries (--head attention).")
+    p.add_argument("--n-heads", type=int, default=4,
+                   help="Attention heads in the cross-attention (--head attention).")
+    p.add_argument("--attn-mlp-layers", type=int, default=0,
+                   help="Residual GELU blocks in the head on top of the attention "
+                        "(0 = the default 2-layer input-proj→output MLP). --head attention.")
+    p.add_argument("--attn-dropout", type=float, default=0.0,
+                   help="Dropout in the attention head's MLP (--head attention).")
+    p.add_argument("--positional", action="store_true",
+                   help="Add per-chromosome + sinusoidal bp position embeddings to each window "
+                        "before attention (reconstructed from the cache). --head attention.")
+    p.add_argument("--init-attention-as-mean", action="store_true",
+                   help="Initialize the attention so its output starts as a uniform mean-pool of "
+                        "the (normalized) windows, then deviates as it trains. Requires --n-queries 1.")
     p.add_argument("--no-normalize", action="store_true",
                    help="Disable the learned de-mean/rescale standardizer in the head.")
     p.add_argument("--standardizer", choices=["perdim", "rms"], default="perdim",
@@ -77,6 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--warm-start-standardizer", action="store_true",
                    help="Fit the standardizer on the training embeddings before training.")
     # Optimization
+    p.add_argument("--early-stopping", action="store_true",
+                   help="Restore the best-val-PCC epoch's weights before the final test eval / "
+                        "save, instead of using the last epoch (the head overfits, so the last "
+                        "epoch is usually past the val peak).")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4,
@@ -94,6 +124,153 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _train_attention(args, spec, dataset, cache, sample_fp_index, Y, trait_cols,
+                     train_idx, val_idx, test_idx, emb_dim, n_traits, device, logger):
+    """Train the cross-attention head (K learnable queries → per-window embeddings).
+
+    Unlike the pooled heads, this never collapses the cache to one vector per sample.
+    The full (n_fps, D) cache stays resident on the GPU and each batch gathers its
+    samples' (B, n_windows, D) window stack from it via sample_fp_index — exactly the
+    tensor AttentionHead attends over. Val/test are gathered in the same batched way
+    (the full (n_windows × n_eval × D) stack would never fit at once)."""
+    cache_gpu = cache.to(device)                    # (n_fps, D) resident on GPU
+    sfi = sample_fp_index                           # (n_samples, n_windows) long, on CPU
+
+    # Train-only per-window centering (subtract each window's across-sample mean) —
+    # fit on TRAIN indices so val/test embeddings never leak into the centering.
+    window_mean = None
+    if args.center_windows:
+        window_mean = window_means(cache_gpu, sfi.to(device), train_idx.to(device)).cpu()
+        print("  center-windows: subtract each window's across-sample (train) mean before attention")
+
+    # Positional features reconstructed from the cache (no partitioner on the fast path).
+    window_chroms = window_positions = None
+    if args.positional:
+        window_chroms, window_positions = window_position_features_from_cache(
+            dataset.unique_fingerprints, sfi)
+        print(f"  positional: per-chromosome + sinusoidal bp position encodings "
+              f"({int(window_chroms.max()) + 1} chroms)")
+
+    attn = AttentionHead(
+        emb_dim=emb_dim, n_traits=n_traits,
+        n_queries=args.n_queries, n_heads=args.n_heads, hidden_dim=args.hidden_dim,
+        positional=args.positional, window_chroms=window_chroms,
+        window_positions=window_positions, window_mean=window_mean,
+        mlp_layers=args.attn_mlp_layers, mlp_dropout=args.attn_dropout,
+    )
+    if args.init_attention_as_mean:
+        attn.init_attention_as_mean()
+        print("  init-attention-as-mean: attention starts as a uniform mean-pool")
+    head = FPGatherHeadModel(attn).to(device)
+
+    # Weight-decay only on inner Linear weights (queries / LayerNorm / biases excluded),
+    # matching the pooled path.
+    linear_weight_ids = {id(m.weight) for m in head.modules() if isinstance(m, torch.nn.Linear)}
+    decay, nodecay = [], []
+    for p in head.parameters():
+        if not p.requires_grad:
+            continue
+        (decay if id(p) in linear_weight_ids else nodecay).append(p)
+    opt = torch.optim.AdamW(
+        [{"params": decay, "weight_decay": args.weight_decay},
+         {"params": nodecay, "weight_decay": 0.0}], lr=args.lr)
+
+    n_params = sum(p.numel() for p in head.parameters())
+    print(f"Head: attention (K={args.n_queries}, heads={args.n_heads}, "
+          f"mlp_layers={args.attn_mlp_layers}; {n_params:,} params)")
+
+    def _predict(idx: torch.Tensor) -> torch.Tensor:
+        """Chunked forward over sample indices → (len(idx), n_traits) on CPU."""
+        head.eval()
+        out = []
+        with torch.no_grad():
+            for i in range(0, len(idx), args.batch_size):
+                gi = sfi[idx[i:i + args.batch_size]].to(device)     # (b, n_windows)
+                out.append(head(cache_gpu, gi).cpu())
+        return torch.cat(out, dim=0)
+
+    train_ds = TensorDataset(train_idx, Y[train_idx])
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+
+    print(f"\nTraining {args.epochs} epochs over {len(train_idx)} samples at lr={args.lr} …")
+    step = 0
+    best_val_pcc, best_state, best_epoch = float("-inf"), None, -1
+    for epoch in range(args.epochs):
+        head.train()
+        for sidx, y in train_loader:
+            gi = sfi[sidx].to(device)                               # (B, n_windows)
+            y = y.to(device)
+            pred = head(cache_gpu, gi)
+            loss = masked_mse(pred, y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            if step % args.log_every == 0:
+                train_m = _compute_metrics(pred.detach(), y, trait_cols, "train")
+                print(f"epoch {epoch:4d} step {step:6d}"
+                      f"  loss={train_m.get('train/mean_mse', loss.item()):.4f}"
+                      f"  pcc={train_m.get('train/mean_pcc', float('nan')):.3f}")
+                logger.log({"epoch": epoch, "step": step, **train_m})
+            step += 1
+
+        val_pred = _predict(val_idx)
+        val_m = _compute_metrics(val_pred, Y[val_idx], trait_cols, "val")
+        print(f"epoch {epoch:4d}  [val]"
+              f"  val_loss={val_m.get('val/mean_mse', float('nan')):.4f}"
+              f"  val_pcc={val_m.get('val/mean_pcc', float('nan')):.3f}")
+        logger.log({"epoch": epoch, "step": step, **val_m})
+
+        if args.early_stopping:
+            vp = val_m.get("val/mean_pcc", float("-inf"))
+            if vp > best_val_pcc:
+                best_val_pcc, best_epoch = vp, epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in head.state_dict().items()}
+
+    if args.early_stopping and best_state is not None:
+        head.load_state_dict(best_state)
+        print(f"Early stopping: restored epoch {best_epoch} (best val_pcc={best_val_pcc:.3f})")
+
+    # ── Final held-out TEST evaluation ────────────────────────────────────────────
+    val_pred = _predict(val_idx).numpy()
+    test_pred = _predict(test_idx).numpy()
+    val_metrics = cmetrics.evaluate(Y[val_idx].numpy(), val_pred, trait_cols)
+    test_metrics = cmetrics.evaluate(Y[test_idx].numpy(), test_pred, trait_cols)
+    tm = test_metrics.get("mean", {})
+    print(f"\n[test] mean pcc={tm.get('pearson', float('nan')):.3f}  mse={tm.get('mse', float('nan')):.4f}")
+
+    # ── Save head + reconstruction metadata ───────────────────────────────────────
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    head_config = {
+        "head": "attention", "model_class": "AttentionHead",
+        "emb_dim": emb_dim, "n_traits": n_traits,
+        "n_queries": args.n_queries, "n_heads": args.n_heads,
+        "hidden_dim": args.hidden_dim, "mlp_layers": args.attn_mlp_layers,
+        "mlp_dropout": args.attn_dropout, "positional": args.positional,
+        "center_windows": args.center_windows,
+        "init_attention_as_mean": args.init_attention_as_mean,
+        "early_stopping": args.early_stopping, "best_epoch": best_epoch,
+    }
+    torch.save({
+        "head_state_dict": head.state_dict(), "head_config": head_config,
+        "cache_path": args.cache,
+        "split_path": str(default_split_path(args.dataset, args.seed)),
+        "trait_cols": trait_cols, "sample_ids": dataset.samples, "args": vars(args),
+    }, out_path)
+    print(f"Saved to {out_path}")
+
+    rec = run_record.build(
+        dataset=args.dataset, features="emb_nn", model="attention", seed=args.seed,
+        traits=trait_cols, hyperparams={**head_config, "lr": args.lr, "epochs": args.epochs,
+                                        "weight_decay": args.weight_decay},
+        metrics={"val": val_metrics, "test": test_metrics},
+        half_window=args.half_window,
+        split_path=str(default_split_path(args.dataset, args.seed)),
+        cache_path=args.cache)
+    run_record.write(rec, out_path.parent)
+    logger.close()
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -103,6 +280,16 @@ def main() -> None:
         parser.error("--warm-start-head and --warm-start-standardizer are mutually exclusive.")
     if args.subtract_reference and args.center_windows:
         parser.error("--subtract-reference and --center-windows are mutually exclusive.")
+    if args.bottleneck_dim is not None and args.head != "mlp":
+        parser.error("--bottleneck-dim requires --head mlp.")
+    if args.head == "attention":
+        for bad, name in [(args.subtract_reference, "--subtract-reference"),
+                          (args.center_ln_pool, "--center-ln-pool"),
+                          (args.svd, "--svd"), (args.bottleneck_dim, "--bottleneck-dim")]:
+            if bad:
+                parser.error(f"{name} is incompatible with --head attention.")
+        if args.init_attention_as_mean and args.n_queries != 1:
+            parser.error("--init-attention-as-mean requires --n-queries 1.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -166,6 +353,14 @@ def main() -> None:
     emb_dim = cache.shape[1]
     n_traits = Y.shape[1]
 
+    # ── Attention head: a different data path (per-batch window gather, not a single
+    # pre-pooled vector), so it runs in its own routine and returns here. ──────────
+    if args.head == "attention":
+        _train_attention(
+            args, spec, dataset, cache, sample_fp_index, Y, trait_cols,
+            train_idx, val_idx, test_idx, emb_dim, n_traits, device, logger)
+        return
+
     # ── 1.a Pre-sum into one embedding per sample ─────────────────────────────────
     if args.center_ln_pool:
         if args.subtract_reference:
@@ -197,6 +392,17 @@ def main() -> None:
         table = cache
         summed = F.embedding_bag(sample_fp_index, table, mode=args.pool)      # (n_samples, D)
 
+    # ── 1.b Optional SVD reduction (fit on TRAIN only), like the SNP pipeline ─────
+    if args.svd:
+        from sklearn.decomposition import TruncatedSVD
+        svd = TruncatedSVD(n_components=args.svd, random_state=args.seed)
+        svd.fit(summed[train_idx].numpy())
+        summed = torch.tensor(svd.transform(summed.numpy()), dtype=torch.float32)
+        emb_dim = args.svd
+        evr = float(svd.explained_variance_ratio_.sum())
+        print(f"  SVD: {summed.shape[1]} components (train-fit), "
+              f"explained variance ratio={evr:.3f}")
+
     train_ds = TensorDataset(summed[train_idx], Y[train_idx])
     val_x = summed[val_idx].to(device)
     val_y = Y[val_idx].to(device)
@@ -207,7 +413,8 @@ def main() -> None:
         inner: torch.nn.Module = LinearModel(emb_dim, n_traits)
     else:
         inner = MLPModel(emb_dim, n_traits, hidden_dim=args.hidden_dim,
-                         n_layers=args.n_layers, dropout=args.dropout)
+                         n_layers=args.n_layers, dropout=args.dropout,
+                         bottleneck_dim=args.bottleneck_dim)
 
     warm_start_embeddings = summed[train_idx] if args.warm_start_standardizer else None
     freeze_standardizer = (args.warm_start_standardizer if args.freeze_standardizer is None
@@ -256,6 +463,7 @@ def main() -> None:
     n_train = len(train_ds)
     print(f"\nTraining {args.epochs} epochs over {n_train} samples at lr={args.lr} …")
     step = 0
+    best_val_pcc, best_state, best_epoch = float("-inf"), None, -1
     for epoch in range(args.epochs):
         head.train()
         for x, y in train_loader:
@@ -285,6 +493,16 @@ def main() -> None:
               f"  val_pcc={val_m.get('val/mean_pcc', float('nan')):.3f}")
         logger.log({"epoch": epoch, "step": step, **val_m})
 
+        if args.early_stopping:
+            vp = val_m.get("val/mean_pcc", float("-inf"))
+            if vp > best_val_pcc:
+                best_val_pcc, best_epoch = vp, epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in head.state_dict().items()}
+
+    if args.early_stopping and best_state is not None:
+        head.load_state_dict(best_state)
+        print(f"Early stopping: restored epoch {best_epoch} (best val_pcc={best_val_pcc:.3f})")
+
     # ── 3.a Final held-out TEST evaluation ────────────────────────────────────────
     head.eval()
     with torch.no_grad():
@@ -307,6 +525,8 @@ def main() -> None:
         "center_windows": args.center_windows,
         "pool": args.pool, "emb_dim": emb_dim, "n_traits": n_traits,
         "hidden_dim": args.hidden_dim, "n_layers": args.n_layers, "dropout": args.dropout,
+        "bottleneck_dim": args.bottleneck_dim, "svd": args.svd,
+        "early_stopping": args.early_stopping, "best_epoch": best_epoch,
         "normalize": not args.no_normalize, "standardizer": args.standardizer,
         "freeze_standardizer": freeze_standardizer,
     }

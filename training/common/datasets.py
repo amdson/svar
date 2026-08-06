@@ -49,6 +49,12 @@ class DatasetSpec:
     pheno_csv: str            # IID-keyed phenotype table
     vcf_path: str | None = None
     trait_cols: tuple[str, ...] | None = None   # None → infer from pheno_csv header
+    # Development variants (e.g. soy_dev): point every artifact path at a base
+    # dataset's files and share its embedding caches (cache_name), but resolve to a
+    # nested 10% split. base_dataset set → splits.get_or_build_split subsamples it.
+    cache_name: str | None = None   # cache dir override; None → self.name
+    base_dataset: str | None = None # this is a dev subsample of that dataset
+    dev_fraction: float | None = None
 
     # ── accessors ────────────────────────────────────────────────────────────
     @property
@@ -86,7 +92,7 @@ class DatasetSpec:
         """Convention for a fixed-embedding cache: address by (crop, backbone, window)."""
         scratch = os.environ.get("SVAR_SCRATCH", str(Path.home() / "svar_scratch"))
         suffix = "_snponly" if snp_only else ""
-        return str(Path(scratch) / "caches" / self.name /
+        return str(Path(scratch) / "caches" / (self.cache_name or self.name) /
                    f"{backbone}_hw{half_window}{suffix}.ckpt.pt")
 
 
@@ -111,6 +117,19 @@ def _registry() -> dict[str, DatasetSpec]:
             pheno_csv=str(soy / "soy_pheno_aligned.csv"),
             vcf_path=str(soy / "soysnp50k_a2_final.vcf"),
             trait_cols=SOY_TRAITS,
+        ),
+        # Development subset: soy's artifacts + caches, but a nested 10% split
+        # (splits.build_dev_split) for fast iteration on expensive models.
+        "soy_dev": DatasetSpec(
+            name="soy_dev",
+            pgen_prefix=str(soy / "soysnp50k_a2_final"),
+            fasta_path=str(soy / "Glycine_max.Glycine_max_v2.1.dna_sm.toplevel.fa"),
+            pheno_csv=str(soy / "soy_pheno_aligned.csv"),
+            vcf_path=str(soy / "soysnp50k_a2_final.vcf"),
+            trait_cols=SOY_TRAITS,
+            cache_name="soy",
+            base_dataset="soy",
+            dev_fraction=0.10,
         ),
         "rice": DatasetSpec(
             name="rice",

@@ -44,6 +44,30 @@ def window_position_features(
     positions = torch.tensor([(w.start + w.end) // 2   for w in windows], dtype=torch.long)
     return chroms, positions
 
+
+def window_position_features_from_cache(
+    unique_fingerprints: list,
+    sample_fp_index: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-window (chrom, center_bp) in window-column order, reconstructed from a
+    cache alone (``unique_fingerprints`` + ``sample_fp_index``) when no partitioner
+    is available — the fast ``CachedWindows`` / ``from_cached_windows`` path.
+
+    Every fingerprint in window column j shares that window's (chrom, start, end)
+    and differs only in its alt positions (see ``build_sample_fp_index``), so any
+    sample's cache row for column j is a valid representative. Row 0 is used.
+
+    Returns (chroms LongTensor[n_windows], positions LongTensor[n_windows]) — the
+    same arrays ``window_position_features`` yields, ready for AttentionHead."""
+    rep_rows = sample_fp_index[0].tolist()          # one cache row per window column
+    chroms, positions = [], []
+    for r in rep_rows:
+        chrom, start, end, _ = unique_fingerprints[r]
+        chroms.append(chrom)
+        positions.append((start + end) // 2)
+    return (torch.tensor(chroms, dtype=torch.long),
+            torch.tensor(positions, dtype=torch.long))
+
 def _sinusoidal_pe(
     positions: torch.Tensor, d_model: int, max_position: int
 ) -> torch.Tensor:
@@ -233,11 +257,23 @@ class MLPModel(nn.Module):
         hidden_dim: int | None = None,
         n_layers: int = 2,
         dropout: float = 0.0,
+        bottleneck_dim: int | None = None,
     ) -> None:
         super().__init__()
-        hidden_dim = hidden_dim or emb_dim
+        # Optional learnable linear bottleneck: a plain Linear(emb_dim -> bottleneck_dim)
+        # with NO activation — a *learned* dimensionality reduction (the trainable analog
+        # of an SVD preprocessing step) applied before the MLP proper. Decoupled from the
+        # block width: the residual stack then runs at `hidden_dim`, which defaults to the
+        # bottleneck (or emb_dim when there's no bottleneck), so you can reduce-then-expand.
+        if bottleneck_dim is not None:
+            self.bottleneck: nn.Module | None = nn.Linear(emb_dim, bottleneck_dim)
+            proj_in = bottleneck_dim
+        else:
+            self.bottleneck = None
+            proj_in = emb_dim
+        hidden_dim = hidden_dim or proj_in
         self.input_proj = nn.Sequential(
-            nn.Linear(emb_dim, hidden_dim),
+            nn.Linear(proj_in, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
         )
@@ -245,10 +281,11 @@ class MLPModel(nn.Module):
             _ResidualBlock(hidden_dim, dropout) for _ in range(n_layers)
         )
         self.output = nn.Linear(hidden_dim, n_traits)
-    
+
     def forward(self, seq_emb: torch.Tensor) -> torch.Tensor:
         # seq_emb: (B, D)
-        x = self.input_proj(seq_emb)
+        x = seq_emb if self.bottleneck is None else self.bottleneck(seq_emb)
+        x = self.input_proj(x)
         for block in self.blocks:
             x = block(x)
         return self.output(x)
