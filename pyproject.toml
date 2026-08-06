@@ -10,6 +10,7 @@ dependencies = [
     # numerics / data
     "numpy",
     "pandas",
+    "polars",   # fast vectorized plain-VCF reader (data/vcf_polars.py)
     "scipy",
     "scikit-learn",
     "tqdm",
@@ -54,4 +55,4 @@ notebooks = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["crop_embed*"]
+include = ["crop_embed*", "training*"]
