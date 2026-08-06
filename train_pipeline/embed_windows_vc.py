@@ -100,8 +100,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fasta-path", type=str, default=str(FASTA_PATH))
     p.add_argument("--half-window", type=int, default=500)
     p.add_argument("--buffer", type=int, default=0)
+    p.add_argument("--loader", choices=["pysam", "polars"], default="pysam",
+                   help="VCF reader. 'polars' is ~2 orders of magnitude faster on "
+                        "large plain biallelic-GT VCFs (arabidopsis: ~18s vs ~45min); "
+                        "byte-identical SNPRecords. 'pysam' (default) for any VCF.")
     p.add_argument("--limit", type=int, default=None,
                    help="Process only the first N window groups (smoke test / dev).")
+    p.add_argument("--write-mode", choices=["tensor", "dict"], default="tensor",
+                   help="'tensor' (default): scatter embeddings into a preallocated "
+                        "(n_unique, emb_dim) fp16 table by fingerprint→row — RAM capped "
+                        "at the cache size, single contiguous checkpoints (required for "
+                        "large runs like arabidopsis, ~7.6M windows). 'dict': the legacy "
+                        "{fingerprint: tensor} accumulator (fine for small caches).")
 
     # Compute
     p.add_argument("--vc-batch-size", type=int, default=16,
@@ -236,9 +246,11 @@ def embed_window_group(
 
 # ── Optional correctness check ─────────────────────────────────────────────────
 
-def sanity_check(var_fps, table, dataset, exact_model, tokenizer, max_length,
+def sanity_check(var_fps, emb_lookup, dataset, exact_model, tokenizer, max_length,
                  snp_only, device, n):
-    """Compare variant-cache embeddings to the exact full-forward embeddings."""
+    """Compare variant-cache embeddings to the exact full-forward embeddings.
+    ``emb_lookup(fp) -> Tensor`` fetches the stored embedding (dict.__getitem__ or
+    a row lookup into the preallocated tensor)."""
     cos = []
     for fp in var_fps[:n]:
         chrom, w_start, w_end, _ = fp
@@ -255,7 +267,7 @@ def sanity_check(var_fps, table, dataset, exact_model, tokenizer, max_length,
             exact_emb = h[m].mean(0) if m.any() else _pool_full(h, keep)
         else:
             exact_emb = _pool_full(h, keep)
-        vc_emb = table[fp].to(device)
+        vc_emb = emb_lookup(fp).to(device)
         cos.append(F.cosine_similarity(vc_emb, exact_emb, dim=0).item())
     if cos:
         import statistics as st
@@ -279,8 +291,12 @@ def main() -> int:
     ckpt_path = args.checkpoint_path or str(out_path) + ".embtable.ckpt.pt"
 
     # ── Dataset ────────────────────────────────────────────────────────────────
-    print("Loading SNPs from VCF …")
-    snps_by_chrom, samples = load_snps_from_vcf(args.vcf_path)
+    print(f"Loading SNPs from VCF (loader={args.loader}) …")
+    if args.loader == "polars":
+        from crop_embed.data.vcf_polars import load_snps_from_vcf as _load
+    else:
+        _load = load_snps_from_vcf
+    snps_by_chrom, samples = _load(args.vcf_path)
     n_snps = sum(len(v) for v in snps_by_chrom.values())
     print(f"  {n_snps:,} SNPs | {len(snps_by_chrom)} chromosomes | {len(samples)} samples")
 
@@ -290,7 +306,8 @@ def main() -> int:
     print(f"  {len(partitioner):,} windows")
 
     print("Building UniqueWindowDataset …")
-    dataset = UniqueWindowDataset(args.vcf_path, args.fasta_path, partitioner)
+    dataset = UniqueWindowDataset(args.vcf_path, args.fasta_path, partitioner,
+                                  engine=args.loader)
     print(f"  {len(dataset):,} unique fingerprints to embed "
           f"(vs {len(partitioner) * len(dataset.samples):,} sample×window pairs)")
 
@@ -311,59 +328,121 @@ def main() -> int:
         args.model_path, device=device, dtype=dtype, backend="efficient")
     exact_model.eval(); cache_model.eval()
 
-    # ── Resume ─────────────────────────────────────────────────────────────────
-    embedding_table = {}
-    if os.path.exists(ckpt_path):
-        embedding_table = torch.load(ckpt_path, weights_only=False)
-        print(f"Resumed from checkpoint: {len(embedding_table):,} fingerprints already embedded")
+    emb_dim = int(exact_model.config.hidden_size)
+    n_uniq = len(dataset.unique_fingerprints)
+    total_haplos = sum(len(v) for v in groups.values())
 
-    def _save_checkpoint():
-        tmp = ckpt_path + ".tmp"
-        torch.save(embedding_table, tmp)
-        os.replace(tmp, ckpt_path)
-
-    # ── Embed ──────────────────────────────────────────────────────────────────
-    print(f"\nEmbedding {len(groups):,} window groups → {ckpt_path}")
-    t0 = time.time()
+    # ── Embed (tensor mode: preallocated fp16 table; dict mode: legacy) ─────────
     sanity_pool = []  # variant fps gathered for the optional sanity check
-    groups_since_save = 0
-    with torch.no_grad():
-        for key, fps in tqdm(groups.items(), desc="Embedding windows", unit="window"):
-            if all(fp in embedding_table for fp in fps):
-                continue
-            group_out = embed_window_group(
-                fps, dataset, exact_model, cache_model, tokenizer,
-                args.max_length, args.snp_only, args.vc_batch_size, device)
-            embedding_table.update(group_out)
 
-            if args.sanity_windows and len(sanity_pool) < args.sanity_windows:
-                sanity_pool.extend(fp for fp in fps if fp[3])
-
-            groups_since_save += 1
-            if groups_since_save >= args.checkpoint_every:
-                _save_checkpoint()
-                groups_since_save = 0
-    _save_checkpoint()
-    elapsed = time.time() - t0
-    print(f"  {len(embedding_table):,} fingerprints embedded in {elapsed:.1f}s")
-
-    if args.sanity_windows and sanity_pool:
-        print("\nRunning sanity check (variant cache vs exact full forward) …")
+    def _run_loop(process_group, is_done, save_ckpt, ckpt_desc):
+        """Shared driver: iterate groups with a rate/ETA progress bar, checkpoint
+        every N groups. process_group(fps) embeds+stores; is_done(fps)->bool skips
+        already-embedded groups (resume)."""
+        t0 = time.time()
+        groups_since_save = done_haplos = 0
+        pbar = tqdm(groups.items(), total=len(groups), desc="Embedding windows",
+                    unit="win", smoothing=0.05)
         with torch.no_grad():
-            sanity_check(sanity_pool, embedding_table, dataset, exact_model,
-                         tokenizer, args.max_length, args.snp_only, device,
-                         args.sanity_windows)
+            for _key, fps in pbar:
+                if not is_done(fps):
+                    process_group(fps)
+                    if args.sanity_windows and len(sanity_pool) < args.sanity_windows:
+                        sanity_pool.extend(fp for fp in fps if fp[3])
+                    groups_since_save += 1
+                    if groups_since_save >= args.checkpoint_every:
+                        save_ckpt(); groups_since_save = 0
+                done_haplos += len(fps)
+                dt = time.time() - t0
+                pbar.set_postfix_str(
+                    f"{done_haplos:,}/{total_haplos:,} haplos, "
+                    f"{done_haplos/max(dt,1e-9):,.0f} haplo/s")
+        save_ckpt()
+        return time.time() - t0
 
-    # ── Save cache (embed_windows.py-compatible payload) ───────────────────────
-    missing = sum(fp not in embedding_table for fp in dataset.unique_fingerprints)
-    if missing:
-        print(f"\n{missing:,}/{len(dataset.unique_fingerprints):,} fingerprints not "
-              f"embedded (partial/--limit run) — skipping final cache write. "
-              f"The resume checkpoint is at {ckpt_path}; re-run without --limit to finish.")
-        return 0
+    if args.write_mode == "tensor":
+        fp_to_row = {fp: i for i, fp in enumerate(dataset.unique_fingerprints)}
+        if os.path.exists(ckpt_path):
+            saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            table, done = saved["table"], saved["done"]
+            print(f"Resumed: {int(done.sum()):,}/{n_uniq:,} fingerprints already embedded")
+        else:
+            table = torch.empty((n_uniq, emb_dim), dtype=torch.float16)  # ~cache size, capped
+            done = torch.zeros(n_uniq, dtype=torch.bool)
 
-    fixed = FixedWindowEmbedder.from_embedding_table(embedding_table, dataset)
-    emb_dim = int(fixed.cache.shape[1])
+        def _save_checkpoint():
+            tmp = ckpt_path + ".tmp"
+            torch.save({"table": table, "done": done}, tmp)
+            os.replace(tmp, ckpt_path)
+
+        def _process(fps):
+            out = embed_window_group(fps, dataset, exact_model, cache_model, tokenizer,
+                                     args.max_length, args.snp_only, args.vc_batch_size, device)
+            for fp, vec in out.items():
+                r = fp_to_row[fp]
+                table[r] = vec.to(torch.float16)
+                done[r] = True
+
+        def _is_done(fps):
+            return bool(done[[fp_to_row[fp] for fp in fps]].all())
+
+        print(f"\nEmbedding {len(groups):,} groups ({total_haplos:,} haplotypes) "
+              f"[tensor/fp16, ~{n_uniq*emb_dim*2/1e9:.1f}GB] → {ckpt_path}")
+        elapsed = _run_loop(_process, _is_done, _save_checkpoint, ckpt_path)
+        print(f"  {int(done.sum()):,} fingerprints embedded in {elapsed:.1f}s")
+
+        if args.sanity_windows and sanity_pool:
+            print("\nRunning sanity check (variant cache vs exact full forward) …")
+            with torch.no_grad():
+                sanity_check(sanity_pool, lambda fp: table[fp_to_row[fp]].float(),
+                             dataset, exact_model, tokenizer, args.max_length,
+                             args.snp_only, device, args.sanity_windows)
+
+        missing = int((~done).sum())
+        if missing:
+            print(f"\n{missing:,}/{n_uniq:,} fingerprints not embedded (partial/--limit "
+                  f"run) — skipping final cache write. Resume checkpoint at {ckpt_path}; "
+                  f"re-run without --limit to finish.")
+            return 0
+        cache_tensor = table
+        sfi_tensor = dataset.sample_fp_index.clone()
+    else:
+        embedding_table = {}
+        if os.path.exists(ckpt_path):
+            embedding_table = torch.load(ckpt_path, weights_only=False)
+            print(f"Resumed from checkpoint: {len(embedding_table):,} already embedded")
+
+        def _save_checkpoint():
+            tmp = ckpt_path + ".tmp"
+            torch.save(embedding_table, tmp)
+            os.replace(tmp, ckpt_path)
+
+        def _process(fps):
+            embedding_table.update(embed_window_group(
+                fps, dataset, exact_model, cache_model, tokenizer,
+                args.max_length, args.snp_only, args.vc_batch_size, device))
+
+        print(f"\nEmbedding {len(groups):,} window groups [dict] → {ckpt_path}")
+        elapsed = _run_loop(_process, lambda fps: all(fp in embedding_table for fp in fps),
+                            _save_checkpoint, ckpt_path)
+        print(f"  {len(embedding_table):,} fingerprints embedded in {elapsed:.1f}s")
+
+        if args.sanity_windows and sanity_pool:
+            print("\nRunning sanity check (variant cache vs exact full forward) …")
+            with torch.no_grad():
+                sanity_check(sanity_pool, embedding_table.__getitem__, dataset,
+                             exact_model, tokenizer, args.max_length, args.snp_only,
+                             device, args.sanity_windows)
+
+        missing = sum(fp not in embedding_table for fp in dataset.unique_fingerprints)
+        if missing:
+            print(f"\n{missing:,}/{n_uniq:,} fingerprints not embedded (partial/--limit "
+                  f"run) — skipping final cache write. Resume checkpoint at {ckpt_path}; "
+                  f"re-run without --limit to finish.")
+            return 0
+        fixed = FixedWindowEmbedder.from_embedding_table(embedding_table, dataset)
+        cache_tensor = fixed.cache
+        sfi_tensor = fixed.sample_fp_index
 
     metadata = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -377,6 +456,8 @@ def main() -> int:
         "max_length":   args.max_length,
         "snp_only":     args.snp_only,
         "precision":    args.precision,
+        "write_mode":   args.write_mode,
+        "storage_dtype": str(cache_tensor.dtype),
         "emb_dim":      emb_dim,
 
         "vcf_path":     args.vcf_path,
@@ -390,8 +471,8 @@ def main() -> int:
     }
 
     payload = {
-        "cache":               fixed.cache,
-        "sample_fp_index":     fixed.sample_fp_index,
+        "cache":               cache_tensor,
+        "sample_fp_index":     sfi_tensor,
         "metadata":            metadata,
         "unique_fingerprints": dataset.unique_fingerprints,
         "sample_ids":          list(dataset.samples),
@@ -401,8 +482,8 @@ def main() -> int:
     torch.save(payload, tmp)
     os.replace(tmp, out_path)
     print(f"\nSaved cache to {out_path}")
-    print(f"  cache: {tuple(fixed.cache.shape)}  "
-          f"sample_fp_index: {tuple(fixed.sample_fp_index.shape)}")
+    print(f"  cache: {tuple(cache_tensor.shape)} {cache_tensor.dtype}  "
+          f"sample_fp_index: {tuple(sfi_tensor.shape)}")
     return 0
 
 

@@ -31,6 +31,17 @@ from crop_embed.fingerprint import (
 )
 from crop_embed.partitioner import SNPWindowPartitioner
 
+
+def _load_snps(vcf_path: str, samples: list[str] | None, engine: str):
+    """Dispatch VCF loading to the pysam or polars reader (identical output)."""
+    if engine == "polars":
+        from crop_embed.data.vcf_polars import load_snps_from_vcf as _polars_load
+        return _polars_load(vcf_path, samples)
+    if engine == "pysam":
+        return load_snps_from_vcf(vcf_path, samples)
+    raise ValueError(f"unknown VCF loader engine {engine!r} (use 'pysam' or 'polars')")
+
+
 class UniqueWindowDataset(Dataset):
     """
     Parameters
@@ -58,12 +69,16 @@ class UniqueWindowDataset(Dataset):
         fasta_path: str,
         partitioner: SNPWindowPartitioner,
         samples: list[str] | None = None,
+        engine: str = "pysam",
     ) -> None:
         self.fasta_path   = fasta_path
         self.partitioner  = partitioner
 
-        # Load VCF (single pass)
-        self._snps_by_chrom, self.samples = load_snps_from_vcf(vcf_path, samples)
+        # Load VCF (single pass). engine="polars" uses the vectorized reader
+        # (crop_embed.data.vcf_polars) — ~2 orders of magnitude faster on large
+        # plain biallelic-GT VCFs (arabidopsis: ~18s vs ~45min pysam); byte-identical
+        # SNPRecords. "pysam" (default) keeps the original behavior for any VCF.
+        self._snps_by_chrom, self.samples = _load_snps(vcf_path, samples, engine)
 
         # FASTA reference cache + per-position alt-byte tables (cheap; VCF + reference
         # only). Shared with from_cached_windows via _build_reference_tables.
