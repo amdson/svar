@@ -63,6 +63,7 @@ from crop_embed import (
     UniqueWindowDataset,
     load_encoder_model,
 )
+from crop_embed.partitioner import WINDOW_MODES, make_partitioner
 from crop_embed.data.coords import FASTA_PATH
 from crop_embed.data.vcf import load_snps_from_vcf
 
@@ -109,6 +110,11 @@ parser.add_argument("--vcf-path",   type=str, default=DEFAULT_VCF_PATH)
 parser.add_argument("--fasta-path", type=str, default=FASTA_PATH)
 parser.add_argument("--half-window", type=int, default=500)
 parser.add_argument("--buffer",      type=int, default=0)
+parser.add_argument("--window-mode", choices=list(WINDOW_MODES), default="overlap",
+                    help="'overlap' (default): windows span [p-hw, p+hw] and may "
+                         "overlap, so a SNP near a boundary is embedded in ~2 windows. "
+                         "'disjoint': non-overlapping windows, each SNP embedded in "
+                         "exactly one window (requires --buffer 0).")
 
 # Compute
 parser.add_argument("--batch-size", type=int, default=64)
@@ -180,9 +186,9 @@ else:
     n_snps = sum(len(v) for v in snps_by_chrom.values())
     print(f"  {n_snps:,} SNPs | {len(snps_by_chrom)} chromosomes | {len(samples)} samples")
 
-    print("Building SNPWindowPartitioner …")
-    partitioner = SNPWindowPartitioner(
-        snps_by_chrom, half_window=args.half_window, buffer=args.buffer
+    print(f"Building partitioner (window-mode={args.window_mode}) …")
+    partitioner = make_partitioner(
+        snps_by_chrom, args.half_window, args.buffer, mode=args.window_mode
     )
     stats = partitioner.snps_per_window_stats()
     print(f"  {stats['n_windows']:,} windows "
@@ -246,6 +252,7 @@ metadata = {
     "fasta_path":    args.fasta_path,
     "half_window":   args.half_window,
     "buffer":        args.buffer,
+    "window_mode":   args.window_mode,
 
     # Shape / identity
     "n_samples":           len(dataset.samples),

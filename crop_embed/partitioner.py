@@ -191,3 +191,22 @@ class NonOverlappingSNPWindowPartitioner(SNPWindowPartitioner):
                     i += 1
 
                 prev_end = w_end
+
+
+WINDOW_MODES = ("overlap", "disjoint")
+
+
+def make_partitioner(snps_by_chrom, half_window, buffer=0, *, mode="overlap"):
+    """Build a partitioner for the requested window ``mode``.
+
+    'overlap'  → SNPWindowPartitioner: windows span [p-hw, p+hw] and may overlap,
+                 so a SNP near a boundary is embedded in ~2 windows. (Default;
+                 the historical behavior.)
+    'disjoint' → NonOverlappingSNPWindowPartitioner: window spans are disjoint, so
+                 every SNP is embedded in exactly one window (requires buffer=0).
+    """
+    if mode == "overlap":
+        return SNPWindowPartitioner(snps_by_chrom, half_window, buffer)
+    if mode == "disjoint":
+        return NonOverlappingSNPWindowPartitioner(snps_by_chrom, half_window, buffer)
+    raise ValueError(f"unknown window mode {mode!r}; use one of {WINDOW_MODES}")

@@ -63,6 +63,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from crop_embed import FixedWindowEmbedder, SNPWindowPartitioner, UniqueWindowDataset
+from crop_embed.partitioner import WINDOW_MODES, make_partitioner
 from crop_embed.data.coords import FASTA_PATH
 from crop_embed.data.vcf import load_snps_from_vcf
 from crop_embed.embedder import (
@@ -100,6 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fasta-path", type=str, default=str(FASTA_PATH))
     p.add_argument("--half-window", type=int, default=500)
     p.add_argument("--buffer", type=int, default=0)
+    p.add_argument("--window-mode", choices=list(WINDOW_MODES), default="overlap",
+                   help="'overlap' (default): windows span [p-hw, p+hw] and may "
+                        "overlap, so a boundary SNP is embedded in ~2 windows. "
+                        "'disjoint': non-overlapping windows, each SNP embedded in "
+                        "exactly one window (requires --buffer 0; ~1.8x fewer windows "
+                        "on dense data).")
     p.add_argument("--loader", choices=["pysam", "polars"], default="pysam",
                    help="VCF reader. 'polars' is ~2 orders of magnitude faster on "
                         "large plain biallelic-GT VCFs (arabidopsis: ~18s vs ~45min); "
@@ -300,9 +307,9 @@ def main() -> int:
     n_snps = sum(len(v) for v in snps_by_chrom.values())
     print(f"  {n_snps:,} SNPs | {len(snps_by_chrom)} chromosomes | {len(samples)} samples")
 
-    print("Building SNPWindowPartitioner …")
-    partitioner = SNPWindowPartitioner(
-        snps_by_chrom, half_window=args.half_window, buffer=args.buffer)
+    print(f"Building partitioner (window-mode={args.window_mode}) …")
+    partitioner = make_partitioner(
+        snps_by_chrom, args.half_window, args.buffer, mode=args.window_mode)
     print(f"  {len(partitioner):,} windows")
 
     print("Building UniqueWindowDataset …")
@@ -464,6 +471,7 @@ def main() -> int:
         "fasta_path":   args.fasta_path,
         "half_window":  args.half_window,
         "buffer":       args.buffer,
+        "window_mode":  args.window_mode,
 
         "n_samples":        len(dataset.samples),
         "n_windows":        len(partitioner),
