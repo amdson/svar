@@ -59,9 +59,25 @@ def resolve_traits(spec, arg: str) -> list[str]:
     return want
 
 
-def _build_features(spec, modality: str, samples: list[str], args):
+def _build_features(spec, modality: str, samples: list[str], args, train_pos=None):
     """Return (X aligned to samples, cache_path_or_None)."""
     if modality == "snp":
+        if getattr(args, "precompute_svd", False):
+            if not getattr(args, "svd", 0) or args.svd <= 0:
+                raise SystemExit("--precompute-svd requires --svd N")
+            if train_pos is None:
+                raise SystemExit("--precompute-svd needs the train split (internal: train_pos)")
+            import os
+            scratch = os.environ.get("SVAR_SCRATCH", os.path.expanduser("~/svar_scratch"))
+            cache = os.path.join(scratch, "caches",
+                                 getattr(spec, "cache_name", None) or spec.name,
+                                 f"snp_svd{args.svd}_seed{args.seed}.pt")
+            X, evr = feat.snp_matrix_svd(spec, samples, n_components=args.svd,
+                                         train_positions=train_pos, seed=args.seed,
+                                         cache_path=cache)
+            print(f"  precomputed SVD-{args.svd} (train-fit, reused across traits) "
+                  f"explained_var={evr:.3f}  → {cache}")
+            return X, cache
         prior = getattr(args, "snp_prior", None)
         sparse = getattr(args, "sparse", False)
         if sparse:
@@ -100,7 +116,8 @@ def run_sklearn(modality: str, make_estimator: Callable[[], object], args) -> di
     traits = resolve_traits(spec, args.traits)
     samples = split.sample_ids
 
-    X, cache_path = _build_features(spec, modality, samples, args)
+    tr = split.indices("train", samples)   # train positions (needed by --precompute-svd)
+    X, cache_path = _build_features(spec, modality, samples, args, train_pos=tr)
     tcol = {t: i for i, t in enumerate(split.trait_cols)}
     Y = split.targets[:, [tcol[t] for t in traits]]           # (n, T) aligned to samples
     # Per-trait z-score (NaN-safe), matching the emb_nn path. PCC/R² are invariant to
@@ -110,7 +127,6 @@ def run_sklearn(modality: str, make_estimator: Callable[[], object], args) -> di
     from crop_embed.data.preprocessing import scale_phenotypes
     Y = scale_phenotypes(Y).astype(np.float32)
 
-    tr = split.indices("train", samples)
     va = split.indices("val", samples)
     te = split.indices("test", samples)
     Xtr, Xva, Xte = X[tr], X[va], X[te]

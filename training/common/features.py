@@ -254,6 +254,50 @@ def snp_matrix_sparse(
     return X, variant_ids
 
 
+def snp_matrix_svd(
+    spec: DatasetSpec,
+    samples: list[str],
+    *,
+    n_components: int,
+    train_positions: np.ndarray,
+    seed: int = 42,
+    cache_path: str | None = None,
+) -> tuple[np.ndarray, float]:
+    """Dense (n, n_components) TruncatedSVD projection of the sparse SNP matrix,
+    fit on ``train_positions`` ONLY (unsupervised, no leakage) and applied to all
+    ``samples``. Returns ``(X_reduced f32, explained_variance_ratio_sum)``.
+
+    Because SVD is unsupervised, the projection is identical for every trait/fold —
+    so computing it once here (and caching it) replaces the per-trait × per-fold
+    refit of TruncatedSVD inside the pipeline, which is prohibitive at many traits
+    (arabidopsis: 536). ``cache_path`` memoizes the reduced matrix keyed by the
+    exact sample order + n_components + seed.
+    """
+    import torch
+    from sklearn.decomposition import TruncatedSVD
+
+    if cache_path and Path(cache_path).exists():
+        d = torch.load(cache_path, map_location="cpu", weights_only=False)
+        if (d.get("sample_ids") == list(samples)
+                and d.get("n_components") == n_components and d.get("seed") == seed):
+            X = d["X"]
+            return (X.numpy() if hasattr(X, "numpy") else np.asarray(X)), float(d.get("evr", float("nan")))
+
+    X, _ = snp_matrix_sparse(spec, samples)                     # CSR (n, V)
+    svd = TruncatedSVD(n_components=n_components, random_state=seed)
+    svd.fit(X[np.asarray(train_positions)])                     # train rows only
+    X_reduced = svd.transform(X).astype(np.float32)             # (n, n_components) dense
+    evr = float(svd.explained_variance_ratio_.sum())
+
+    if cache_path:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(cache_path) + ".tmp"
+        torch.save({"X": torch.from_numpy(X_reduced), "sample_ids": list(samples),
+                    "n_components": n_components, "seed": seed, "evr": evr}, tmp)
+        Path(tmp).replace(cache_path)
+    return X_reduced, evr
+
+
 # ── modality: emb (pooled per-sample) ────────────────────────────────────────
 def pooled_embeddings(
     spec: DatasetSpec,

@@ -48,6 +48,13 @@ class _ColumnScaler(BaseEstimator, TransformerMixin):
 def add_sklearn_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--svd", type=int, default=0,
                    help="TruncatedSVD components before the model (0 = off)")
+    p.add_argument("--precompute-svd", action="store_true",
+                   help="Compute the --svd projection ONCE (train-fit, unsupervised) in "
+                        "the feature layer and reuse the reduced matrix across all traits, "
+                        "instead of refitting TruncatedSVD inside every per-trait pipeline "
+                        "(× CV folds × grid). Essential when there are many traits "
+                        "(arabidopsis: 536). Cached to disk; implies the SNP matrix is read "
+                        "sparse. The per-trait estimator then just standardizes + fits.")
     p.add_argument("--cv-folds", type=int, default=5)
     p.add_argument("--n-jobs", type=int, default=-1)
 
@@ -74,6 +81,10 @@ def _prefix(args) -> list:
     densifies it), then standardize the reduced factors. Requires --svd, since SVD is
     what makes the sparse matrix usable by the downstream (dense) model.
     """
+    if getattr(args, "precompute_svd", False):
+        # The SVD projection was already applied once (train-fit) in the feature
+        # layer, so the input is the dense reduced matrix — just standardize it.
+        return [("scale", StandardScaler())]
     if getattr(args, "sparse", False):
         if not getattr(args, "svd", 0) or args.svd <= 0:
             raise SystemExit("--sparse requires --svd N (TruncatedSVD reduces the sparse SNP matrix).")
