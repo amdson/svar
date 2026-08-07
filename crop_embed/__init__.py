@@ -51,7 +51,11 @@ from crop_embed.fingerprint import (
     build_sample_window_map,
     make_fingerprint,
 )
-from crop_embed.partitioner import SNPWindowPartitioner, Window
+from crop_embed.partitioner import (
+    SNPWindowPartitioner,
+    NonOverlappingSNPWindowPartitioner,
+    Window,
+)
 from crop_embed.heads import AttentionHead, LinearHead, MLPHead, window_position_features
 from crop_embed.train import masked_mse, train
 from crop_embed.logging_utils import MetricLogger, metrics_path_for
@@ -67,6 +71,7 @@ __all__ = [
     "SNPRecord",
     "load_snps_from_vcf",
     "SNPWindowPartitioner",
+    "NonOverlappingSNPWindowPartitioner",
     "Window",
     "Fingerprint",
     "make_fingerprint",
