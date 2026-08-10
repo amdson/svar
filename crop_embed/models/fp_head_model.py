@@ -179,7 +179,7 @@ class _LearnedStandardizer(nn.Module):
             raise ValueError(
                 f"expected (N, {self.mean.numel()}) embeddings, got {tuple(embeddings.shape)}"
             )
-        emb = embeddings.float()
+        emb = embeddings.float().to(self.mean.device)
         self.mean.copy_(emb.mean(dim=0))
         std = emb.std(dim=0).clamp_min(self.eps)
         self.log_scale.copy_(std.log())
@@ -228,7 +228,7 @@ class _RMSStandardizer(nn.Module):
             raise ValueError(
                 f"expected (N, {self.mean.numel()}) embeddings, got {tuple(embeddings.shape)}"
             )
-        emb = embeddings.float()
+        emb = embeddings.float().to(self.mean.device)
         self.mean.copy_(emb.mean(dim=0))
         rms = (emb - self.mean).pow(2).mean().sqrt().clamp_min(self.eps)   # scalar
         self.log_scale.copy_(rms.log())
@@ -662,6 +662,7 @@ class AttentionHead(nn.Module):
         input_standardize: bool = False,
         layernorm: bool = True,
         output_standardize: bool = False,
+        standardizer: str = "rms",
         window_mean: torch.Tensor | None = None,
         window_scale: float | None = None,
         mlp_layers: int = 0,
@@ -704,7 +705,13 @@ class AttentionHead(nn.Module):
         # which normalizes each window vector across D, not each dim across the
         # population — doesn't surface it. The standardizer whitens per-dim so the
         # signal isn't denormalized away. Off by default (back-compat).
-        self.in_std: nn.Module = _LearnedStandardizer(emb_dim) if input_standardize else nn.Identity()
+        # 'rms' (scalar RMS rescale) vs 'perdim' (per-dim std). Default RMS: the
+        # attended aggregate is pool-like, so its per-dim across-sample stds collapse
+        # to ~1e-5 and per-dim whitening amplifies the lowest-variance dims by ~1/σ,
+        # exploding the output (val_loss 1e4) and collapsing training. A single RMS
+        # scalar lifts to ~unit magnitude without that per-dim amplification.
+        _std_cls = _RMSStandardizer if standardizer == "rms" else _LearnedStandardizer
+        self.in_std: nn.Module = _std_cls(emb_dim) if input_standardize else nn.Identity()
         # Per-window normalization, applied before attention. Three modes, so the
         # effect of LayerNorm specifically can be isolated:
         #   window_scale set -> learnable scalar upscale (linear; keeps additivity)
@@ -724,7 +731,7 @@ class AttentionHead(nn.Module):
         # after aggregation, so whitening it here (warm_start_output) lifts it from
         # ~1e-5 to ~unit scale where the MLP can learn. Off by default.
         self.out_std: nn.Module = (
-            _LearnedStandardizer(n_queries * emb_dim) if output_standardize else nn.Identity()
+            _std_cls(n_queries * emb_dim) if output_standardize else nn.Identity()
         )
         # Head on top of the flattened attended summary (K*D → n_traits). Reuses
         # MLPModel: input projection → `mlp_layers` residual GELU blocks → output.
@@ -740,7 +747,7 @@ class AttentionHead(nn.Module):
         """Fit the input standardizer from a (N, D) sample of window embeddings
         (no-op unless input_standardize=True). Pass the training-set window
         embeddings so its per-dim mean/scale match the attention input."""
-        if isinstance(self.in_std, _LearnedStandardizer):
+        if hasattr(self.in_std, "warm_start"):
             self.in_std.warm_start(window_embeddings)
 
     @torch.no_grad()
@@ -748,7 +755,7 @@ class AttentionHead(nn.Module):
         """Fit the output standardizer from a (N, K*D) sample of attended summaries
         (no-op unless output_standardize=True). Produce the feats by running
         `attend()` over the training samples first."""
-        if isinstance(self.out_std, _LearnedStandardizer):
+        if hasattr(self.out_std, "warm_start"):
             self.out_std.warm_start(attended_feats)
 
     @torch.no_grad()
@@ -756,13 +763,12 @@ class AttentionHead(nn.Module):
         """Initialize the cross-attention so its output is the UNIFORM MEAN of the
         (normalized) windows: zero the query/key projections (so every score is 0 →
         softmax is uniform), set the value projection and the output projection to
-        identity. With n_queries=1 the flattened output is then exactly mean_j x_j —
-        so a head whose out_std + mlp were pretrained on the mean-pool of the same
-        normalized windows reproduces that head bit-for-bit at init, and attention
-        can only *deviate* from uniform as it trains. Requires n_queries == 1."""
-        if self.queries.shape[0] != 1:
-            raise ValueError("init_attention_as_mean expects n_queries=1 (so the "
-                             "flattened output is (B, D) and matches a mean-pool head).")
+        identity. Every query then emits mean_j x_j, so the flattened output is that
+        mean (K copies for K>1). This starts attention *at* the working mean-pool —
+        the only starting point from which it reliably trains on these numerically
+        nasty windows (random-query init collapses) — and it can only deviate from
+        uniform as it learns. With K>1 the queries differentiate once training breaks
+        their symmetry (their distinct query vectors get non-zero projections)."""
         D = self.queries.shape[1]
         self.attn.in_proj_weight.zero_()                       # Q, K = 0  -> uniform softmax
         self.attn.in_proj_weight[2 * D:3 * D].copy_(torch.eye(D))   # V = identity

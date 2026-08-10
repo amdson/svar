@@ -71,12 +71,34 @@ def build_parser() -> argparse.ArgumentParser:
                         "(0 = the default 2-layer input-proj→output MLP). --head attention.")
     p.add_argument("--attn-dropout", type=float, default=0.0,
                    help="Dropout in the attention head's MLP (--head attention).")
+    p.add_argument("--attn-standardize", action=argparse.BooleanOptionalAction, default=True,
+                   help="Warm-start (and freeze) the attention head's per-dim input+output "
+                        "standardizers on TRAIN data, and drop LayerNorm. Window embeddings are "
+                        "~99.97%% shared 'which window' and ~1e-4 per-sample 'which alleles'; "
+                        "without this the attention input/aggregate keep that signal buried and "
+                        "the head only fits the mean (this is why attention 'wouldn't train'). "
+                        "The out_std whitens the aggregate ACROSS SAMPLES where the signal emerges, "
+                        "lifting it to ~unit scale — the same trick that makes the pooled heads work. "
+                        "On by default for --head attention; --no-attn-standardize for the old path.")
+    p.add_argument("--attn-warmup-epochs", type=int, default=0,
+                   help="Freeze the attention (queries + cross-attention) for the first N epochs, "
+                        "then unfreeze. Off by default: the unfreeze is itself a destabilizing "
+                        "discontinuity (the MLP, tuned to the frozen mean-pool, is thrown by the "
+                        "suddenly-moving aggregate). Prefer --attn-lr-scale, which slows attention "
+                        "from the start instead.")
+    p.add_argument("--attn-lr-scale", type=float, default=0.1,
+                   help="Learning rate for the attention params (queries + cross-attention) as a "
+                        "fraction of --lr. They're unstable at the MLP's lr once they deviate from "
+                        "the mean-pool, so default to 0.2x; the MLP head keeps the full --lr.")
     p.add_argument("--positional", action="store_true",
                    help="Add per-chromosome + sinusoidal bp position embeddings to each window "
                         "before attention (reconstructed from the cache). --head attention.")
-    p.add_argument("--init-attention-as-mean", action="store_true",
+    p.add_argument("--init-attention-as-mean", action=argparse.BooleanOptionalAction, default=True,
                    help="Initialize the attention so its output starts as a uniform mean-pool of "
-                        "the (normalized) windows, then deviates as it trains. Requires --n-queries 1.")
+                        "the (normalized) windows, then deviates as it trains. On by default: it's "
+                        "the only start from which attention reliably trains on these windows "
+                        "(random-query init collapses to the mean-predictor). Works for any "
+                        "--n-queries (queries differentiate as training breaks their symmetry).")
     p.add_argument("--no-normalize", action="store_true",
                    help="Disable the learned de-mean/rescale standardizer in the head.")
     p.add_argument("--standardizer", choices=["perdim", "rms"], default="perdim",
@@ -109,6 +131,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "epoch is usually past the val peak).")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--grad-clip", type=float, default=1.0,
+                   help="Max grad-norm for clipping (attention loop). Guards against the "
+                        "large initial loss collapsing the head; raise/lower or set very high "
+                        "to effectively disable.")
     p.add_argument("--weight-decay", type=float, default=1e-4,
                    help="L2 decay, applied only to inner Linear weights.")
     p.add_argument("--batch-size", type=int, default=64)
@@ -157,27 +183,86 @@ def _train_attention(args, spec, dataset, cache, sample_fp_index, Y, trait_cols,
         positional=args.positional, window_chroms=window_chroms,
         window_positions=window_positions, window_mean=window_mean,
         mlp_layers=args.attn_mlp_layers, mlp_dropout=args.attn_dropout,
+        # Warm-startable per-dim whiteners that surface the ~1e-4 across-sample signal;
+        # drop LayerNorm (it normalizes within each window vector, not per-dim across the
+        # population, so it leaves that signal buried). See --attn-standardize.
+        input_standardize=args.attn_standardize,
+        output_standardize=args.attn_standardize,
+        layernorm=not args.attn_standardize,
     )
     if args.init_attention_as_mean:
         attn.init_attention_as_mean()
         print("  init-attention-as-mean: attention starts as a uniform mean-pool")
+    # Zero-init the head's output layer so initial predictions are ~0 and the initial
+    # loss is sane regardless of the aggregate's dimensionality. Otherwise the K*D-dim
+    # (e.g. 8192 at K=8) input gives a large random initial loss whose first optimizer
+    # steps ride the head into a mean-predictor collapse (esp. at lr 1e-3). Benign init.
+    with torch.no_grad():
+        attn.mlp.output.weight.zero_()
+        attn.mlp.output.bias.zero_()
     head = FPGatherHeadModel(attn).to(device)
+
+    # Warm-start the standardizers on TRAIN data (fit input on train window vectors,
+    # output on the attended summaries the head will actually see), then freeze — the
+    # pooled path's --warm-start-standardizer, adapted to the attention aggregate.
+    if args.attn_standardize:
+        with torch.no_grad():
+            n_ws = min(16, len(train_idx))
+            sw = cache_gpu[sfi[train_idx[:n_ws]].to(device)]          # (n_ws, n_windows, D)
+            if attn.center_windows:
+                sw = sw - attn.window_mean                            # match attend()'s centering
+            attn.warm_start_input(sw.reshape(-1, emb_dim))
+            summ = [attn.attend(cache_gpu[sfi[train_idx[i:i + args.batch_size]].to(device)]).cpu()
+                    for i in range(0, len(train_idx), args.batch_size)]
+            attn.warm_start_output(torch.cat(summ, 0))
+        for std in (attn.in_std, attn.out_std):
+            for p in std.parameters():
+                p.requires_grad_(False)
+        print("  attn-standardize: warm-started + froze input/output standardizers on train "
+              "(LayerNorm off); surfaces the across-sample signal")
+
+    # The attention params (queries + cross-attention) get their OWN, lower learning
+    # rate: once they start deviating from the mean-pool they're unstable at the MLP's
+    # lr (the aggregate they feed the MLP shifts → large loss → the attention explodes
+    # and the head collapses). A ~5x-smaller attention lr keeps that deviation gentle
+    # while the MLP head still trains fast.
+    attn_params = [attn.queries, *attn.attn.parameters()]
+    if attn.positional:
+        attn_params += list(attn.chrom_emb.parameters())
+    attn_param_ids = {id(p) for p in attn_params}
 
     # Weight-decay only on inner Linear weights (queries / LayerNorm / biases excluded),
     # matching the pooled path.
     linear_weight_ids = {id(m.weight) for m in head.modules() if isinstance(m, torch.nn.Linear)}
-    decay, nodecay = [], []
+    groups = {"mlp_decay": [], "mlp_nodecay": [], "attn_decay": [], "attn_nodecay": []}
     for p in head.parameters():
         if not p.requires_grad:
             continue
-        (decay if id(p) in linear_weight_ids else nodecay).append(p)
-    opt = torch.optim.AdamW(
-        [{"params": decay, "weight_decay": args.weight_decay},
-         {"params": nodecay, "weight_decay": 0.0}], lr=args.lr)
+        which = "attn" if id(p) in attn_param_ids else "mlp"
+        which += "_decay" if id(p) in linear_weight_ids else "_nodecay"
+        groups[which].append(p)
+    attn_lr = args.lr * args.attn_lr_scale
+    opt = torch.optim.AdamW([
+        {"params": groups["mlp_decay"],   "weight_decay": args.weight_decay, "lr": args.lr},
+        {"params": groups["mlp_nodecay"], "weight_decay": 0.0,               "lr": args.lr},
+        {"params": groups["attn_decay"],  "weight_decay": args.weight_decay, "lr": attn_lr},
+        {"params": groups["attn_nodecay"],"weight_decay": 0.0,               "lr": attn_lr},
+    ], lr=args.lr)
 
     n_params = sum(p.numel() for p in head.parameters())
     print(f"Head: attention (K={args.n_queries}, heads={args.n_heads}, "
-          f"mlp_layers={args.attn_mlp_layers}; {n_params:,} params)")
+          f"mlp_layers={args.attn_mlp_layers}; {n_params:,} params; "
+          f"attn_lr={attn_lr:.1e} vs mlp_lr={args.lr:.1e})")
+
+    # Attention warmup: keep attention at its (mean-pool) init for the first N epochs
+    # so the MLP head learns a good mapping from the stable aggregate before attention
+    # deviates. The params stay in the optimizer above — just frozen (no grad) until
+    # unfrozen at epoch `attn_warmup_epochs`.
+    if args.attn_warmup_epochs > 0:
+        for p in attn_params:
+            p.requires_grad_(False)
+        print(f"  attn-warmup: attention frozen (mean-pool) for the first "
+              f"{args.attn_warmup_epochs} epoch(s)")
 
     def _predict(idx: torch.Tensor) -> torch.Tensor:
         """Chunked forward over sample indices → (len(idx), n_traits) on CPU."""
@@ -196,6 +281,10 @@ def _train_attention(args, spec, dataset, cache, sample_fp_index, Y, trait_cols,
     step = 0
     best_val_pcc, best_state, best_epoch = float("-inf"), None, -1
     for epoch in range(args.epochs):
+        if args.attn_warmup_epochs > 0 and epoch == args.attn_warmup_epochs:
+            for p in attn_params:
+                p.requires_grad_(True)
+            print(f"  attn-warmup: unfreezing attention at epoch {epoch}")
         head.train()
         for sidx, y in train_loader:
             gi = sfi[sidx].to(device)                               # (B, n_windows)
@@ -204,6 +293,10 @@ def _train_attention(args, spec, dataset, cache, sample_fp_index, Y, trait_cols,
             loss = masked_mse(pred, y)
             opt.zero_grad()
             loss.backward()
+            # Clip grads: the freshly-initialized MLP over the standardized aggregate
+            # produces a large initial loss, and without this the first optimizer steps
+            # can nuke the head into a mean-predictor (esp. multi-query at higher lr).
+            torch.nn.utils.clip_grad_norm_(head.parameters(), args.grad_clip)
             opt.step()
             if step % args.log_every == 0:
                 train_m = _compute_metrics(pred.detach(), y, trait_cols, "train")
@@ -248,6 +341,7 @@ def _train_attention(args, spec, dataset, cache, sample_fp_index, Y, trait_cols,
         "hidden_dim": args.hidden_dim, "mlp_layers": args.attn_mlp_layers,
         "mlp_dropout": args.attn_dropout, "positional": args.positional,
         "center_windows": args.center_windows,
+        "attn_standardize": args.attn_standardize,
         "init_attention_as_mean": args.init_attention_as_mean,
         "early_stopping": args.early_stopping, "best_epoch": best_epoch,
     }
@@ -288,8 +382,6 @@ def main() -> None:
                           (args.svd, "--svd"), (args.bottleneck_dim, "--bottleneck-dim")]:
             if bad:
                 parser.error(f"{name} is incompatible with --head attention.")
-        if args.init_attention_as_mean and args.n_queries != 1:
-            parser.error("--init-attention-as-mean requires --n-queries 1.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
