@@ -83,6 +83,80 @@ def _sinusoidal_pe(
     return pe
 
 
+class WindowPositionalEncoding(nn.Module):
+    """Additive genomic positional encoding for windows. Each window has a
+    chromosome and a within-chromosome bp position; this maps those to an additive
+    (n_windows, emb_dim) vector added to the (standardized) window embeddings before
+    attention, gated by a learnable scalar so the head can dial positional strength.
+
+    Swappable ``mode`` (this is the experimentation surface):
+      none        — no-op (returns None).
+      chrom       — per-chromosome learned embedding only.
+      sinusoidal  — chrom + fixed log-spaced sinusoidal encoding of bp (Vaswani).
+      learned     — chrom + a learned embedding per within-genome bp bucket.
+      fourier     — chrom + a learned linear map of log-spaced sin/cos bp features
+                    (learnable-ish generalization of sinusoidal; more expressive).
+
+    RoPE / relative schemes need rotary inside the attention (not an additive term),
+    so they live with a custom attention layer, not here.
+    """
+
+    VALID = ("none", "chrom", "sinusoidal", "learned", "fourier")
+
+    def __init__(
+        self,
+        emb_dim: int,
+        chroms: torch.Tensor,
+        positions: torch.Tensor,
+        mode: str = "sinusoidal",
+        *,
+        n_buckets: int = 128,
+        n_fourier: int = 64,
+        min_wavelength: float = 1e2,
+        max_wavelength: float = 5e7,
+    ) -> None:
+        super().__init__()
+        if mode not in self.VALID:
+            raise ValueError(f"unknown pos mode {mode!r}; use one of {self.VALID}")
+        self.mode = mode
+        self.register_buffer("chroms", chroms.long())
+        self.register_buffer("positions", positions.long())
+        if mode == "none":
+            return
+        self.gate = nn.Parameter(torch.ones(()))
+        n_chroms = int(chroms.max().item()) + 1
+        self.chrom_emb = nn.Embedding(n_chroms, emb_dim)
+        nn.init.normal_(self.chrom_emb.weight, std=0.5)
+
+        if mode == "sinusoidal":
+            self.register_buffer("pe", _sinusoidal_pe(positions, emb_dim, int(max_wavelength)))
+        elif mode == "learned":
+            maxpos = int(positions.max().item()) + 1
+            bucket = (positions.float() / maxpos * n_buckets).long().clamp_(max=n_buckets - 1)
+            self.register_buffer("bucket", bucket)
+            self.bucket_emb = nn.Embedding(n_buckets, emb_dim)
+            nn.init.normal_(self.bucket_emb.weight, std=0.5)
+        elif mode == "fourier":
+            freqs = torch.exp(torch.linspace(
+                math.log(1.0 / max_wavelength), math.log(1.0 / min_wavelength), n_fourier))
+            ang = positions.float().unsqueeze(1) * (2 * math.pi * freqs).unsqueeze(0)  # (n, F)
+            self.register_buffer("fourier_feats", torch.cat([ang.sin(), ang.cos()], dim=1))
+            self.fourier_proj = nn.Linear(2 * n_fourier, emb_dim)
+
+    def forward(self) -> torch.Tensor | None:
+        """(n_windows, emb_dim) additive encoding, or None for mode 'none'."""
+        if self.mode == "none":
+            return None
+        pe = self.chrom_emb(self.chroms)
+        if self.mode == "sinusoidal":
+            pe = pe + self.pe
+        elif self.mode == "learned":
+            pe = pe + self.bucket_emb(self.bucket)
+        elif self.mode == "fourier":
+            pe = pe + self.fourier_proj(self.fourier_feats)
+        return self.gate * pe
+
+
 @torch.no_grad()
 def window_means(
     cache: torch.Tensor,
@@ -655,7 +729,7 @@ class AttentionHead(nn.Module):
         n_queries: int = 8,
         n_heads: int = 4,
         hidden_dim: int | None = None,
-        positional: bool = False,
+        pos_encoding: str = "none",
         window_chroms: torch.Tensor | None = None,
         window_positions: torch.Tensor | None = None,
         max_position: int = int(5e8),
@@ -684,19 +758,18 @@ class AttentionHead(nn.Module):
         if self.center_windows:
             self.register_buffer("window_mean", window_mean.clone().float())
 
-        self.positional = positional
-        if positional:
+        # Swappable additive genomic positional encoding (see WindowPositionalEncoding).
+        self.pos_encoding = pos_encoding
+        if pos_encoding != "none":
             if window_chroms is None or window_positions is None:
                 raise ValueError(
-                    "positional=True requires window_chroms and window_positions; "
-                    "see crop_embed.heads.window_position_features(dataset)."
-                )
-            n_chroms = int(window_chroms.max().item()) + 1
-            self.chrom_emb = nn.Embedding(n_chroms, emb_dim)
-            self.register_buffer("window_chroms", window_chroms.long())
-            self.register_buffer(
-                "pos_emb", _sinusoidal_pe(window_positions, emb_dim, max_position)
-            )
+                    f"pos_encoding={pos_encoding!r} requires window_chroms and "
+                    "window_positions; see window_position_features_from_cache(...).")
+            self.pos_enc: nn.Module = WindowPositionalEncoding(
+                emb_dim, window_chroms, window_positions, mode=pos_encoding,
+                max_wavelength=float(max_position))
+        else:
+            self.pos_enc = nn.Identity()
 
         # Per-dimension de-mean/rescale of the window embeddings BEFORE attention,
         # warm-startable from training stats (see warm_start_input). This is the
@@ -783,11 +856,15 @@ class AttentionHead(nn.Module):
         if self.center_windows:
             window_emb = window_emb - self.window_mean  # subtract per-window across-sample mean
         window_emb = self.in_std(window_emb)            # per-dim whiten (broadcasts over B, windows)
-        x = self.norm(window_emb)
-        if self.positional:
-            x = x + self.chrom_emb(self.window_chroms) + self.pos_emb
+        x = self.norm(window_emb)                                # VALUES: positional-free
+        # Positional goes on the KEYS only, not the values: attention uses genomic
+        # position to decide WHERE to look, but the pooled output carries no positional
+        # mass. Injecting it into the values instead makes any attention re-weighting
+        # move a large positional term through the frozen out_std (~1e4 amplification)
+        # and explode — pooling only the (signal) values keeps out_std valid.
+        k = x if self.pos_encoding == "none" else x + self.pos_enc()   # (…broadcasts over B)
         q = self.queries.unsqueeze(0).expand(x.size(0), -1, -1)   # (B, K, D)
-        pooled, _ = self.attn(q, x, x, need_weights=False)        # (B, K, D)
+        pooled, _ = self.attn(q, k, x, need_weights=False)        # query, key=k(+pos), value=x
         return pooled.flatten(1)
 
     def forward(self, window_emb: torch.Tensor) -> torch.Tensor:

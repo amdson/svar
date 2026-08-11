@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from crop_embed.models.fp_head_model import (
     MLPModel, LinearModel, FPSumHeadModel, FPCenteredSumHeadModel,
     FPRefDeltaSumHeadModel, AttentionHead, FPGatherHeadModel, window_means,
-    window_position_features_from_cache)
+    window_position_features_from_cache, WindowPositionalEncoding)
 from crop_embed import FixedWindowEmbedder, MetricLogger, metrics_path_for, ActivationTracker
 from crop_embed.train import masked_mse, _compute_metrics
 
@@ -90,9 +90,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Learning rate for the attention params (queries + cross-attention) as a "
                         "fraction of --lr. They're unstable at the MLP's lr once they deviate from "
                         "the mean-pool, so default to 0.2x; the MLP head keeps the full --lr.")
+    p.add_argument("--pos-encoding", choices=list(WindowPositionalEncoding.VALID),
+                   default="none",
+                   help="Additive genomic positional encoding on each window before attention "
+                        "(reconstructed from the cache): none | chrom | sinusoidal | learned | "
+                        "fourier. The swappable positional experimentation surface. --head attention.")
     p.add_argument("--positional", action="store_true",
-                   help="Add per-chromosome + sinusoidal bp position embeddings to each window "
-                        "before attention (reconstructed from the cache). --head attention.")
+                   help="Deprecated alias for --pos-encoding sinusoidal.")
     p.add_argument("--init-attention-as-mean", action=argparse.BooleanOptionalAction, default=True,
                    help="Initialize the attention so its output starts as a uniform mean-pool of "
                         "the (normalized) windows, then deviates as it trains. On by default: it's "
@@ -171,16 +175,16 @@ def _train_attention(args, spec, dataset, cache, sample_fp_index, Y, trait_cols,
 
     # Positional features reconstructed from the cache (no partitioner on the fast path).
     window_chroms = window_positions = None
-    if args.positional:
+    if args.pos_encoding != "none":
         window_chroms, window_positions = window_position_features_from_cache(
             dataset.unique_fingerprints, sfi)
-        print(f"  positional: per-chromosome + sinusoidal bp position encodings "
-              f"({int(window_chroms.max()) + 1} chroms)")
+        print(f"  pos-encoding={args.pos_encoding} over "
+              f"{int(window_chroms.max()) + 1} chroms")
 
     attn = AttentionHead(
         emb_dim=emb_dim, n_traits=n_traits,
         n_queries=args.n_queries, n_heads=args.n_heads, hidden_dim=args.hidden_dim,
-        positional=args.positional, window_chroms=window_chroms,
+        pos_encoding=args.pos_encoding, window_chroms=window_chroms,
         window_positions=window_positions, window_mean=window_mean,
         mlp_layers=args.attn_mlp_layers, mlp_dropout=args.attn_dropout,
         # Warm-startable per-dim whiteners that surface the ~1e-4 across-sample signal;
@@ -215,6 +219,9 @@ def _train_attention(args, spec, dataset, cache, sample_fp_index, Y, trait_cols,
             summ = [attn.attend(cache_gpu[sfi[train_idx[i:i + args.batch_size]].to(device)]).cpu()
                     for i in range(0, len(train_idx), args.batch_size)]
             attn.warm_start_output(torch.cat(summ, 0))
+        # Freeze the standardizers: out_std amplifies by ~1/signal-scale (~1e4), so a
+        # trainable scale drifting into the signal explodes it. (Positional stays
+        # trainable — it's on the keys only, so it never enters the pooled output.)
         for std in (attn.in_std, attn.out_std):
             for p in std.parameters():
                 p.requires_grad_(False)
@@ -226,9 +233,9 @@ def _train_attention(args, spec, dataset, cache, sample_fp_index, Y, trait_cols,
     # lr (the aggregate they feed the MLP shifts → large loss → the attention explodes
     # and the head collapses). A ~5x-smaller attention lr keeps that deviation gentle
     # while the MLP head still trains fast.
+    # Positional-encoding params train at the full (MLP) lr — they shape the attention
+    # input, not the (unstable) attention projections, so they don't need the slow lr.
     attn_params = [attn.queries, *attn.attn.parameters()]
-    if attn.positional:
-        attn_params += list(attn.chrom_emb.parameters())
     attn_param_ids = {id(p) for p in attn_params}
 
     # Weight-decay only on inner Linear weights (queries / LayerNorm / biases excluded),
@@ -339,7 +346,7 @@ def _train_attention(args, spec, dataset, cache, sample_fp_index, Y, trait_cols,
         "emb_dim": emb_dim, "n_traits": n_traits,
         "n_queries": args.n_queries, "n_heads": args.n_heads,
         "hidden_dim": args.hidden_dim, "mlp_layers": args.attn_mlp_layers,
-        "mlp_dropout": args.attn_dropout, "positional": args.positional,
+        "mlp_dropout": args.attn_dropout, "pos_encoding": args.pos_encoding,
         "center_windows": args.center_windows,
         "attn_standardize": args.attn_standardize,
         "init_attention_as_mean": args.init_attention_as_mean,
@@ -382,6 +389,8 @@ def main() -> None:
                           (args.svd, "--svd"), (args.bottleneck_dim, "--bottleneck-dim")]:
             if bad:
                 parser.error(f"{name} is incompatible with --head attention.")
+        if args.positional and args.pos_encoding == "none":   # deprecated alias
+            args.pos_encoding = "sinusoidal"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
