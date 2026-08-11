@@ -97,12 +97,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "fourier. The swappable positional experimentation surface. --head attention.")
     p.add_argument("--positional", action="store_true",
                    help="Deprecated alias for --pos-encoding sinusoidal.")
-    p.add_argument("--init-attention-as-mean", action=argparse.BooleanOptionalAction, default=True,
-                   help="Initialize the attention so its output starts as a uniform mean-pool of "
-                        "the (normalized) windows, then deviates as it trains. On by default: it's "
-                        "the only start from which attention reliably trains on these windows "
-                        "(random-query init collapses to the mean-predictor). Works for any "
-                        "--n-queries (queries differentiate as training breaks their symmetry).")
+    p.add_argument("--attn-init", choices=["mean", "near_mean", "default"], default="mean",
+                   help="Attention init. 'mean': zero Q/K + identity V/out → output starts as the "
+                        "uniform mean-pool (reliable, but a degenerate zero saddle). 'near_mean': "
+                        "default random projections with Q/K shrunk by --attn-qk-scale so it starts "
+                        "≈ mean with clean non-degenerate gradients. 'default': raw init (collapses "
+                        "on these windows). Near-mean/mean are the starts that actually train.")
+    p.add_argument("--attn-qk-scale", type=float, default=0.02,
+                   help="Q/K shrink factor for --attn-init near_mean (smaller = closer to uniform).")
+    p.add_argument("--init-attention-as-mean", action=argparse.BooleanOptionalAction, default=None,
+                   help="Deprecated: --no-init-attention-as-mean maps to --attn-init default.")
     p.add_argument("--no-normalize", action="store_true",
                    help="Disable the learned de-mean/rescale standardizer in the head.")
     p.add_argument("--standardizer", choices=["perdim", "rms"], default="perdim",
@@ -194,9 +198,12 @@ def _train_attention(args, spec, dataset, cache, sample_fp_index, Y, trait_cols,
         output_standardize=args.attn_standardize,
         layernorm=not args.attn_standardize,
     )
-    if args.init_attention_as_mean:
+    if args.attn_init == "mean":
         attn.init_attention_as_mean()
-        print("  init-attention-as-mean: attention starts as a uniform mean-pool")
+        print("  attn-init=mean: attention starts as the uniform mean-pool")
+    elif args.attn_init == "near_mean":
+        attn.init_attention_near_mean(args.attn_qk_scale)
+        print(f"  attn-init=near_mean (qk_scale={args.attn_qk_scale}): ~mean start, clean grads")
     # Zero-init the head's output layer so initial predictions are ~0 and the initial
     # loss is sane regardless of the aggregate's dimensionality. Otherwise the K*D-dim
     # (e.g. 8192 at K=8) input gives a large random initial loss whose first optimizer
@@ -349,7 +356,7 @@ def _train_attention(args, spec, dataset, cache, sample_fp_index, Y, trait_cols,
         "mlp_dropout": args.attn_dropout, "pos_encoding": args.pos_encoding,
         "center_windows": args.center_windows,
         "attn_standardize": args.attn_standardize,
-        "init_attention_as_mean": args.init_attention_as_mean,
+        "attn_init": args.attn_init, "attn_qk_scale": args.attn_qk_scale,
         "early_stopping": args.early_stopping, "best_epoch": best_epoch,
     }
     torch.save({
@@ -391,6 +398,8 @@ def main() -> None:
                 parser.error(f"{name} is incompatible with --head attention.")
         if args.positional and args.pos_encoding == "none":   # deprecated alias
             args.pos_encoding = "sinusoidal"
+        if args.init_attention_as_mean is False:              # deprecated alias
+            args.attn_init = "default"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

@@ -850,6 +850,28 @@ class AttentionHead(nn.Module):
         self.attn.out_proj.weight.copy_(torch.eye(D))
         self.attn.out_proj.bias.zero_()
 
+    @torch.no_grad()
+    def init_attention_near_mean(self, qk_scale: float = 0.02) -> None:
+        """Softer alternative to init_attention_as_mean: keep the default random
+        Q/K/V/out projections but SHRINK the Q/K projections by ``qk_scale`` so the
+        initial attention scores are ~0 → softmax near-uniform → output ≈ mean
+        aggregation (up to the value/out linear map, which out_std + the MLP absorb).
+
+        Unlike init_attention_as_mean (which zeros Q/K exactly — a degenerate saddle
+        where symmetry-breaking relies on the query vectors slowly acquiring non-zero
+        projections), the Q/K here are small but non-degenerate, so every parameter has
+        a clean gradient from step 0. V/out are set to IDENTITY (as in the hard mean
+        init): the near-uniform output is then ≈ the true mean-pool, not a random linear
+        projection of it — the random-V/out variant conditions worse (rice: 0.43 vs 0.53)."""
+        D = self.queries.shape[1]
+        self.attn.in_proj_weight[:2 * D].mul_(qk_scale)            # shrink Q, K → near-uniform
+        self.attn.in_proj_weight[2 * D:3 * D].copy_(torch.eye(D))  # V = identity
+        if self.attn.in_proj_bias is not None:
+            self.attn.in_proj_bias[:2 * D].mul_(qk_scale)          # Q, K bias
+            self.attn.in_proj_bias[2 * D:3 * D].zero_()            # V bias
+        self.attn.out_proj.weight.copy_(torch.eye(D))
+        self.attn.out_proj.bias.zero_()
+
     def attend(self, window_emb: torch.Tensor) -> torch.Tensor:
         """Everything up to (but not through) the MLP: returns the flattened
         attended summary (B, K*D). Exposed so warm_start_output can fit on it."""
