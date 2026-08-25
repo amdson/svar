@@ -39,6 +39,22 @@ def _rice_dir() -> Path:
     return scratch_rice if scratch_rice.exists() else legacy_rice
 
 
+def _vcf_for(stem: Path | str) -> str:
+    """VCF path for a build stem, accepting either compression.
+
+    The dataset Makefiles emit bgzipped VCFs where the uncompressed text would be
+    unreasonably large (arabidopsis' final export is ~16 GB plain, ~1 GB bgzipped),
+    while the older rice/soy builds left theirs plain. pysam — the only reader of
+    this path (crop_embed/data/vcf.py) — takes both, so resolve whichever is on
+    disk. Falls back to the plain name when neither exists, so the error message
+    from ``samples()`` names the file the Makefile would build.
+    """
+    plain, gz = Path(f"{stem}.vcf"), Path(f"{stem}.vcf.gz")
+    if plain.exists():
+        return str(plain)
+    return str(gz) if gz.exists() else str(plain)
+
+
 @dataclass(frozen=True)
 class DatasetSpec:
     """Where a dataset's canonical artifacts live. Paths are strings (may not all
@@ -122,7 +138,7 @@ def _registry() -> dict[str, DatasetSpec]:
             pgen_prefix=str(arab / "arabidopsis_1001g_final"),
             fasta_path=str(arab / "Arabidopsis_thaliana.TAIR10.dna_sm.toplevel.fa"),
             pheno_csv=str(arab / "arabidopsis_pheno_aligned.csv"),
-            vcf_path=str(arab / "arabidopsis_1001g_final.vcf"),
+            vcf_path=_vcf_for(arab / "arabidopsis_1001g_final"),
         ),
     }
 

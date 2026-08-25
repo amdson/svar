@@ -55,11 +55,21 @@ LD_PRUNE  ?= 0
 LD_PARAMS ?= 50 5 0.4
 
 # ── Build intermediates / outputs (mirrors soy, minus the chrom-rename) ────────
-VCF_FILT   := $(DATA)/$(STEM)_biallelic_snps.vcf   # chroms 1..5, biallelic SNPs only
-VCF_QC     := $(DATA)/$(STEM)_qc.vcf
-VCF_PRUNED := $(DATA)/$(STEM)_pruned.vcf
-VCF_OUT    := $(DATA)/$(STEM)_final.vcf
+# Every VCF here is bgzipped. Uncompressed, the biallelic-SNP intermediate alone
+# is ~50 GB (≈11 M SNPs × 1,135 samples of "0/0<tab>" text) and the final export
+# ~16 GB; bgzip cuts each roughly 10x, which is the difference between a build
+# that fits comfortably in scratch and one that churns 100+ GB. Both consumers
+# read it natively: plink2 takes a bgzipped --vcf, and crop_embed's loader is
+# pysam-based ("plain or bgzipped", crop_embed/dataset.py).
+VCF_FILT   := $(DATA)/$(STEM)_biallelic_snps.vcf.gz   # chroms 1..5, biallelic SNPs only
+VCF_QC     := $(DATA)/$(STEM)_qc.vcf.gz
+VCF_PRUNED := $(DATA)/$(STEM)_pruned.vcf.gz
+VCF_OUT    := $(DATA)/$(STEM)_final.vcf.gz
+VCF_OUT_TBI := $(VCF_OUT).tbi                         # random access for pysam
 PGEN       := $(DATA)/$(STEM)_final.pgen
+
+# Threads for bgzip compression in bcftools (the build's main CPU cost).
+THREADS ?= 4
 
 # What feeds the final REF-from-fa step: the pruned VCF iff LD_PRUNE=1, else QC.
 ifeq ($(LD_PRUNE),1)
@@ -73,7 +83,13 @@ endif
 # VCF sample set (needs $(PSAM), so it depends on the genotype build).
 PHENO_DIR   := $(DATA)/phenotypes
 PHENO_LIST  := $(PHENO_DIR)/phenotype_list.csv
-PHENO_STAMP := $(PHENO_DIR)/.download_complete   # touched when all values.csv are in
+# Touched when every values.csv is in. NB: keep the comment on its own line —
+# `VAR := value   # comment` keeps the whitespace BEFORE the comment in the value,
+# and this one is used quoted (`touch "$(PHENO_STAMP)"`), so a trailing-comment
+# version creates a file literally named `.download_complete   ` while the Make
+# target is the stripped `.download_complete`. The stamp then never matches its
+# target and `make phenotypes` re-fetches all ~536 REST tables on every run.
+PHENO_STAMP := $(PHENO_DIR)/.download_complete
 URL_PHENO_LIST := https://arapheno.1001genomes.org/rest/phenotype/list.csv
 # Per-phenotype values are pulled by looping the IDs in phenotype_list.csv:
 #   https://arapheno.1001genomes.org/rest/phenotype/<id>/values.csv
@@ -99,11 +115,15 @@ $(FASTA): $(FASTA_GZ)
 $(FASTA).fai: $(FASTA)
 	$(CONDA_RUN) python -c "import sys,pyfaidx; pyfaidx.Faidx(sys.argv[1])" "$<"
 
+# NB: no -O. The URL basename already equals $(VCF_SRC)'s, and `wget -c -O file`
+# has undefined resume behaviour — on a 19 GB download that silently restarts
+# from zero (or truncates) after a dropped connection. Plain `-c -P $(DATA)`
+# resumes correctly, which is the whole point on a file this size.
 $(VCF_SRC): | $(DATA)
-	$(WGET) -O "$(VCF_SRC)" "$(URL_VCF)"
+	$(WGET) "$(URL_VCF)"
 
 # ── Build ─────────────────────────────────────────────────────────────────────
-build: $(VCF_OUT) $(PGEN)
+build: $(VCF_OUT) $(VCF_OUT_TBI) $(PGEN)
 
 # Keep chroms 1..5, biallelic SNPs only (drop indels + multi-allelic). One
 # combined bcftools view streams the ~18 GB source once; -t needs no index.
@@ -116,7 +136,7 @@ build: $(VCF_OUT) $(PGEN)
 # is still guaranteed downstream.
 $(VCF_FILT): $(VCF_SRC)
 	$(BCFTOOLS) view -t $(CHROMS) --types snps --min-alleles 2 --max-alleles 2 \
-	          $(VCF_SRC) -o $@
+	          -Oz --threads $(THREADS) $(VCF_SRC) -o $@
 
 # Variant QC: missing rate + MAF (+optional --mind). Multi-allelic / indels are
 # already gone from the filter step. Order is preserved from the (already
@@ -124,7 +144,7 @@ $(VCF_FILT): $(VCF_SRC)
 # plink2 only permits alongside --make-pgen (not with a bare --export vcf).
 $(VCF_QC): $(VCF_FILT)
 	$(PLINK2) --vcf $< $(MIND_FLAG) --geno $(GENO) --maf $(MAF) \
-	          --export vcf --out $(DATA)/$(STEM)_qc
+	          --export vcf bgz --out $(DATA)/$(STEM)_qc
 
 # Optional LD pruning (only when LD_PRUNE=1). plink2 prunes by variant ID; if the
 # source lacks IDs, plink2 assigns chr:pos-style IDs which --extract still matches.
@@ -132,7 +152,7 @@ $(VCF_PRUNED): $(VCF_QC)
 	$(PLINK2) --vcf $< --set-all-var-ids '@:#' --indep-pairwise $(LD_PARAMS) \
 	          --out $(DATA)/$(STEM)_ldprune
 	$(PLINK2) --vcf $< --set-all-var-ids '@:#' --extract $(DATA)/$(STEM)_ldprune.prune.in \
-	          --export vcf --out $(DATA)/$(STEM)_pruned
+	          --export vcf bgz --out $(DATA)/$(STEM)_pruned
 
 # Force REF allele to match the reference genome — the key correctness step.
 # Feeds from the QC VCF, or the pruned VCF when LD_PRUNE=1 (see FINAL_IN).
@@ -143,8 +163,14 @@ $(VCF_PRUNED): $(VCF_QC)
 $(PGEN) $(VCF_OUT) &: $(FINAL_IN) $(FASTA) $(FASTA).fai
 	$(PLINK2) --vcf $< --fa $(FASTA) --ref-from-fa force --sort-vars \
 	          --make-pgen --out $(DATA)/$(STEM)_final
-	$(PLINK2) --pfile $(DATA)/$(STEM)_final --export vcf \
+	$(PLINK2) --pfile $(DATA)/$(STEM)_final --export vcf bgz \
 	          --out $(DATA)/$(STEM)_final
+
+# Tabix index over the final VCF — pysam (crop_embed's loader) needs it to fetch
+# a region instead of streaming the whole file. bcftools, not tabix: the svar env
+# ships bcftools but no standalone tabix binary.
+$(VCF_OUT_TBI): $(VCF_OUT)
+	$(BCFTOOLS) index -t --threads $(THREADS) $(VCF_OUT)
 
 # ── Sanity check ──────────────────────────────────────────────────────────────
 # Confirm every VCF REF allele agrees with the reference genome. (No per-SNP

@@ -18,6 +18,9 @@ only the variant tokens: a variant query at original position ``p`` attends to
 which is exactly a single softmax over the union of those two key sets. We never
 concatenate them (that would force expanding the reference to the variant batch
 size); instead we run two attentions and merge them with the log-sum-exp trick.
+Keeping the reference at batch 1 also requires folding the variant scenarios into
+the cross branch's query axis, or autograd re-expands it anyway — see
+`_cross_attention_with_lse`.
 
 What's different from DNABERT2 (bidirectional + ALiBi)
 ------------------------------------------------------
@@ -131,15 +134,18 @@ class VariantCacheCarbonEncoder(nn.Module):
     @staticmethod
     def _attention_with_lse(
         q: torch.Tensor,  # (N, h, Lq, d)
-        k: torch.Tensor,  # (B, h, Lk, d), B in {1, N}
-        v: torch.Tensor,  # (B, h, Lk, d), B in {1, N}
+        k: torch.Tensor,  # (N, h, Lk, d)
+        v: torch.Tensor,  # (N, h, Lk, d)
         bias: torch.Tensor,  # additive, broadcastable to (N, h, Lq, Lk)
         scale: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Scaled dot-product attention returning the normalized output and the
         per-query log-sum-exp of the (scaled, biased) scores.
 
-        `k`/`v` may keep batch dim 1 and broadcast over the N variant scenarios.
+        Used for the *self* branch, where q/k/v all share batch dim N. The cross
+        branch has batch-1 reference K/V and goes through
+        `_cross_attention_with_lse` instead — see that method for why.
+
         With ``bias`` built from ``finfo.min`` for disallowed keys, a fully
         masked row produces a finite (garbage) output with an astronomically
         negative lse, so the log-sum-exp merge gives it weight 0 — which is how
@@ -151,6 +157,47 @@ class VariantCacheCarbonEncoder(nn.Module):
         probs = torch.exp(scores - lse)
         out = torch.matmul(probs, v)  # (N, h, Lq, d)
         return out, lse
+
+    @staticmethod
+    def _cross_attention_with_lse(
+        q: torch.Tensor,  # (N, h, Lq, d) variant queries
+        k: torch.Tensor,  # (1, h, Lk, d) reference keys   — batch 1
+        v: torch.Tensor,  # (1, h, Lk, d) reference values — batch 1
+        bias: torch.Tensor,  # (1, 1, Lq, Lk) additive, shared across all N
+        scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Same contract as `_attention_with_lse`, but with the N variant
+        scenarios folded into the *query* axis so the batch-1 reference K/V are
+        never broadcast.
+
+        Why this exists: `torch.matmul` on batch dims (N, h) x (1, h) expands the
+        reference K/V to (N, h, Lk, d), and autograd **saves the expanded
+        tensors**. That is 2 * N * h * Lk * d per layer — ~380 MB per scenario
+        per layer at Lk=3334 — and it dominates training memory, which defeats
+        the whole point of keeping the reference at batch 1. Reshaping the
+        queries to (1, h, N*Lq, d) makes both matmul operands batch-1, so
+        nothing expands and only the (h, N, Lq, Lk) probabilities are saved.
+
+        The head dim must stay in the batch position (that is what lines up with
+        the reference K/V), so N folds into the sequence axis, not the batch
+        axis. Row ``n*Lq + q`` of the folded query is scenario n's query q, so
+        the (1, 1, Lq, Lk) bias broadcasts correctly over an (h, N, Lq, Lk)
+        *view* of the scores without ever being materialized.
+
+        Inference is unaffected — under no_grad nothing is saved, so the
+        broadcast was already free.
+        """
+        N, h, Lq, d = q.shape
+        Lk = k.shape[-2]
+
+        q_folded = q.transpose(0, 1).reshape(h, N * Lq, d).unsqueeze(0)
+        scores = torch.matmul(q_folded, k.transpose(-1, -2)) * scale  # (1,h,N*Lq,Lk)
+        scores = scores.view(h, N, Lq, Lk) + bias
+        lse = torch.logsumexp(scores, dim=-1, keepdim=True)  # (h, N, Lq, 1)
+        probs = torch.exp(scores - lse)
+        out = torch.matmul(probs.view(1, h, N * Lq, Lk), v)  # (1, h, N*Lq, d)
+        out = out.view(h, N, Lq, d).transpose(0, 1)  # (N, h, Lq, d)
+        return out, lse.transpose(0, 1)  # (N, h, Lq, 1)
 
     def forward(
         self,
@@ -226,7 +273,8 @@ class VariantCacheCarbonEncoder(nn.Module):
             k_v, v_v = repeat_kv(k_v, groups), repeat_kv(v_v, groups)  # (N, h, cs, d)
             k_r, v_r = repeat_kv(k_r, groups), repeat_kv(v_r, groups)  # (1, h, ref, d)
 
-            out_c, lse_c = self._attention_with_lse(q_v, k_r, v_r, cross_mask, scale)
+            out_c, lse_c = self._cross_attention_with_lse(q_v, k_r, v_r,
+                                                          cross_mask, scale)
             out_s, lse_s = self._attention_with_lse(q_v, k_v, v_v, self_mask, scale)
 
             # Merge the two softmaxes by their log-sum-exps == single softmax
