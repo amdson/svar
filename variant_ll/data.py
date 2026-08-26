@@ -151,6 +151,10 @@ class WindowSource:
         self.ref = _RefGenome(fasta_path)
         self.stats = {"dropped_multisite": 0, "dropped_n_token": 0,
                       "dropped_ref_mismatch": 0, "sites": 0}
+        # Site accounting is per *window*, not per call — the same window is built
+        # once per split (train/val) and again for the baselines, and those repeats
+        # must not double-count.
+        self._counted: set[int] = set()
 
     def __len__(self) -> int:
         return len(self.partitioner.windows)
@@ -192,23 +196,29 @@ class WindowSource:
                 continue
             by_token.setdefault(1 + off // KMER, []).append((snp, off))
 
+        count = win_idx not in self._counted
+        self._counted.add(win_idx)
         keep = []   # (token, snp, offset-within-6mer)
         for tok, members in sorted(by_token.items()):
-            self.stats["sites"] += len(members)
+            if count:
+                self.stats["sites"] += len(members)
             if tok >= n_tok:
                 continue
             if len(members) > 1:                      # multi-site token
-                self.stats["dropped_multisite"] += len(members)
+                if count:
+                    self.stats["dropped_multisite"] += len(members)
                 continue
             snp, off = members[0]
             lo = (tok - 1) * KMER
             mer = seq[lo:lo + KMER].ljust(KMER, "A")
             if "N" in mer:
-                self.stats["dropped_n_token"] += 1
+                if count:
+                    self.stats["dropped_n_token"] += 1
                 continue
             within = off - lo
             if mer[within] != chr(snp.ref_byte):       # REF vs genome disagreement
-                self.stats["dropped_ref_mismatch"] += 1
+                if count:
+                    self.stats["dropped_ref_mismatch"] += 1
                 continue
             keep.append((tok, snp, within, mer))
         if not keep:
