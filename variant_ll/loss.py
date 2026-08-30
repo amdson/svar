@@ -95,22 +95,26 @@ def _chunk_bits(model, batch, lo: int, hi: int, backend: str) -> torch.Tensor:
 
 
 def window_backward(model, batch, backend: str = "cache",
-                    hap_chunk: int | None = None) -> tuple[float, float]:
+                    hap_chunk: int | None = None,
+                    denom: float | None = None) -> tuple[float, float]:
     """Forward + backward one window, accumulating grad chunk by chunk.
 
     Returns ``(weighted bits summed, weight summed)`` as floats — no graph is
     handed back, so nothing from this window survives the call.
 
-    Why this exists rather than ``window_bits(...).backward()``: that path builds
+    ``denom`` is the normalizer the loss is divided by. Pass the **total weight of
+    every window in the accumulation group** to make the accumulated gradient the
+    gradient of that group's mean bits per SNP — i.e. the actual objective, where
+    every scored site counts once. Leaving it None normalizes by this window's own
+    weight, which makes each window contribute equally to the step regardless of
+    how many sites and haplotypes it holds; that is only correct when one window
+    *is* the batch, and even then it disagrees with what ``evaluate`` reports.
+
+    Why chunking rather than ``window_bits(...).backward()``: that path builds
     every chunk's graph and holds all of them until the caller's single backward,
     so ``hap_chunk`` bounds nothing during training and a window with an unusually
     large haplotype count decides peak memory for the whole run. Here each chunk is
-    backwarded and freed before the next one runs, so peak memory is set by
-    ``hap_chunk`` instead of by N.
-
-    Each chunk's loss is divided by the *window's* total weight, so the summed
-    gradient is exactly the gradient of the window-mean bits/SNP — the same
-    quantity the single-backward path computes.
+    backwarded and freed before the next runs.
 
     The cost is that the frozen-reference forward is repeated per chunk. At the
     window sizes this benchmark uses (T~168 at half_window=500) that is minor; if
@@ -118,17 +122,28 @@ def window_backward(model, batch, backend: str = "cache",
     the chunk size past what fits.
     """
     w_all = window_weights(batch)                    # (N, K)
-    denom = w_all.sum()
+    w_sum = w_all.sum()
+    scale = w_sum if denom is None else denom
     N = batch.n_hap
     step = hap_chunk or N
-    total = 0.0
+    total_bits = 0.0
     for lo in range(0, N, step):
         hi = min(lo + step, N)
         bits = _chunk_bits(model, batch, lo, hi, backend)
-        chunk_loss = (bits * w_all[lo:hi]).sum() / denom
-        chunk_loss.backward()
-        total += float(chunk_loss.detach())
-    return total * float(denom), float(denom)
+        wsum = (bits * w_all[lo:hi]).sum()
+        (wsum / scale).backward()
+        total_bits += float(wsum.detach())
+    return total_bits, float(w_sum)
+
+
+def group_weight(batches) -> float:
+    """Total scored-site weight over an accumulation group.
+
+    Cheap — ``hap_count`` x ``tok_nsite``, no forward — so the normalizer is known
+    before the first backward, which is what lets the group be normalized as one
+    batch rather than as a sum of per-window means.
+    """
+    return float(sum(float(window_weights(b).sum()) for b in batches))
 
 
 @torch.no_grad()

@@ -107,6 +107,13 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--weight-decay", type=float, default=0.01)
     g.add_argument("--schedule", choices=["constant", "cosine"], default="cosine")
     g.add_argument("--warmup", type=int, default=200)
+    g.add_argument("--accum-windows", type=int, default=8,
+                   help="windows accumulated into one optimizer step. One window "
+                        "is ~1 kb of genome, so its sites are heavily correlated "
+                        "and a batch of one is a very noisy gradient. The group is "
+                        "normalized by its TOTAL scored-site weight, so the step "
+                        "minimizes mean bits/SNP — the reported metric — rather "
+                        "than the mean over per-window means.")
     g.add_argument("--grad-clip", type=float, default=0.0,
                    help="0 = off")
 
@@ -304,17 +311,17 @@ def load_model(args, device, dtype):
     return model, tokenizer
 
 
-def lr_scale(step: int, total: int, args) -> float:
-    """Linear warmup then constant or cosine.
+def lr_scale(step: int, total: int, args, warmup: int) -> float:
+    """Linear warmup then constant or cosine, over *optimizer* steps.
 
     Warmup is not optional here: the model starts above 1 bit/SNP against a ~0.36
     target, so the first steps are a long way downhill and a cold full-LR AdamW
     step on 500M parameters can wreck the checkpoint before it settles.
     """
-    if step < args.warmup:
-        return (step + 1) / args.warmup
+    if step < warmup:
+        return (step + 1) / warmup
     if args.schedule == "cosine":
-        prog = (step - args.warmup) / max(1, total - args.warmup)
+        prog = (step - warmup) / max(1, total - warmup)
         return 0.5 * (1 + math.cos(math.pi * min(prog, 1.0)))
     return 1.0
 
@@ -416,10 +423,18 @@ def fine_tune(model, tr_dev, args, score, base, results) -> dict:
                             weight_decay=args.weight_decay)
     rng = np.random.default_rng(args.seed)
     order = np.arange(len(tr_dev))
-    total = args.epochs * len(tr_dev)
+    accum = max(1, args.accum_windows)
+    steps_per_epoch = math.ceil(len(tr_dev) / accum)
+    total = args.epochs * steps_per_epoch
+    # --warmup is in optimizer steps, and accumulation cuts those by `accum`, so a
+    # warmup tuned for one-window steps can swallow a whole short run. Clamp it.
+    warmup = min(args.warmup, max(1, total // 10))
     hap_chunk = args.hap_chunk or None
     gstep = 0
     best = {"eval_bits": float("inf")}
+    print(f"  accumulating {accum} window(s)/step -> {steps_per_epoch} steps/epoch, "
+          f"{total} total; warmup {warmup}"
+          + (f" (clamped from {args.warmup})" if warmup != args.warmup else ""))
 
     def maybe_best(row):
         if row["eval_bits"] < best["eval_bits"]:
@@ -432,20 +447,26 @@ def fine_tune(model, tr_dev, args, score, base, results) -> dict:
         rng.shuffle(order)
         run_bits = run_n = 0.0
         win_bits = win_n = 0.0
-        for step, i in enumerate(order):
+        for step, gi in enumerate(range(0, len(order), accum)):
+            group = [tr_dev[i] for i in order[gi:gi + accum]]
+            # The normalizer is the group's total scored-site weight, known before
+            # any forward, so every site in the group counts once no matter which
+            # window it came from.
+            denom = loss.group_weight(group)
             for g in opt.param_groups:
-                g["lr"] = args.lr * lr_scale(gstep, total, args)
+                g["lr"] = args.lr * lr_scale(gstep, total, args, warmup)
             opt.zero_grad(set_to_none=True)
-            b_sum, n_sum = loss.window_backward(model, tr_dev[i], args.backend,
-                                                hap_chunk)
+            for b in group:
+                b_sum, n_sum = loss.window_backward(model, b, args.backend,
+                                                    hap_chunk, denom=denom)
+                run_bits += b_sum; run_n += n_sum
+                win_bits += b_sum; win_n += n_sum
             if args.grad_clip:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
             gstep += 1
-            run_bits += b_sum; run_n += n_sum
-            win_bits += b_sum; win_n += n_sum
             if step % 100 == 0 and step:
-                print(f"    epoch {epoch} step {step}/{len(order)}  "
+                print(f"    epoch {epoch} step {step}/{steps_per_epoch}  "
                       f"train {win_bits / win_n:.4f} bits/SNP (last 100)", flush=True)
                 win_bits = win_n = 0.0
             if args.eval_every and gstep % args.eval_every == 0:

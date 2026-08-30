@@ -32,7 +32,8 @@ precision = {
     "name": "precision",
     "gpu": True,
     "fixed": {**DATA, "windows": 20, "epochs": 75, "lr": "1e-4",
-              "eval_accessions": "insample", "warmup": 50, "hap_chunk": 32},
+              "eval_accessions": "insample", "warmup": 50, "hap_chunk": 32,
+              "accum_windows": 4},
     "grid": {"precision": ["fp32", "bf16"]},
 }
 
@@ -46,7 +47,8 @@ backend_cache = {
     "gpu": True,
     "fixed": {**DATA, "windows": 20, "epochs": 75, "lr": "1e-4",
               "precision": "fp32", "eval_accessions": "insample",
-              "warmup": 50, "backend": "cache", "hap_chunk": 32},
+              "warmup": 50, "backend": "cache", "hap_chunk": 32,
+              "accum_windows": 4},
     "grid": {},
 }
 backend_exact = {
@@ -55,7 +57,8 @@ backend_exact = {
     "gpu": True,
     "fixed": {**DATA, "windows": 20, "epochs": 75, "lr": "1e-4",
               "precision": "fp32", "eval_accessions": "insample",
-              "warmup": 50, "backend": "exact", "hap_chunk": 8},
+              "warmup": 50, "backend": "exact", "hap_chunk": 8,
+              "accum_windows": 4},
     "grid": {},
 }
 
@@ -69,7 +72,8 @@ heldout = {
     "gpu": True,
     "fixed": {**DATA, "precision": "fp32", "lr": "1e-4",
               "eval_accessions": "heldout", "eval_split": "val",
-              "hap_chunk": 32, "permute": True, "eval_every": 2000},
+              "hap_chunk": 32, "permute": True, "eval_every": 250,
+              "accum_windows": 8},
     "grid": {"windows": [200, 400], "epochs": [40, 80]},
 }
 
@@ -79,7 +83,8 @@ lr_probe = {
     "name": "lr",
     "gpu": True,
     "fixed": {**DATA, "windows": 20, "epochs": 75, "precision": "fp32",
-              "eval_accessions": "insample", "warmup": 50},
+              "eval_accessions": "insample", "warmup": 50,
+              "accum_windows": 4},
     "grid": {"lr": ["3e-5", "1e-4", "3e-4"]},
 }
 
@@ -93,7 +98,8 @@ rice_null = {
     "gpu": True,
     "fixed": {"dataset": "rice", "chrom": 1, "half_window": 500, "seed": 42,
               "windows": 200, "epochs": 40, "lr": "1e-4", "precision": "fp32",
-              "eval_accessions": "heldout", "permute": True, "hap_chunk": 32},
+              "eval_accessions": "heldout", "permute": True, "hap_chunk": 32,
+              "accum_windows": 8},
     "grid": {},
 }
 

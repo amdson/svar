@@ -497,6 +497,35 @@ compare converged numbers, not intermediate ones.)
 These are in-sample numbers: they establish that the mechanism passes real
 individual-specific information, not that it generalises to held-out accessions.
 
+### 8e. Accumulate windows, and normalize by the group
+
+One window is ~1 kb of genome. Its sites sit in one LD block and its haplotypes
+are the same few founder patterns, so a batch of one window is both tiny and
+heavily correlated — about the worst gradient estimate available. Accumulate
+several windows per optimizer step (`--accum-windows`, default 8).
+
+The normalizer matters as much as the accumulation. Dividing each window's loss
+by *its own* total weight makes every window pull equally hard on the step
+regardless of how many sites and haplotypes it holds, which is not the objective
+and does not match what `evaluate` reports (a global `sum bits / sum weights`).
+Normalize the whole group by its **total scored-site weight** instead, so every
+site counts once.
+
+This is not cosmetic. Measured on a group of 4 arabidopsis chr4 windows with 9-37
+sites (group weights spanning 4.1x), against the true joint gradient of the
+group's mean bits/SNP, on `encoder.layers.3.mlp.down_proj`:
+
+| accumulation | rel. error vs true gradient | cosine |
+|---|---:|---:|
+| **group-normalized (now)** | **8.2e-6** | **0.99999994** |
+| per-window mean (before) | 3.2e-1 | 0.9545 |
+
+The old scheme pointed measurably elsewhere, biased toward sparse windows.
+
+`--warmup` counts *optimizer* steps, which accumulation divides by
+`accum_windows`, so a warmup tuned for one-window steps can swallow a short run
+whole; it is clamped to 10% of total steps and the clamp is printed.
+
 ### Practical training envelope
 
 `half_window=10000`, bf16, checkpointed reference, N chunked at 32: ~1.0 s per window
