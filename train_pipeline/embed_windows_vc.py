@@ -101,8 +101,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fasta-path", type=str, default=str(FASTA_PATH))
     p.add_argument("--half-window", type=int, default=500)
     p.add_argument("--buffer", type=int, default=0)
-    p.add_argument("--window-mode", choices=list(WINDOW_MODES), default="overlap",
-                   help="'overlap' (default): windows span [p-hw, p+hw] and may "
+    p.add_argument("--window-mode", choices=list(WINDOW_MODES), default="disjoint",
+                   help="'disjoint' (default): non-overlapping spans. "
                         "overlap, so a boundary SNP is embedded in ~2 windows. "
                         "'disjoint': non-overlapping windows, each SNP embedded in "
                         "exactly one window (requires --buffer 0; ~1.8x fewer windows "

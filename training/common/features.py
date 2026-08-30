@@ -158,7 +158,7 @@ def apply_snp_prior(X, variant_ids: list[str], prior):
 
 
 def variant_window_index(
-    spec: DatasetSpec, half_window: int, *, buffer: int = 0
+    spec: DatasetSpec, half_window: int, *, buffer: int = 0, mode: str = "disjoint"
 ) -> dict[str, int]:
     """Map each variant_id → its partitioner window index (the cache's window axis).
 
@@ -172,7 +172,8 @@ def variant_window_index(
     if not spec.vcf_path or not Path(spec.vcf_path).exists():
         raise FileNotFoundError(f"[{spec.name}] VCF not found: {spec.vcf_path}")
     snps_by_chrom, _ = load_snps_from_vcf(spec.vcf_path, None)
-    part = SNPWindowPartitioner(snps_by_chrom, half_window=half_window, buffer=buffer)
+    part = SNPWindowPartitioner(snps_by_chrom, half_window=half_window,
+                                buffer=buffer, mode=mode)
     # (chrom, pos, variant_id) from the .pvar; assign via the partitioner's map.
     vid_to_win: dict[str, int] = {}
     pvar = spec.pgen_prefix + ".pvar"

@@ -33,6 +33,7 @@ class SNPRecord(NamedTuple):
 def load_snps_from_vcf(
     vcf_path: str,
     samples: list[str] | None = None,
+    chroms: set[int] | None = None,
 ) -> tuple[dict[int, list[SNPRecord]], list[str]]:
     """
     Single-pass VCF read.
@@ -41,6 +42,9 @@ def load_snps_from_vcf(
     ----------
     vcf_path : path to a biallelic VCF (plain or bgzipped)
     samples  : sample IDs to include; None means all samples in the VCF header
+    chroms   : if given, keep only records on these (parsed-int) chromosomes;
+               non-matching records are skipped before the per-sample genotype
+               is decoded, so a single-chromosome subset reads much faster.
 
     Returns
     -------
@@ -62,6 +66,8 @@ def load_snps_from_vcf(
                 continue
 
             chrom_int = _parse_chrom(rec.chrom)
+            if chroms is not None and chrom_int not in chroms:
+                continue
             ref_byte  = ord(rec.ref[0].upper())
             alt_byte  = ord(rec.alts[0][0].upper())
 

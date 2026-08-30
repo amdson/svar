@@ -12,7 +12,7 @@ Typical usage
     from crop_embed.embedder import SampleEmbedder
 
     snps, samples = load_snps_from_vcf(vcf_path)
-    partitioner   = SNPWindowPartitioner(snps, half_window=512, buffer=64)
+    partitioner   = SNPWindowPartitioner(snps, half_window=512)
     dataset       = UniqueWindowDataset(vcf_path, fasta_path, partitioner)
 
     embedding_table = SampleEmbedder.fill_embedding_table(dataset, model, tokenizer)
@@ -53,7 +53,6 @@ from crop_embed.fingerprint import (
 )
 from crop_embed.partitioner import (
     SNPWindowPartitioner,
-    NonOverlappingSNPWindowPartitioner,
     Window,
 )
 from crop_embed.heads import AttentionHead, LinearHead, MLPHead, window_position_features
@@ -71,7 +70,6 @@ __all__ = [
     "SNPRecord",
     "load_snps_from_vcf",
     "SNPWindowPartitioner",
-    "NonOverlappingSNPWindowPartitioner",
     "Window",
     "Fingerprint",
     "make_fingerprint",

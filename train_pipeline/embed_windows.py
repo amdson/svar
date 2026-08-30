@@ -77,7 +77,7 @@ parser = argparse.ArgumentParser(
 )
 
 # Model
-parser.add_argument("--backend", choices=["dnabert2", "plantcad", "carbon"], default="dnabert2",
+parser.add_argument("--backend", choices=["dnabert2", "plantcad", "carbon", "agront", "gpn"], default="dnabert2",
                     help="Encoder family. Picks default --model-path if --model-path "
                          "is left unset, and routes loading / forward semantics.")
 parser.add_argument("--model-path", type=str, default=None,
@@ -107,14 +107,27 @@ parser.add_argument("--attn-impl", choices=["torch", "flash"], default="torch",
 
 # Data / windowing
 parser.add_argument("--vcf-path",   type=str, default=DEFAULT_VCF_PATH)
+parser.add_argument("--chrom", type=str, default=None,
+                    help="Restrict windowing to these chromosomes (comma-separated "
+                         "ints, e.g. '4' or '1,4'). Filters SNPs before partitioning, "
+                         "so only the chosen chromosomes' windows are built/embedded. "
+                         "Ignored with --reuse-windows-from.")
+parser.add_argument("--loader", choices=["pysam", "polars"], default="pysam",
+                    help="VCF reader. 'polars' is ~2 orders of magnitude faster on "
+                         "large plain-GT VCFs (vectorized Rust parse); 'pysam' is the "
+                         "reference reader. Both yield identical windows. Ignored with "
+                         "--reuse-windows-from.")
 parser.add_argument("--fasta-path", type=str, default=FASTA_PATH)
 parser.add_argument("--half-window", type=int, default=500)
 parser.add_argument("--buffer",      type=int, default=0)
-parser.add_argument("--window-mode", choices=list(WINDOW_MODES), default="overlap",
-                    help="'overlap' (default): windows span [p-hw, p+hw] and may "
-                         "overlap, so a SNP near a boundary is embedded in ~2 windows. "
-                         "'disjoint': non-overlapping windows, each SNP embedded in "
-                         "exactly one window (requires --buffer 0).")
+parser.add_argument("--window-mode", choices=list(WINDOW_MODES), default="disjoint",
+                    help="'disjoint' (default): non-overlapping window spans, so "
+                         "every SNP in a window's sequence belongs to that window. "
+                         "'overlap' (legacy): spans [p-hw, p+hw] that overlap, so a "
+                         "window's sequence also contains SNPs owned by earlier "
+                         "windows, pinned at the reference allele. The two produce "
+                         "different windows AND a different window order, so caches "
+                         "are not interchangeable.")
 
 # Compute
 parser.add_argument("--batch-size", type=int, default=64)
@@ -144,11 +157,12 @@ if args.model_path is None:
         args.model_path = CARBON_MODEL_PATHS[args.carbon_size]
     else:
         args.model_path = DEFAULT_MODEL_PATHS[args.backend]
-if args.backend == "plantcad" and args.snp_only:
-    parser.error("--snp-only is not supported with --backend plantcad")
-if args.backend == "plantcad" and args.half_window > 256:
+if args.backend in ("plantcad", "gpn") and args.snp_only:
+    parser.error(f"--snp-only is not supported with --backend {args.backend}")
+if args.backend in ("plantcad", "gpn") and args.half_window > 256:
+    cap = 512
     print(
-        f"WARNING: PlantCAD's max input is 512 bp; --half-window={args.half_window} "
+        f"WARNING: {args.backend}'s max input is {cap} bp; --half-window={args.half_window} "
         f"produces {2 * args.half_window} bp windows which will be truncated."
     )
 
@@ -176,13 +190,34 @@ if args.reuse_windows_from:
             f"--half-window {args.half_window} != source cache half_window {src_hw}; "
             f"the reused windows were built at hw={src_hw} (pass --half-window {src_hw})."
         )
+    # Window mode changes the windows AND their order, so reusing across modes
+    # silently misaligns every column. Caches predating the flag have no recorded
+    # mode and were necessarily built as 'overlap'.
+    src_mode = dataset.source_metadata.get("window_mode", "overlap")
+    if src_mode != args.window_mode:
+        parser.error(
+            f"--window-mode {args.window_mode} != source cache window_mode "
+            f"{src_mode}; the reused windows were built as {src_mode!r} and the two "
+            f"modes are not interchangeable (pass --window-mode {src_mode})."
+        )
     n_windows = int(dataset.sample_fp_index.shape[1])
     print(f"  {len(dataset):,} unique windows to embed "
           f"({dataset.sample_fp_index.shape[0]:,} samples × {n_windows:,} windows; "
           f"no sample×window enumeration)")
 else:
-    print("Loading SNPs from VCF …")
-    snps_by_chrom, samples = load_snps_from_vcf(args.vcf_path)
+    print(f"Loading SNPs from VCF (loader={args.loader}) …")
+    chroms = ({int(c) for c in args.chrom.split(",")} if args.chrom else None)
+    if chroms:
+        print(f"  restricting to chromosome(s): {sorted(chroms)}")
+    if args.loader == "polars":
+        # Vectorized Rust parse (~100x faster on large plain-GT VCFs). The polars
+        # loader has no chroms arg, so filter its per-chromosome dict after load.
+        from crop_embed.data.vcf_polars import load_snps_from_vcf as _load_polars
+        snps_by_chrom, samples = _load_polars(args.vcf_path)
+        if chroms:
+            snps_by_chrom = {c: v for c, v in snps_by_chrom.items() if c in chroms}
+    else:
+        snps_by_chrom, samples = load_snps_from_vcf(args.vcf_path, chroms=chroms)
     n_snps = sum(len(v) for v in snps_by_chrom.values())
     print(f"  {n_snps:,} SNPs | {len(snps_by_chrom)} chromosomes | {len(samples)} samples")
 

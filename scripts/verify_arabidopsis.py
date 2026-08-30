@@ -129,7 +129,7 @@ def main() -> int:
         check("loader parsed SNPs with integer chrom keys", n_snps > 0,
               f"{n_snps:,} SNPs over chroms {sorted(snps_by_chrom)}")
 
-        part = SNPWindowPartitioner(snps_by_chrom, half_window=250, buffer=50)
+        part = SNPWindowPartitioner(snps_by_chrom, half_window=250)
         ds = UniqueWindowDataset(slice_vcf, spec.fasta_path, part)
         check("windows built", len(ds) > 0, f"{len(ds):,} unique windows")
 
