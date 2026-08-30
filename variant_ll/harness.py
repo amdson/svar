@@ -36,7 +36,7 @@ import torch
 from crop_embed import MetricLogger, metrics_path_for
 from training.common import artifacts, run_record
 from variant_ll import baselines, loss
-from variant_ll.data import WindowSource, genotype_split
+from variant_ll.data import WindowSource, load_or_build_genotype_split
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -144,6 +144,7 @@ class WindowSet:
     win_ids: np.ndarray
     fit_rows: np.ndarray        # accessions the model trains on; baselines fit here
     eval_rows: np.ndarray       # accessions scored
+    split_path: Path | None = None
     train_batches: list = field(default_factory=list)
     eval_batches: list = field(default_factory=list)
 
@@ -165,7 +166,8 @@ def build_windows(args) -> WindowSet:
     print(f"  {len(src.samples)} accessions, {len(src)} windows "
           f"(hw={args.half_window}) in {time.time() - t0:.0f}s")
 
-    tr_rows, va_rows, te_rows = genotype_split(src.samples, args.seed)
+    tr_rows, va_rows, te_rows, split_path = load_or_build_genotype_split(
+        args.dataset, src.samples, args.seed)
     if args.eval_accessions == "insample":
         eval_rows = tr_rows
     else:
@@ -175,7 +177,8 @@ def build_windows(args) -> WindowSet:
     win_ids = np.sort(rng.choice(len(src), size=min(args.windows, len(src)),
                                  replace=False))
 
-    ws = WindowSet(source=src, win_ids=win_ids, fit_rows=tr_rows, eval_rows=eval_rows)
+    ws = WindowSet(source=src, win_ids=win_ids, fit_rows=tr_rows,
+                   eval_rows=eval_rows, split_path=split_path)
     ws.train_batches = build_batches(src, win_ids, tr_rows)
     ws.eval_batches = (ws.train_batches if ws.insample
                        else build_batches(src, win_ids, eval_rows))
@@ -490,7 +493,6 @@ def resolve_output(args) -> tuple[Path, Path]:
 
 
 def finalize(args, model, results, base, ws, out_path: Path, run_dir: Path) -> None:
-    from training.common.splits import default_split_path
     best = results.get("best", {})
     perm = results.get("permuted")
 
@@ -531,7 +533,7 @@ def finalize(args, model, results, base, ws, out_path: Path, run_dir: Path) -> N
                      "eval_accessions": args.eval_accessions},
         metrics={phase: {"mean": mean}},
         half_window=args.half_window,
-        split_path=str(default_split_path(args.dataset, args.seed)),
+        split_path=str(ws.split_path) if ws.split_path else None,
         strict=args.strict,
         extra={"n_sites": results["n_sites"], "n_windows": results["n_windows"],
                "upstream_frac": results["upstream_frac"],

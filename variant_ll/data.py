@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -359,11 +360,62 @@ def genotype_split(samples: list[str], seed: int = 42,
                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Deterministic 70/15/15 split over *genotyped* accessions.
 
-    `training.common.splits` partitions phenotyped samples; this benchmark uses
-    no traits, so it splits the VCF's sample list directly (PLAN.md Phase 2).
+    Returns row *indices* into ``samples`` (train, val, test).
+
+    `training.common.splits` partitions **phenotyped** samples, keyed by IID, and
+    is what every phenotype model shares. This benchmark uses no traits and every
+    genotyped accession, so it splits the VCF's sample list directly — a different
+    partition over a different sample universe (PLAN.md Phase 2). Two consequences
+    worth stating: a variant_ll held-out accession may sit in a phenotype model's
+    training set (harmless here, since no phenotype is involved, but not a shared
+    split), and determinism rests on the VCF's header order being stable, which is
+    why :func:`load_or_build_genotype_split` pins the sample IDs to a file.
     """
     rng = np.random.default_rng(seed)
     perm = rng.permutation(len(samples))
     n_test = int(round(len(samples) * test))
     n_val = int(round(len(samples) * val))
     return perm[n_test + n_val:], perm[n_test:n_test + n_val], perm[:n_test]
+
+
+def genotype_split_path(dataset: str, seed: int = 42) -> Path:
+    """Committed alongside the phenotype splits, with a `_geno` tag to keep the
+    two distinguishable (they partition different sample universes)."""
+    return Path(__file__).resolve().parents[1] / "splits" / f"{dataset}_geno_seed{seed}.pt"
+
+
+def load_or_build_genotype_split(dataset: str, samples: list[str], seed: int = 42
+                                 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, Path]:
+    """The genotype split as a persisted artifact: (train, val, test, path).
+
+    `genotype_split` is deterministic given (sample order, seed), but "sample
+    order" is the VCF header — an implicit dependency that a rebuild could change
+    without anything noticing. Writing the chosen **sample IDs** to
+    ``splits/<dataset>_geno_seed<seed>.pt`` makes the split inspectable, gives the
+    run record something real to point at, and turns a silent shift into a loud
+    mismatch: on load the stored IDs are re-resolved against the current sample
+    list and a disagreement raises rather than quietly re-partitioning.
+    """
+    path = genotype_split_path(dataset, seed)
+    index = {s: i for i, s in enumerate(samples)}
+    if path.exists():
+        blob = torch.load(path, weights_only=False)
+        missing = [s for part in ("train", "val", "test")
+                   for s in blob[part] if s not in index]
+        if missing:
+            raise RuntimeError(
+                f"{path} lists {len(missing)} accessions absent from the current "
+                f"{dataset} VCF (e.g. {missing[:3]}). The genotype panel changed; "
+                f"delete the file to re-split, and expect earlier numbers to be "
+                f"incomparable.")
+        return (np.array([index[s] for s in blob["train"]], dtype=np.int64),
+                np.array([index[s] for s in blob["val"]], dtype=np.int64),
+                np.array([index[s] for s in blob["test"]], dtype=np.int64), path)
+
+    tr, va, te = genotype_split(samples, seed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"train": [samples[i] for i in tr],
+                "val": [samples[i] for i in va],
+                "test": [samples[i] for i in te],
+                "seed": seed, "dataset": dataset, "n_samples": len(samples)}, path)
+    return tr, va, te, path
