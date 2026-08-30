@@ -126,12 +126,22 @@ it. That is a follow-up experiment, not part of the go/no-go.
 
 ---
 
-## Phase 2 — genotype-level split
+## Phase 2 — split ~~(genotype-level)~~ **DONE: use the shared phenotype split**
 
-`training/common/splits.py::build_split` partitions **phenotyped** samples. This
-benchmark uses all genotyped accessions and no traits, so add a genotype-only path
-that partitions VCF sample IDs → `splits/arabidopsis_geno_seed42.pt`, same 70/15/15
-and seed 42 convention so it sits alongside the existing split files.
+Originally this phase called for a genotype-only split over all VCF sample IDs,
+on the grounds that the benchmark uses no traits. That was implemented and then
+reverted: it created a *second* partition of the same panel, which is how run
+records ended up naming a split file the runs never touched, and it forfeits the
+one thing a shared split buys — being able to set these numbers beside phenotype
+results without worrying that a variant_ll held-out accession was in a phenotype
+model's training set.
+
+`variant_ll` now uses `training.common.splits.get_or_build_split(dataset)`, the
+same committed 70/15/15 seed-42 split as every other model, resolved against the
+VCF's column order. Cost: it partitions *phenotyped* samples, so accessions with
+no phenotype at all are not scored — arabidopsis 1,041 of 1,135 (729/156/156),
+rice all 383 (269/57/57). Those 94 are a slightly non-random subset (phenotyped
+accessions skew toward the better-studied ones), which is the price paid.
 
 **Relatedness is a confound here.** 1001G has strong population structure (relicts,
 admixed groups, near-duplicate accessions). A random split puts close relatives on

@@ -36,7 +36,7 @@ import torch
 from crop_embed import MetricLogger, metrics_path_for
 from training.common import artifacts, run_record
 from variant_ll import baselines, loss
-from variant_ll.data import WindowSource, load_or_build_genotype_split
+from variant_ll.data import WindowSource
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -166,8 +166,27 @@ def build_windows(args) -> WindowSet:
     print(f"  {len(src.samples)} accessions, {len(src)} windows "
           f"(hw={args.half_window}) in {time.time() - t0:.0f}s")
 
-    tr_rows, va_rows, te_rows, split_path = load_or_build_genotype_split(
-        args.dataset, src.samples, args.seed)
+    # The split every model in the repo shares (training/common/splits.py), keyed
+    # by sample ID and committed, so a variant_ll held-out accession is held out
+    # for the phenotype models too — no cross-model leakage, and these numbers can
+    # be set beside phenotype results later. `indices` resolves IDs against the
+    # VCF's column order and raises if any is absent.
+    #
+    # It partitions *phenotyped* samples, so on a panel where some accessions have
+    # no phenotype at all it covers less than the full VCF: arabidopsis 1,041 of
+    # 1,135 (729/156/156), rice all 383 (269/57/57). Those 94 are simply not
+    # scored — a slightly smaller and not-quite-random panel, which is the price of
+    # a shared split.
+    from training.common.splits import get_or_build_split, default_split_path
+    split = get_or_build_split(args.dataset, seed=args.seed)
+    tr_rows = split.indices("train", src.samples)
+    va_rows = split.indices("val", src.samples)
+    te_rows = split.indices("test", src.samples)
+    split_path = default_split_path(args.dataset, args.seed)
+    n_cov = len(tr_rows) + len(va_rows) + len(te_rows)
+    if n_cov < len(src.samples):
+        print(f"  split covers {n_cov}/{len(src.samples)} genotyped accessions "
+              f"({len(src.samples) - n_cov} have no phenotype and are not scored)")
     if args.eval_accessions == "insample":
         eval_rows = tr_rows
     else:

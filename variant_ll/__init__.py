@@ -18,6 +18,6 @@ The scored unit is a *token*, not a site: a 6-mer holding m segregating sites is
 scored jointly over its 2**m possible values, which keeps the sum an exact
 chain-rule factorization of P(haplotype | reference). See BENCHMARK.md §5.
 """
-from variant_ll.data import WindowBatch, WindowSource, genotype_split
+from variant_ll.data import WindowBatch, WindowSource
 
-__all__ = ["WindowSource", "WindowBatch", "genotype_split"]
+__all__ = ["WindowSource", "WindowBatch"]
