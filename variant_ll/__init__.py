@@ -7,6 +7,8 @@ at each SNP, better than the naive per-site allele-frequency baseline?
 
 See BENCHMARK.md for the objective and PLAN.md for the run sequence.
 
+  run.py / harness.py -> the runner; every experiment is this one loop with
+                         different flags (see run.py's docstring)
   data.WindowSource   -> per-window batches (frozen reference + haplotypes)
   baselines.evaluate  -> B0 / B1 / B2 in bits per SNP
   loss.window_bits    -> the objective, cache or exact backend

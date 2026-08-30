@@ -51,6 +51,10 @@ RUNNERS = {
     "emb_sklearn": "training.emb_sklearn.run",
     "emb_nn": "training.emb_nn.run",
     "e2e": "training.e2e.run",
+    # Not a training/ runner (no traits, no phenotypes — its metric is bits/SNP),
+    # but it takes --key value args and appends to the same manifest, so the
+    # driver drives it unchanged.
+    "variant_ll": "variant_ll.run",
 }
 
 

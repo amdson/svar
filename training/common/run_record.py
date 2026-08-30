@@ -136,8 +136,14 @@ def _flatten(rec: RunRecord) -> dict:
     for phase in ("val", "test"):
         block = rec.metrics.get(phase, {})
         mean = block.get("mean", {})
-        for k in ("pearson", "r2", "mse", "mae"):
-            if k in mean:
+        # Phenotype runners report pearson/r2/mse/mae; variant_ll reports bits per
+        # SNP against its baselines. Emit whichever are present so one manifest
+        # read compares runs of either kind.
+        for k in ("pearson", "r2", "mse", "mae",
+                  "bits_per_snp", "bits_up", "bits_noup", "train_bits", "gap",
+                  "b1_bits", "b2_bits", "b1_bits_up", "b2_bits_up",
+                  "margin_vs_b1", "zeroshot_bits", "permuted_bits"):
+            if k in mean and mean[k] is not None:
                 row[f"{phase}.{k}"] = mean[k]
     return row
 
