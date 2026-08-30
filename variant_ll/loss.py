@@ -72,24 +72,63 @@ def window_bits(model, batch, backend: str = "cache",
     multiplicity rather than recomputed — and ``batch.tok_nsite``.
     """
     N = batch.n_hap
-    chunks = range(0, N, hap_chunk) if hap_chunk else [0]
     step = hap_chunk or N
-    out = []
-    for lo in chunks:
-        hi = min(lo + step, N)
-        if backend == "cache":
-            res = model(batch.ref_ids,
-                        variant_positions=batch.cache_idx,
-                        variant_input_ids=batch.hap_ids[lo:hi])
-            logits = res.logits.index_select(1, batch.pred_row)      # (n, K, V)
-        else:
-            full = batch.ref_ids.unsqueeze(0).repeat(hi - lo, 1)
-            full[:, batch.cache_idx] = batch.hap_ids[lo:hi]
-            logits = model(input_ids=full).logits.index_select(
-                1, (batch.tok_idx - 1).clamp(min=0))                 # (n, K, V)
-        out.append(_token_bits(logits, batch.cand_ids, batch.cand_mask,
-                               batch.hap_target[lo:hi]))
+    out = [_chunk_bits(model, batch, lo, min(lo + step, N), backend)
+           for lo in range(0, N, step)]
     return torch.cat(out, dim=0), window_weights(batch)
+
+
+def _chunk_bits(model, batch, lo: int, hi: int, backend: str) -> torch.Tensor:
+    """(hi-lo, K) bits for one slice of the window's haplotypes."""
+    if backend == "cache":
+        res = model(batch.ref_ids,
+                    variant_positions=batch.cache_idx,
+                    variant_input_ids=batch.hap_ids[lo:hi])
+        logits = res.logits.index_select(1, batch.pred_row)          # (n, K, V)
+    else:
+        full = batch.ref_ids.unsqueeze(0).repeat(hi - lo, 1)
+        full[:, batch.cache_idx] = batch.hap_ids[lo:hi]
+        logits = model(input_ids=full).logits.index_select(
+            1, (batch.tok_idx - 1).clamp(min=0))                     # (n, K, V)
+    return _token_bits(logits, batch.cand_ids, batch.cand_mask,
+                       batch.hap_target[lo:hi])
+
+
+def window_backward(model, batch, backend: str = "cache",
+                    hap_chunk: int | None = None) -> tuple[float, float]:
+    """Forward + backward one window, accumulating grad chunk by chunk.
+
+    Returns ``(weighted bits summed, weight summed)`` as floats — no graph is
+    handed back, so nothing from this window survives the call.
+
+    Why this exists rather than ``window_bits(...).backward()``: that path builds
+    every chunk's graph and holds all of them until the caller's single backward,
+    so ``hap_chunk`` bounds nothing during training and a window with an unusually
+    large haplotype count decides peak memory for the whole run. Here each chunk is
+    backwarded and freed before the next one runs, so peak memory is set by
+    ``hap_chunk`` instead of by N.
+
+    Each chunk's loss is divided by the *window's* total weight, so the summed
+    gradient is exactly the gradient of the window-mean bits/SNP — the same
+    quantity the single-backward path computes.
+
+    The cost is that the frozen-reference forward is repeated per chunk. At the
+    window sizes this benchmark uses (T~168 at half_window=500) that is minor; if
+    it ever isn't, hoist `forward_reference` out of the loop rather than raising
+    the chunk size past what fits.
+    """
+    w_all = window_weights(batch)                    # (N, K)
+    denom = w_all.sum()
+    N = batch.n_hap
+    step = hap_chunk or N
+    total = 0.0
+    for lo in range(0, N, step):
+        hi = min(lo + step, N)
+        bits = _chunk_bits(model, batch, lo, hi, backend)
+        chunk_loss = (bits * w_all[lo:hi]).sum() / denom
+        chunk_loss.backward()
+        total += float(chunk_loss.detach())
+    return total * float(denom), float(denom)
 
 
 @torch.no_grad()

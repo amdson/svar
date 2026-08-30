@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -61,7 +62,20 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--epochs", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-5)
-    p.add_argument("--hap-chunk", type=int, default=64)
+    p.add_argument("--hap-chunk", type=int, default=128,
+                   help="Haplotypes per forward; 0 = the window's whole set. Bounds "
+                        "peak memory in both eval and training (training goes "
+                        "through loss.window_backward, which frees each chunk before "
+                        "the next). Costs one repeated reference forward per chunk.")
+    p.add_argument("--schedule", choices=["constant", "cosine"], default="cosine",
+                   help="Post-warmup LR shape. Constant LR bounces near the end of "
+                        "training here (5e-5 went 0.760 -> 0.878 over 200 steps).")
+    p.add_argument("--warmup", type=int, default=100,
+                   help="Linear LR warmup steps; the first windows are otherwise a "
+                        "large step from a model that starts above 1 bit/SNP.")
+    p.add_argument("--eval-every", type=int, default=0,
+                   help="Also evaluate on val every N optimizer steps (0 = only at "
+                        "epoch ends).")
     p.add_argument("--precision", choices=["fp32", "bf16"], default="fp32")
     p.add_argument("--ckpt-reference", action="store_true",
                    help="Gradient-checkpoint the frozen-reference forward. Exact, "
@@ -76,6 +90,7 @@ def main() -> int:
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
+    hap_chunk = args.hap_chunk or None
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     dtype = torch.bfloat16 if args.precision == "bf16" else torch.float32
     vcf_path, fasta_path = _resolve(args.dataset)
@@ -146,7 +161,7 @@ def main() -> int:
                "site_stats": src.stats}
 
     t0 = time.time()
-    zs = loss.evaluate(model, va_dev, "cache", args.hap_chunk)
+    zs = loss.evaluate(model, va_dev, "cache", hap_chunk)
     print(f"\n  Carbon zero-shot (cache)  {zs['all_bits']:.4f} bits/SNP  "
           f"[up {zs['up_bits']:.4f} | no-up {zs['noup_bits']:.4f}]  "
           f"({time.time()-t0:.0f}s)")
@@ -154,7 +169,7 @@ def main() -> int:
 
     if args.exact:
         exact, _ = load_carbon_local(args.model_path, device=device, dtype=dtype)
-        ze = loss.evaluate(exact, va_dev, "exact", args.hap_chunk)
+        ze = loss.evaluate(exact, va_dev, "exact", hap_chunk)
         print(f"  Carbon zero-shot (exact)  {ze['all_bits']:.4f} bits/SNP  "
               f"[up {ze['up_bits']:.4f} | no-up {ze['noup_bits']:.4f}]")
         results["zeroshot_exact"] = ze
@@ -162,29 +177,64 @@ def main() -> int:
         torch.cuda.empty_cache()
 
     # ── Fine-tune ─────────────────────────────────────────────────────────────
+    history = []
+    results["history"] = history
     if args.epochs:
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
         order = np.arange(len(tr_dev))
+        total_steps = args.epochs * len(tr_dev)
+        gstep = 0
+        best = {"all_bits": float("inf")}
+
+        def record(tag, train_bits):
+            ft = loss.evaluate(model, va_dev, "cache", hap_chunk)
+            row = {"tag": tag, "step": gstep, "train_bits": train_bits, **ft}
+            history.append(row)
+            flag = ""
+            if ft["all_bits"] < best["all_bits"]:
+                best.update(ft); best["step"] = gstep; flag = "  *best"
+            print(f"  {tag}: train {train_bits:.4f} | val {ft['all_bits']:.4f} "
+                  f"bits/SNP  [up {ft['up_bits']:.4f} | no-up {ft['noup_bits']:.4f}]"
+                  f"  vs B1 {base['b1']:.4f} ({ft['all_bits']-base['b1']:+.4f}){flag}")
+            model.train()
+            return ft
+
         for epoch in range(args.epochs):
             model.train()
             rng.shuffle(order)
             run_bits, run_n = 0.0, 0.0
+            win_bits, win_n = 0.0, 0.0          # since the last printed line
             for step, i in enumerate(order):
+                # Warmup: the model starts above 1 bit/SNP against a 0.34 target, so
+                # the first steps are a long way downhill and a cold full-LR AdamW
+                # step on 500M params can wreck the checkpoint before it settles.
+                if gstep < args.warmup:
+                    scale = (gstep + 1) / args.warmup
+                elif args.schedule == "cosine":
+                    prog = (gstep - args.warmup) / max(1, total_steps - args.warmup)
+                    scale = 0.5 * (1 + math.cos(math.pi * min(prog, 1.0)))
+                else:
+                    scale = 1.0
+                for g in opt.param_groups:
+                    g["lr"] = args.lr * scale
                 opt.zero_grad(set_to_none=True)
-                bits, w = loss.window_bits(model, tr_dev[i], "cache",
-                                           args.hap_chunk)
-                l = (bits * w).sum() / w.sum()
-                l.backward()
+                b_sum, n_sum = loss.window_backward(model, tr_dev[i], "cache",
+                                                    hap_chunk)
                 opt.step()
-                run_bits += float((bits * w).sum().detach()); run_n += float(w.sum())
-                if step % 50 == 0 and step:
+                gstep += 1
+                run_bits += b_sum; run_n += n_sum
+                win_bits += b_sum; win_n += n_sum
+                if step % 100 == 0 and step:
                     print(f"    epoch {epoch} step {step}/{len(order)}  "
-                          f"train {run_bits/run_n:.4f} bits/SNP")
-            ft = loss.evaluate(model, va_dev, "cache", args.hap_chunk)
-            print(f"  epoch {epoch}: train {run_bits/run_n:.4f} | "
-                  f"val {ft['all_bits']:.4f} bits/SNP  "
-                  f"[up {ft['up_bits']:.4f} | no-up {ft['noup_bits']:.4f}]")
-            results[f"ft_epoch{epoch}"] = ft
+                          f"train {win_bits/win_n:.4f} bits/SNP (last 100)")
+                    win_bits, win_n = 0.0, 0.0
+                if args.eval_every and gstep % args.eval_every == 0:
+                    record(f"step {gstep}", run_bits / run_n)
+            results[f"ft_epoch{epoch}"] = record(f"epoch {epoch}", run_bits / run_n)
+
+        results["best_val"] = best
+        print(f"\n  best val {best['all_bits']:.4f} bits/SNP at step {best['step']}"
+              f"  (B1 {base['b1']:.4f}, B2 {base['b2']:.4f})")
 
     # ── Mechanism control ─────────────────────────────────────────────────────
     # Compare against the *current* model's intact score, not the zero-shot one:
@@ -195,7 +245,7 @@ def main() -> int:
         perm = build_batches(src, win_ids, va_rows, shuffle_sites=True,
                              seed=args.seed)
         pm = loss.evaluate(model, [b.to(device) for b in perm], "cache",
-                           args.hap_chunk)
+                           hap_chunk)
         intact = results[f"ft_epoch{args.epochs - 1}"] if args.epochs else zs
         stage = f"after {args.epochs} epoch(s)" if args.epochs else "zero-shot"
         print(f"\n  LD-destroyed control      {pm['all_bits']:.4f} bits/SNP  "
