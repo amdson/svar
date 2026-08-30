@@ -83,25 +83,42 @@ def tokenize_window(seq: str) -> list[int]:
 class WindowBatch:
     """One window's frozen reference plus every haplotype observed in a split.
 
-    Shapes: T = tokens in the window, S = scoreable sites, C = cached positions,
-    N = unique haplotypes.
+    The scored unit is a **token**, not a site. Carbon's DNA mode is a fixed
+    contiguous 6-mer split, so a token holding m segregating sites has 2**m
+    possible values; the autoregressive target is simply the one carrying this
+    haplotype's alleles at all m, and the score is renormalised over those 2**m
+    candidates. For m = 1 that is the two-candidate ref/alt case; for m > 1 it is
+    the same formula, and — unlike scoring each site with its co-token neighbours
+    pinned to their true values — it stays a chain-rule factorisation of
+    P(haplotype | reference) and conditions only on strictly upstream tokens.
+
+    Shapes: T = tokens in the window, K = scored tokens, S = sites (>= K),
+    C = cached positions, N = unique haplotypes, Q = 2**max(m) candidate slots.
     """
     chrom: int
     start: int
     ref_ids: torch.Tensor      # (T,)     all-reference token ids
-    site_tok: torch.Tensor     # (S,)     token index of each site
-    cache_idx: torch.Tensor    # (C,)     unique(site_tok ∪ site_tok-1), sorted
-    pred_row: torch.Tensor     # (S,)     row of (site_tok-1) within cache_idx
+    tok_idx: torch.Tensor      # (K,)     token index of each scored token
+    tok_nsite: torch.Tensor    # (K,)     m — sites in that token; the bits/SNP weight
+    cache_idx: torch.Tensor    # (C,)     unique(tok_idx ∪ tok_idx-1), sorted
+    pred_row: torch.Tensor     # (K,)     row of (tok_idx-1) within cache_idx
     hap_ids: torch.Tensor      # (N, C)   token ids at cached positions
-    hap_allele: torch.Tensor   # (N, S)   True = carries alt
+    hap_target: torch.Tensor   # (N, K)   index of the true candidate, bit b = site b
     hap_count: torch.Tensor    # (N,)     multiplicity within this split
-    cand_ids: torch.Tensor     # (S, 2)   [ref-allele 6-mer, alt-allele 6-mer]
-    has_upstream: torch.Tensor  # (S,)    ≥1 site at a strictly earlier token
+    cand_ids: torch.Tensor     # (K, Q)   candidate 6-mer ids, right-padded
+    cand_mask: torch.Tensor    # (K, Q)   True where a candidate slot is real
+    has_upstream: torch.Tensor  # (K,)    ≥1 scored token strictly earlier
+    site_tok: torch.Tensor     # (S,)     token index per site (non-decreasing)
+    hap_allele: torch.Tensor   # (N, S)   True = carries alt (baselines only)
     site_pos: np.ndarray       # (S,)     genomic positions (for baseline alignment)
 
     @property
     def n_hap(self) -> int:
         return self.hap_ids.shape[0]
+
+    @property
+    def n_site(self) -> int:
+        return int(self.tok_nsite.sum())
 
     def to(self, device) -> "WindowBatch":
         move = lambda t: t.to(device) if isinstance(t, torch.Tensor) else t
@@ -176,8 +193,8 @@ class WindowSource:
         self.snps_by_chrom = snps_by_chrom
         self.partitioner = SNPWindowPartitioner(snps_by_chrom, half_window, buffer)
         self.ref = _RefGenome(fasta_path)
-        self.stats = {"dropped_multisite": 0, "dropped_n_token": 0,
-                      "dropped_ref_mismatch": 0, "sites": 0}
+        self.stats = {"dropped_n_token": 0, "dropped_ref_mismatch": 0,
+                      "dropped_past_window": 0, "sites": 0, "multi_site_tokens": 0}
         # Site accounting is per *window*, not per call — the same window is built
         # once per split (train/val) and again for the baselines, and those repeats
         # must not double-count.
@@ -191,11 +208,11 @@ class WindowSource:
               ) -> WindowBatch | None:
         """One window's batch over ``sample_rows`` (indices into ``self.samples``).
 
-        Returns None if the window has no scoreable site. Sites are dropped when
-        their 6-mer contains N (both candidates would collapse to <oov>), when the
-        VCF REF disagrees with the genome, or when two sites share a 6-mer — the
-        last is a ~0.05% case in rice but needs proper marginalisation at
-        arabidopsis density (see PLAN.md Phase 1).
+        Returns None if the window has no scoreable token. A token is dropped only
+        when its 6-mer contains N (every candidate would collapse to <oov>) or when
+        the VCF REF disagrees with the genome; a token holding several segregating
+        sites is *kept* and scored over its 2**m possible values, which at
+        arabidopsis density is 21% of sites that would otherwise be discarded.
 
         ``shuffle_sites`` is the LD-destroying control: permute each site's
         alleles across accessions *independently*, before deduplication. Every
@@ -215,7 +232,9 @@ class WindowSource:
         ref_ids = tokenize_window(seq)
         n_tok = len(ref_ids)
 
-        # Group sites by the token whose 6-mer contains them.
+        # Group sites by the token whose 6-mer contains them. `snps` is
+        # position-sorted, so each token's member list is too — which is what makes
+        # bit b of a candidate index mean "the b-th site in this token".
         by_token: dict[int, list] = {}
         for snp in snps:
             off = snp.pos - win.start
@@ -225,49 +244,70 @@ class WindowSource:
 
         count = win_idx not in self._counted
         self._counted.add(win_idx)
-        keep = []   # (token, snp, offset-within-6mer)
+        keep = []   # (token, [(snp, offset-within-6mer), ...], reference 6-mer)
         for tok, members in sorted(by_token.items()):
             if count:
                 self.stats["sites"] += len(members)
             if tok >= n_tok:
-                continue
-            if len(members) > 1:                      # multi-site token
                 if count:
-                    self.stats["dropped_multisite"] += len(members)
+                    self.stats["dropped_past_window"] += len(members)
                 continue
-            snp, off = members[0]
             lo = (tok - 1) * KMER
             mer = seq[lo:lo + KMER].ljust(KMER, "A")
             if "N" in mer:
                 if count:
-                    self.stats["dropped_n_token"] += 1
+                    self.stats["dropped_n_token"] += len(members)
                 continue
-            within = off - lo
-            if mer[within] != chr(snp.ref_byte):       # REF vs genome disagreement
-                if count:
-                    self.stats["dropped_ref_mismatch"] += 1
+            sites = []
+            for snp, off in members:
+                within = off - lo
+                if mer[within] != chr(snp.ref_byte):   # REF vs genome disagreement
+                    if count:
+                        self.stats["dropped_ref_mismatch"] += 1
+                    continue
+                sites.append((snp, within))
+            if not sites:
                 continue
-            keep.append((tok, snp, within, mer))
+            if count and len(sites) > 1:
+                self.stats["multi_site_tokens"] += 1
+            keep.append((tok, sites, mer))
         if not keep:
             return None
 
-        site_tok = torch.tensor([k[0] for k in keep], dtype=torch.long)
-        site_pos = np.array([k[1].pos for k in keep], dtype=np.int64)
-        cand = torch.tensor(
-            [[kmer_id(m[:w] + chr(s.ref_byte) + m[w + 1:]),
-              kmer_id(m[:w] + chr(s.alt_byte) + m[w + 1:])]
-             for _, s, w, m in keep], dtype=torch.long)          # (S, 2)
+        tok_idx = torch.tensor([k[0] for k in keep], dtype=torch.long)
+        tok_nsite = torch.tensor([len(k[1]) for k in keep], dtype=torch.long)
+        site_tok = torch.tensor([t for t, sites, _ in keep for _ in sites],
+                                dtype=torch.long)
+        site_pos = np.array([snp.pos for _, sites, _ in keep for snp, _ in sites],
+                            dtype=np.int64)
 
-        # Cached positions: the site tokens, plus the position that predicts each
+        # Candidates: every assignment of ref/alt to the token's m segregating
+        # sites, so the target is just "the token with this haplotype's alleles
+        # filled in". Bit b of the candidate index is the b-th site in the token.
+        # Ragged over tokens (m varies), so right-pad and carry a mask.
+        n_cand = 1 << int(tok_nsite.max())
+        cand = torch.zeros((len(keep), n_cand), dtype=torch.long)
+        cand_mask = torch.zeros((len(keep), n_cand), dtype=torch.bool)
+        for k, (_, sites, mer) in enumerate(keep):
+            for combo in range(1 << len(sites)):
+                chars = list(mer)
+                for b, (snp, within) in enumerate(sites):
+                    chars[within] = chr(snp.alt_byte if (combo >> b) & 1
+                                        else snp.ref_byte)
+                cand[k, combo] = kmer_id("".join(chars))
+                cand_mask[k, combo] = True
+
+        # Cached positions: the scored tokens, plus the position that predicts each
         # of them. unique() also sorts and dedups, which forward() requires.
-        pred_tok = (site_tok - 1).clamp(min=0)
-        cache_idx = torch.unique(torch.cat([site_tok, pred_tok]))
+        pred_tok = (tok_idx - 1).clamp(min=0)
+        cache_idx = torch.unique(torch.cat([tok_idx, pred_tok]))
         row_of = {int(p): i for i, p in enumerate(cache_idx)}
         pred_row = torch.tensor([row_of[int(p)] for p in pred_tok], dtype=torch.long)
 
         # Haplotypes of the requested accessions, deduplicated with counts.
-        alt_flags = np.stack([np.frombuffer(s.gt_alts, dtype=np.uint8)[sample_rows]
-                              for _, s, _, _ in keep], axis=1)    # (n_samples, S)
+        alt_flags = np.stack([np.frombuffer(snp.gt_alts, dtype=np.uint8)[sample_rows]
+                              for _, sites, _ in keep for snp, _ in sites],
+                             axis=1)                              # (n_samples, S)
         if shuffle_sites:
             rng = rng or np.random.default_rng(0)
             alt_flags = np.stack([rng.permutation(col) for col in alt_flags.T], axis=1)
@@ -275,24 +315,39 @@ class WindowSource:
         hap_allele = torch.from_numpy(uniq.astype(bool))          # (N, S)
         hap_count = torch.tensor(counts, dtype=torch.float32)
 
-        # Token ids at cached positions: reference everywhere, then patch the site
-        # tokens with each haplotype's allele.
+        # Per-token target index: pack each token's sites into the candidate index.
+        bit = torch.zeros(len(site_tok), dtype=torch.long)
+        tok_of_site = torch.zeros(len(site_tok), dtype=torch.long)
+        c = 0
+        for k, (_, sites, _) in enumerate(keep):
+            for b in range(len(sites)):
+                bit[c], tok_of_site[c] = b, k
+                c += 1
+        hap_target = torch.zeros((len(uniq), len(keep)), dtype=torch.long)
+        hap_target.index_add_(1, tok_of_site,
+                              hap_allele.long() << bit.unsqueeze(0))   # (N, K)
+
+        # Token ids at cached positions: reference everywhere, then patch the
+        # scored tokens with each haplotype's candidate.
         base = torch.tensor(ref_ids, dtype=torch.long)
         hap_ids = base.index_select(0, cache_idx).unsqueeze(0).repeat(len(uniq), 1)
-        site_row = torch.tensor([row_of[int(t)] for t in site_tok], dtype=torch.long)
-        hap_ids[:, site_row] = torch.gather(
-            cand.T.unsqueeze(0).expand(len(uniq), 2, len(keep)), 1,
-            hap_allele.long().unsqueeze(1)).squeeze(1)
+        tok_row = torch.tensor([row_of[int(t)] for t in tok_idx], dtype=torch.long)
+        hap_ids[:, tok_row] = torch.gather(
+            cand.unsqueeze(0).expand(len(uniq), *cand.shape), 2,
+            hap_target.unsqueeze(-1)).squeeze(-1)
 
-        # A site has upstream context iff another site sits at a strictly earlier
-        # token — same-token sites are not visible to the predictor at site_tok-1.
-        has_up = torch.tensor([bool((site_tok < t).any()) for t in site_tok])
+        # A token has upstream context iff another scored token sits strictly
+        # earlier. Sites sharing a token are predicted jointly, not sequentially,
+        # so they give each other no context — which is exactly why this is a
+        # per-token property.
+        has_up = torch.arange(len(keep)) > 0
 
         return WindowBatch(
-            chrom=win.chrom, start=win.start, ref_ids=base, site_tok=site_tok,
-            cache_idx=cache_idx, pred_row=pred_row, hap_ids=hap_ids,
-            hap_allele=hap_allele, hap_count=hap_count, cand_ids=cand,
-            has_upstream=has_up, site_pos=site_pos)
+            chrom=win.chrom, start=win.start, ref_ids=base, tok_idx=tok_idx,
+            tok_nsite=tok_nsite, cache_idx=cache_idx, pred_row=pred_row,
+            hap_ids=hap_ids, hap_target=hap_target, hap_count=hap_count,
+            cand_ids=cand, cand_mask=cand_mask, has_upstream=has_up,
+            site_tok=site_tok, hap_allele=hap_allele, site_pos=site_pos)
 
     def verify(self, tokenizer, win_idx: int = 0) -> None:
         win = self.partitioner.windows[win_idx]

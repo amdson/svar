@@ -49,10 +49,14 @@ def markov_probs(train_alleles: np.ndarray, site_tok: np.ndarray,
     the caller falls back to B1, exactly as the model must).
     """
     S = train_alleles.shape[1]
-    # `WindowSource.build` emits sites in token order, one per token (multi-site
-    # tokens are dropped), so the nearest strictly-upstream site is just j-1.
-    if S > 1 and not np.all(np.diff(site_tok) > 0):
-        raise ValueError("site_tok must be strictly increasing")
+    # `WindowSource.build` emits sites in genomic order, so the nearest upstream
+    # site is j-1. Tokens holding several segregating sites make `site_tok`
+    # non-decreasing rather than strictly increasing, and for those the upstream
+    # site is a co-token neighbour. That is deliberate: the model scores such a
+    # token jointly and so sees the same within-token correlation, and B2 exists
+    # to bound the headroom, which means giving it the same information.
+    if S > 1 and not np.all(np.diff(site_tok) >= 0):
+        raise ValueError("site_tok must be non-decreasing (genomic order)")
     upstream = np.arange(-1, S - 1, dtype=np.int64)
 
     table = np.zeros((S, 2), dtype=np.float64)

@@ -91,12 +91,19 @@ With λ = 6/D expected SNPs per 6-mer token:
 | 0.05 | 74 | 0.08 | 7.8% | 4.0% | ~0.15 |
 | LD-pruned | 200 | 0.03 | 3.0% | 1.5% | ~0.06 |
 
-In rice this was 0.05% and BENCHMARK.md §5 says "drop them". Here that would discard
-~9% of sites and bias the evaluation toward isolated SNPs — exactly the regime where
-the cache is most accurate, i.e. it would flatter the result. **Implement the
-per-haplotype candidate construction instead** (`cand_ids → (N, S, 2)`, holding the
-other sites in the token at that haplotype's true alleles and flipping only the focal
-one). It is ~10 lines and removes the bias.
+In rice this was 0.05%. **Measured** on chr4 at hw=500 (3,000 windows, 35,611
+SNP-bearing tokens): 10.12% of tokens hold 2 sites, 0.93% hold 3, 0.06% hold 4,
+0.01% hold 5 — **20.8% of sites**, not the ~9% predicted above. Dropping them would
+bias the evaluation toward isolated SNPs, exactly the regime where the cache is most
+accurate, i.e. it would flatter the result.
+
+**Score the token jointly** — enumerate its 2^m candidate 6-mers and make the
+autoregressive target the one carrying the haplotype's alleles at all m sites.
+Implemented; see BENCHMARK.md §5, which also records why the earlier proposal here
+(flip the focal site, pin its co-token neighbours to their true alleles) was wrong:
+it is a pseudo-likelihood rather than a chain-rule factorization, and it leaks a
+neighbouring allele 1–5 bp away that B1 never sees. Max m observed is 5, so at most
+32 candidates against a 4096 vocab — one wider `gather`.
 
 ### Missing calls — a mask is now mandatory
 `GENO=0.2` admits variants with up to 20% missing genotypes, and
@@ -185,7 +192,7 @@ new versus changed.
 |---|---|---|---|
 | 1 | `crop_embed/data/vcf.py` | **change** | missing mask on `SNPRecord` (Phase 1) |
 | 2 | `training/common/splits.py` | **change** | genotype-only split path (Phase 2) |
-| 3 | `variant_ll/data.py` | new | `WindowBatch`; chromosome subsetting; window sampling; per-haplotype candidates |
+| 3 | `variant_ll/data.py` | new | `WindowBatch`; chromosome subsetting; window sampling; joint per-token candidates |
 | 4 | `variant_ll/baselines.py` | new | B0/B1/B2 + NN-haplotype copying |
 | 5 | `variant_ll/loss.py` | new | `window_nll`, cache + exact backends |
 | 6 | `CARBON_modules/variant_cache_layers.py` | **change** | `--ckpt-reference` flag on `forward_reference` (BENCHMARK.md §8a; §8b already landed in `dc46caa`) |

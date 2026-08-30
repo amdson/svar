@@ -59,27 +59,36 @@ For each SNP site *j* in a window and each individual *i*:
 loss_ij = -log2 P(allele_ij | reference window, alleles at sites < j for individual i)
 ```
 
-**Renormalize over two candidates.** Carbon's DNA mode is a fixed contiguous 6-mer
-split, so the token containing site *j* is a 6-mer whose other five bases are shared
-between the two alleles. Score the model by restricting its 4096-way token
-distribution to the two candidate 6-mers and renormalizing:
+**Renormalize over the token's candidates.** Carbon's DNA mode is a fixed
+contiguous 6-mer split, so the token containing site *j* is a 6-mer whose
+non-segregating bases are shared across alleles. Score the model by restricting its
+4096-way token distribution to the 6-mers reachable by varying that token's
+segregating sites, and renormalizing. The autoregressive target is just the 6-mer
+with this haplotype's alleles filled in:
 
 ```
-z_ref = logits[pred_row, id6(kmer with REF allele at j)]
-z_alt = logits[pred_row, id6(kmer with ALT allele at j)]
-logp  = (z_ref, z_alt) - logsumexp(z_ref, z_alt)
+cand   = [id6(kmer with allele assignment c at the token's m sites)
+          for c in range(2**m)]
+logp   = logits[pred_row, cand] - logsumexp(logits[pred_row, cand])
+target = sum(allele[b] << b for b in range(m))     # the true assignment
 ```
+
+For the usual *m* = 1 that is the two-candidate REF/ALT case. See "Multi-SNP
+tokens" in §5 for why *m* > 1 must be scored jointly like this.
 
 This is not a convenience — it is what makes the comparison fair. Without it the LM
-must spread mass over 4096 tokens while B1 puts all its mass on two, and it also
-must "pay" for the five flanking bases the baseline gets free. Renormalizing cancels
-both, leaves a clean 2-class problem, and makes the units **bits per SNP**, directly
-comparable to B1.
+must spread mass over 4096 tokens while B1 puts all its mass on the alleles, and it
+also must "pay" for the token's non-segregating bases that the baseline gets free.
+Renormalizing cancels both, leaves a clean 2^m-class problem, and makes the units
+**bits per SNP**, directly comparable to B1.
 
-**The sum is a real haplotype log-likelihood.** Sites are scored left-to-right, each
-conditioned on the true upstream alleles, so `Σ_j loss_ij` is a chain-rule
-factorization of `P(haplotype_i | reference)`. B1's `Σ_j H(p_j)` is the same quantity
-under an independent-sites model. They are on the same scale by construction.
+**The sum is a real haplotype log-likelihood.** Tokens are scored left-to-right,
+each conditioned on the true upstream alleles, so `Σ loss` is a chain-rule
+factorization of `P(haplotype_i | reference)` — a token carrying *m* sites
+contributes their joint, which is exactly their chain-rule product. B1's
+`Σ_j H(p_j)` is the same quantity under an independent-sites model. They are on the
+same scale by construction. Divide by the *site* count, not the token count, to keep
+the unit **bits per SNP**.
 
 **Positions in the cache.** For every SNP token position `p` in the window:
 
@@ -197,12 +206,14 @@ class WindowBatch:
     site_tok:    LongTensor   # (S,)      1 + (pos - w_start) // 6   (see _build_snp_mask_kmer)
     pred_row:    LongTensor   # (S,)      row of (site_tok - 1) within cache_idx
     cache_idx:   LongTensor   # (C,)      unique(site_tok ∪ site_tok-1), sorted
-    cand_ids:    LongTensor   # (S, 2)    [ref-allele 6-mer id, alt-allele 6-mer id]
+    cand_ids:    LongTensor   # (K, Q)    candidate 6-mer ids per token, right-padded
+    cand_mask:   BoolTensor   # (K, Q)    real candidate slots (Q = 2**max m)
+    tok_nsite:   LongTensor   # (K,)      m — sites in the token; the bits/SNP weight
     hap_ids:     LongTensor   # (N, C)    token ids at cache positions per haplotype
-    hap_allele:  BoolTensor   # (N, S)    1 = carries alt
+    hap_target:  LongTensor   # (N, K)    index of the true candidate, bit b = site b
+    hap_allele:  BoolTensor   # (N, S)    1 = carries alt (baselines only)
     hap_count:   FloatTensor  # (N,)      multiplicity within this split
-    single_site: BoolTensor   # (S,)      token contains exactly one segregating site
-    has_upstream: BoolTensor  # (S,)      ≥1 SNP earlier in this window  → the key diagnostic slice
+    has_upstream: BoolTensor  # (K,)      ≥1 SNP token earlier in this window  → the key diagnostic slice
 ```
 
 Build it from machinery that already exists:
@@ -246,11 +257,26 @@ dropped. Windows near a chromosome edge get `N`-padding from `extract_sequence`;
 because `SNPWindowPartitioner` centres each window on its first SNP, no site token
 ever lands at index 0 or 1, so the `<dna>` marker is never a predictor in practice.
 
-**Multi-SNP tokens.** When two segregating sites share a 6-mer the two-candidate
-scheme becomes 2^m candidates. In rice this is ~0.05% of sites: mark them
-`single_site=False`, exclude from the primary metric, report the count. (For dense
-data — arabidopsis — extend `cand_ids` to `(N, S, 2)` by holding the *other* sites in
-the token at that haplotype's true alleles and flipping only the focal one.)
+**Multi-SNP tokens — score the token jointly.** When *m* segregating sites share a
+6-mer, enumerate all 2^m candidate 6-mers and make the target the one carrying the
+haplotype's alleles at all *m*. Rice sees this at ~0.05% of sites; arabidopsis chr4
+at hw=500 sees **20.8%** — 10.1% of SNP-bearing tokens hold 2 sites, 0.9% hold 3,
+max observed 5, so at most 32 candidates out of a 4096 vocab: one wider `gather`.
+
+An earlier draft of this file proposed instead scoring each site with its co-token
+neighbours pinned to that haplotype's *true* alleles — `cand_ids → (N, S, 2)`,
+flipping only the focal site. **Do not do that.** It scores
+`P(s_j | s_other = true, upstream)`, a pseudo-likelihood whose terms do not compose
+into a joint, so `Σ loss` stops being `log P(haplotype)` and the comparison to B1's
+`Σ_j H(p_j)` quietly loses its footing. It also hands the model the true allele at a
+site 1–5 bp away — about the strongest LD anywhere in the genome — that B1 gets
+nothing of, so it would flatter the model on exactly the sites it was introduced to
+rescue.
+
+The joint has neither problem: it is the exact chain-rule contribution of those *m*
+sites and conditions only on strictly upstream tokens. It also needs no per-site
+decomposition for the diagnostics, since `has_upstream` is a property of the token —
+sites sharing a token are predicted simultaneously and give each other no context.
 
 ---
 
@@ -271,10 +297,12 @@ def window_nll(model, batch, backend="cache", chunk=32):
         alt_ids[:, batch.cache_idx] = batch.hap_ids
         logits = model(input_ids=alt_ids).logits.index_select(1, batch.site_tok - 1)
 
-    pair = logits.gather(-1, batch.cand_ids.expand(N, S, 2))     # (N, S, 2)
-    logp = torch.log_softmax(pair.float(), dim=-1) / math.log(2) # bits
-    nll  = -logp.gather(-1, batch.hap_allele.long().unsqueeze(-1)).squeeze(-1)
-    return (nll * batch.hap_count[:, None]).sum(), batch.hap_count.sum() * S
+    sel  = logits.gather(-1, batch.cand_ids.expand(N, K, Q))     # (N, K, Q)
+    sel  = sel.float().masked_fill(~batch.cand_mask, -inf)       # ragged over m
+    logp = torch.log_softmax(sel, dim=-1) / math.log(2)          # bits
+    nll  = -logp.gather(-1, batch.hap_target.unsqueeze(-1)).squeeze(-1)
+    w    = batch.hap_count[:, None] * batch.tok_nsite[None, :]   # bits per *SNP*
+    return (nll * w).sum(), w.sum()
 ```
 
 Both backends consume the identical `cand_ids` / `hap_allele`, so their bits/SNP are

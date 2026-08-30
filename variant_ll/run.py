@@ -95,14 +95,17 @@ def main() -> int:
 
     tr_batches = build_batches(src, win_ids, tr_rows)
     va_batches = build_batches(src, win_ids, va_rows)
-    n_sites = sum(len(b.site_tok) for b in va_batches)
+    n_sites = sum(b.n_site for b in va_batches)
+    n_tokens = sum(len(b.tok_idx) for b in va_batches)
     n_tok = int(np.mean([len(b.ref_ids) for b in va_batches]))
     print(f"  train {len(tr_rows)} acc / val {len(va_rows)} acc | "
-          f"{len(va_batches)} scoreable windows, {n_sites} sites, "
-          f"~{n_tok} tokens/window")
+          f"{len(va_batches)} scoreable windows, {n_sites} sites in "
+          f"{n_tokens} scored tokens, ~{n_tok} tokens/window")
     print(f"  site accounting: {src.stats}")
-    up_frac = np.mean(np.concatenate(
-        [b.has_upstream.numpy() for b in va_batches])) if va_batches else 0.0
+    up_frac = (np.average(
+        np.concatenate([b.has_upstream.numpy() for b in va_batches]),
+        weights=np.concatenate([b.tok_nsite.numpy() for b in va_batches]))
+        if va_batches else 0.0)
     print(f"  sites with upstream context: {100*up_frac:.1f}%")
     if not va_batches:
         print("No scoreable windows — nothing to do."); return 1
@@ -168,9 +171,8 @@ def main() -> int:
             run_bits, run_n = 0.0, 0.0
             for step, i in enumerate(order):
                 opt.zero_grad(set_to_none=True)
-                bits, counts = loss.window_bits(model, tr_dev[i], "cache",
-                                                args.hap_chunk)
-                w = counts.unsqueeze(1).expand_as(bits)
+                bits, w = loss.window_bits(model, tr_dev[i], "cache",
+                                           args.hap_chunk)
                 l = (bits * w).sum() / w.sum()
                 l.backward()
                 opt.step()
