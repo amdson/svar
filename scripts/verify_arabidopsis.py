@@ -68,8 +68,16 @@ def main() -> int:
     if not all_present:
         print("\nmissing inputs — run: cd datasets/arabidopsis && make")
         return 1
-    check("VCF tabix index exists", Path(spec.vcf_path + ".tbi").exists(),
-          "pysam .fetch() needs it on a bgzipped VCF")
+    # The Makefile emits a bgzipped VCF (+ .tbi), but an older build may have left
+    # a plain one, and `variant_ll` prefers plain anyway — that is the only form the
+    # polars reader takes. Only a bgzipped VCF needs the index.
+    bgzipped = spec.vcf_path.endswith((".gz", ".bgz"))
+    if bgzipped:
+        check("VCF tabix index exists", Path(spec.vcf_path + ".tbi").exists(),
+              "pysam .fetch() needs it on a bgzipped VCF")
+    else:
+        check("VCF is plain text (no tabix index needed)", True,
+              "polars path reads it directly; bcftools streams with -t")
 
     # ── 2. panel shape ───────────────────────────────────────────────────────
     print("\n2. panel shape")
@@ -102,9 +110,12 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         slice_vcf = str(Path(td) / "slice.vcf.gz")
         sub = ",".join(samples[:SLICE_SAMPLES])
-        r = conda_run("bcftools", "view", "-r", SLICE_REGION, "-s", sub,
+        # -r seeks via the tabix index; -t streams and filters. A plain VCF has no
+        # index, so it has to take the streaming form (slower, but correct).
+        region_flag = "-r" if bgzipped else "-t"
+        r = conda_run("bcftools", "view", region_flag, SLICE_REGION, "-s", sub,
                       "-Oz", "-o", slice_vcf, spec.vcf_path)
-        if not check("bcftools can fetch a region (tabix index works)",
+        if not check(f"bcftools can subset the region ({region_flag})",
                      r.returncode == 0, (r.stderr or "").strip()[-200:]):
             return 1
         conda_run("bcftools", "index", "-t", slice_vcf)

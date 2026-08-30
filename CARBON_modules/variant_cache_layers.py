@@ -56,6 +56,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 
 from .carbon_layers import (CarbonDecoderLayer, CarbonRMSNorm,
                             CarbonRotaryEmbedding, apply_rotary_pos_emb,
@@ -102,6 +103,11 @@ class VariantCacheCarbonEncoder(nn.Module):
         self.norm = CarbonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = CarbonRotaryEmbedding(config=config)
 
+        # Recompute the reference stream's layer activations in the backward pass
+        # instead of storing them. Off by default (inference never needs it); set
+        # by the trainer. See `forward_reference`.
+        self.reference_checkpointing = False
+
     # ------------------------------------------------------------------ #
     # Reference pass: cache the (pre-norm) residual stream entering each   #
     # layer. That cached input is the K/V source the variant update        #
@@ -123,12 +129,28 @@ class VariantCacheCarbonEncoder(nn.Module):
         causal_mask = build_causal_mask(
             attention_mask.reshape(1, ref_seqlen), (1, ref_seqlen), dtype, device)
 
+        ckpt = self.reference_checkpointing and torch.is_grad_enabled()
+
         layer_inputs: List[torch.Tensor] = []
         for layer_module in self.layers:
             layer_inputs.append(hidden)  # pre-norm input entering this layer
-            hidden = layer_module(hidden,
-                                  position_embeddings=(cos, sin),
-                                  attention_mask=causal_mask)
+            if ckpt:
+                # `eager_attention_forward` saves, per layer, a (1, h, T, T) score
+                # tensor plus a float32 softmax copy — at T=3334 over 28 layers that
+                # is ~30 GB and it is the whole reason a grad-enabled reference pass
+                # blows up. Recomputing the layer costs ~1.4x time and is exact.
+                #
+                # use_reentrant=False so this composes with the ordinary autograd
+                # graph the variant branch builds on top of `layer_inputs`.
+                hidden = torch.utils.checkpoint.checkpoint(
+                    layer_module, hidden,
+                    position_embeddings=(cos, sin),
+                    attention_mask=causal_mask,
+                    use_reentrant=False)
+            else:
+                hidden = layer_module(hidden,
+                                      position_embeddings=(cos, sin),
+                                      attention_mask=causal_mask)
         return layer_inputs
 
     @staticmethod

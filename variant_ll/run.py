@@ -52,6 +52,10 @@ def main() -> int:
     p.add_argument("--half-window", type=int, default=500)
     p.add_argument("--buffer", type=int, default=0)
     p.add_argument("--chrom", type=int, nargs="*", default=[1])
+    p.add_argument("--vcf-engine", choices=["auto", "polars", "pysam"], default="auto",
+                   help="VCF reader. 'auto' takes the vectorized polars path for a "
+                        "plain .vcf and pysam for a bgzipped one; polars is ~100x "
+                        "faster and is what the arabidopsis build needs.")
     p.add_argument("--windows", type=int, default=200,
                    help="Number of windows to sample (the chromosome is the frame).")
     p.add_argument("--seed", type=int, default=42)
@@ -59,6 +63,10 @@ def main() -> int:
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--hap-chunk", type=int, default=64)
     p.add_argument("--precision", choices=["fp32", "bf16"], default="fp32")
+    p.add_argument("--ckpt-reference", action="store_true",
+                   help="Gradient-checkpoint the frozen-reference forward. Exact, "
+                        "~1.4x slower, and the difference between fitting and OOM "
+                        "once the window is a few thousand tokens (BENCHMARK.md 8a).")
     p.add_argument("--exact", action="store_true",
                    help="Also score the exact full-forward control.")
     p.add_argument("--permute", action="store_true",
@@ -75,7 +83,8 @@ def main() -> int:
     # ── Windows ───────────────────────────────────────────────────────────────
     t0 = time.time()
     print(f"Loading {args.dataset} VCF (chrom {args.chrom}) …")
-    src = WindowSource(vcf_path, fasta_path, args.half_window, args.buffer, args.chrom)
+    src = WindowSource(vcf_path, fasta_path, args.half_window, args.buffer,
+                       args.chrom, engine=args.vcf_engine)
     print(f"  {len(src.samples)} accessions, {len(src)} windows "
           f"(hw={args.half_window}) in {time.time()-t0:.0f}s")
 
@@ -122,6 +131,7 @@ def main() -> int:
     print(f"\nLoading Carbon on {device} ({dtype}) …")
     model, tokenizer = load_carbon_variant_cache(args.model_path, device=device,
                                                  dtype=dtype, backend="efficient")
+    model.encoder.reference_checkpointing = args.ckpt_reference
     src.verify(tokenizer)          # analytic tokenization == the real tokenizer
     print("  tokenization verified against the tokenizer")
 
@@ -164,7 +174,7 @@ def main() -> int:
                 l = (bits * w).sum() / w.sum()
                 l.backward()
                 opt.step()
-                run_bits += float((bits * w).sum()); run_n += float(w.sum())
+                run_bits += float((bits * w).sum().detach()); run_n += float(w.sum())
                 if step % 50 == 0 and step:
                     print(f"    epoch {epoch} step {step}/{len(order)}  "
                           f"train {run_bits/run_n:.4f} bits/SNP")
@@ -175,15 +185,22 @@ def main() -> int:
             results[f"ft_epoch{epoch}"] = ft
 
     # ── Mechanism control ─────────────────────────────────────────────────────
+    # Compare against the *current* model's intact score, not the zero-shot one:
+    # after fine-tuning those are different models, and pairing a fine-tuned
+    # permuted number with a zero-shot intact number reads as a large degradation
+    # that is really just the fine-tuning.
     if args.permute:
         perm = build_batches(src, win_ids, va_rows, shuffle_sites=True,
                              seed=args.seed)
         pm = loss.evaluate(model, [b.to(device) for b in perm], "cache",
                            args.hap_chunk)
+        intact = results[f"ft_epoch{args.epochs - 1}"] if args.epochs else zs
+        stage = f"after {args.epochs} epoch(s)" if args.epochs else "zero-shot"
         print(f"\n  LD-destroyed control      {pm['all_bits']:.4f} bits/SNP  "
-              f"(vs {zs['all_bits']:.4f} intact; a model using haplotype "
-              f"context should get worse)")
+              f"(vs {intact['all_bits']:.4f} intact, same model, {stage}; "
+              f"a model using haplotype context should get worse)")
         results["permuted"] = pm
+        results["permuted_vs"] = stage
 
     if args.output:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)

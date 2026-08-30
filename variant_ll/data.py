@@ -28,7 +28,6 @@ import numpy as np
 import torch
 from pyfaidx import Fasta
 
-from crop_embed.data.vcf import load_snps_from_vcf
 from crop_embed.partitioner import SNPWindowPartitioner
 
 KMER = 6
@@ -109,6 +108,33 @@ class WindowBatch:
         return WindowBatch(**{k: move(v) for k, v in self.__dict__.items()})
 
 
+def load_vcf(vcf_path: str, chroms: list[int] | None = None,
+             engine: str = "auto") -> tuple[dict, list[str]]:
+    """Read a VCF into ``({chrom: [SNPRecord]}, samples)``, chromosome-filtered.
+
+    ``engine="polars"`` uses `crop_embed.data.vcf_polars`, which parses the whole
+    file in one vectorized Rust pass; on the arabidopsis 1001G export (10 GB, 2.3M
+    SNPs x 1,135 accessions) that is the difference between a minute and most of an
+    hour, so it is what any large-VCF read here should use. It only handles plain
+    text, so ``"auto"`` (the default) takes it for a ``.vcf`` and falls back to
+    pysam for a ``.vcf.gz`` / ``.bcf``. Both push ``chroms`` down to the record
+    loop, which for a single chromosome is most of the remaining cost.
+    """
+    if engine == "auto":
+        engine = "pysam" if vcf_path.endswith((".gz", ".bgz", ".bcf")) else "polars"
+    keep = set(chroms) if chroms is not None else None
+    if engine == "polars":
+        from crop_embed.data.vcf_polars import load_snps_from_vcf as _load
+    elif engine == "pysam":
+        from crop_embed.data.vcf import load_snps_from_vcf as _load
+    else:
+        raise ValueError(f"unknown VCF engine {engine!r} (want polars/pysam/auto)")
+    snps_by_chrom, samples = _load(vcf_path, None, keep)
+    if keep is not None:                       # defensive: engine honours it already
+        snps_by_chrom = {c: v for c, v in snps_by_chrom.items() if c in keep}
+    return snps_by_chrom, samples
+
+
 class _RefGenome:
     """Chromosome bytearrays with the same window semantics as
     `UniqueWindowDataset.extract_sequence`: clip to the chromosome, then pad the
@@ -137,15 +163,16 @@ class WindowSource:
     """Builds `WindowBatch`es from a VCF + reference FASTA.
 
     ``chroms`` restricts to a subset of chromosomes (the plan's "one chromosome"
-    training set); ``samples`` restricts the accessions whose haplotypes are
-    collected, which is how the train/val split is applied.
+    training set); ``sample_rows`` in :meth:`build` restricts the accessions whose
+    haplotypes are collected, which is how the train/val split is applied.
+    ``engine`` selects the VCF reader — see :func:`load_vcf`; the default picks
+    the fast polars path for any plain-text VCF.
     """
 
     def __init__(self, vcf_path: str, fasta_path: str, half_window: int,
-                 buffer: int = 0, chroms: list[int] | None = None):
-        snps_by_chrom, self.samples = load_snps_from_vcf(vcf_path, None)
-        if chroms is not None:
-            snps_by_chrom = {c: snps_by_chrom[c] for c in chroms if c in snps_by_chrom}
+                 buffer: int = 0, chroms: list[int] | None = None,
+                 engine: str = "auto"):
+        snps_by_chrom, self.samples = load_vcf(vcf_path, chroms, engine)
         self.snps_by_chrom = snps_by_chrom
         self.partitioner = SNPWindowPartitioner(snps_by_chrom, half_window, buffer)
         self.ref = _RefGenome(fasta_path)
