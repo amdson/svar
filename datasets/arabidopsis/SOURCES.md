@@ -32,7 +32,16 @@ Because the genotypes are already a VCF in the target assembly, arabidopsis need
 
 ## Build pipeline
 
-`make` runs (output `$(DATA_ROOT)/arabidopsis/arabidopsis_1001g_final.vcf` + `.pgen`):
+`make` runs (output `$(DATA_ROOT)/arabidopsis/arabidopsis_1001g_final.vcf.gz`
++ `.vcf.gz.tbi` + `.pgen`):
+
+> **All VCFs in this build are bgzipped.** Uncompressed, the biallelic-SNP
+> intermediate is ~50 GB and the final export ~16 GB (≈11 M SNPs × 1,135 samples of
+> `0/0<tab>` text); bgzip cuts each roughly 10x. Both consumers read it natively —
+> plink2 accepts a bgzipped `--vcf`, and `crop_embed`'s loader is pysam-based
+> ("plain or bgzipped", `crop_embed/dataset.py`). The final VCF also gets a tabix
+> index so pysam can fetch a region instead of streaming the whole file.
+> `training/common/datasets.py` resolves either `.vcf` or `.vcf.gz`.
 
 1. **biallelic-SNP filter** — `bcftools view -t 1,2,3,4,5 --types snps
    --min-alleles 2 --max-alleles 2`. Restricts to the 5 nuclear chromosomes and
@@ -101,6 +110,7 @@ AraPheno table to genotyped accessions and emitting three views:
 
 | Output | Shape | Use |
 |--------|-------|-----|
+| `arabidopsis_pheno_aligned.csv` | one row per genotyped accession, `.psam` order (1,135 rows) × trait columns named `p<phenotype_id>`, plus a `matched` flag | **What the training pipeline reads.** `training/common/features.py` does `read_csv(...).set_index("IID")` and reindexes onto the sample list, so it needs a *unique* IID key — which the `(IID, rep)` matrix below cannot provide. Replicates are therefore **averaged** here. Columns are ids, not names, because AraPheno names contain commas and sweep configs pass trait sets as comma-joined strings; look ids up in the coverage table. Restricted to traits covering ≥ `--aligned-min-genotyped` accessions (default 100) so `traits=all` stays meaningful. |
 | `arabidopsis_pheno_matrix.csv` | rows keyed `(IID, rep)` in `.psam` order × cols = ~536 phenotype ids | the "one big matrix" — Y for modelling. Replicates kept on **separate rows** (never averaged): within each (accession, trait) the k values fill rows 0..k-1, so an accession spans as many rows as its most-replicated trait (~3,900 rows total). For a trait, select its column and `dropna`. **Sparse** — most cells NaN. |
 | `arabidopsis_pheno_long.csv` | tidy: `IID, phenotype_id, phenotype_name, study, value` (replicates kept) | filter to one trait without carrying a mostly-empty matrix. |
 | `arabidopsis_pheno_coverage.csv` | per phenotype: `phenotype_id, name, study, n_genotyped, n_values`, sorted by coverage | pick well-powered traits — `n_genotyped` is the real per-GWAS sample size (median ~a few hundred). |
