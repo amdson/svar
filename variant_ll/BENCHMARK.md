@@ -445,6 +445,58 @@ broadcast was already free (N=256: 4.04 GiB before and after).
 large haplotype count can't blow up. With the fix the chunk can be much larger; hoist
 the reference forward out of the chunk loop so it runs once per window.
 
+### 8c. Train in fp32 — bf16 silently caps the result at the baseline
+
+**This is the single most consequential setting in the file.** Measured on
+arabidopsis chr4, 20 windows / 262 sites / 867 haplotypes, trained and scored on
+the *same* accessions (pure fitting, no generalisation), lr 1e-4 cosine, in-sample
+B1 = 0.408 bits/SNP:
+
+| step | bf16 | fp32 |
+|---:|---:|---:|
+| 500 | 0.4269 | 0.4138 |
+| 1000 | 0.3985 | 0.3387 |
+| 1500 | **0.3946** | **0.3026** |
+
+bf16 flattens *at the baseline* and stays there; fp32 goes 0.106 bits below it and
+is still descending at 1500 steps. The gap opens late (0.013 at step 500, 0.094 at
+step 1500), which is the signature of bf16 rounding away small updates once
+gradients shrink: AdamW's update here is ~1e-2 relative to weight magnitude,
+against bf16's relative epsilon of 3.9e-3.
+
+The trap is that the bf16 curve looks like a converged, legitimate null result —
+"the model learns per-site marginals and nothing else", BENCHMARK's own §7
+"ties B1" row. It is an optimizer artifact. Torch's AdamW keeps its moments in the
+parameter dtype, so bf16 parameters mean bf16 optimizer state and no fp32 master
+weights anywhere.
+
+fp32 costs ~1.7x wall-clock (828 s vs 475 s for 1500 steps at T=168) and more
+memory — note `logits` is `(N, C, vocab)` and vocab is ~152k, so at N=128 and
+C~40 that single tensor is 3.1 GB in fp32 and will OOM a 48 GB card in backward;
+`--hap-chunk 32` is the fix. Proper mixed precision (fp32 master weights + bf16
+autocast) would recover the speed and is the right thing to build; until then, run
+fp32 and treat any bf16 number as a lower bound.
+
+### 8d. What the frozen-reference approximation actually costs — measured
+
+Same 20 windows, same fp32 recipe, cache backend vs the exact full forward
+(BENCHMARK §7's control):
+
+| | bits/SNP (in-sample) | margin vs B1 |
+|---|---:|---:|
+| in-sample B1 | 0.4080 | — |
+| **cache** | **0.3024** | −0.106 |
+| **exact forward** | **0.2599** | −0.148 |
+
+The approximation costs 0.043 bits/SNP — 29% of the achievable margin — and keeps
+72% of it. Both beat B1, which is the decision matrix's "better / better" cell:
+the cache is viable, and it is not the thing to fix first. (Curves crossed twice
+en route — exact was *behind* the cache through step 900 before overtaking — so
+compare converged numbers, not intermediate ones.)
+
+These are in-sample numbers: they establish that the mechanism passes real
+individual-specific information, not that it generalises to held-out accessions.
+
 ### Practical training envelope
 
 `half_window=10000`, bf16, checkpointed reference, N chunked at 32: ~1.0 s per window
