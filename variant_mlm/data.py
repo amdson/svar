@@ -44,6 +44,7 @@ def build_variant_window_dataset(
     buffer: int = 0,
     samples: list[str] | None = None,
     variant_only: bool = True,
+    engine: str = "pysam",
 ) -> tuple[UniqueWindowDataset, list[int]]:
     """Build the unique-window dataset and the indices to train/eval on.
 
@@ -54,11 +55,16 @@ def build_variant_window_dataset(
               ``variant_only`` (default), restricted to windows with >=1 alt
               allele (the only ones that produce a variant-MLM target).
     """
-    snps_by_chrom, _ = load_snps_from_vcf(vcf_path, samples)
+    if engine == "polars":
+        from crop_embed.data.vcf_polars import load_snps_from_vcf as _load_snps_from_vcf
+    else:
+        _load_snps_from_vcf = load_snps_from_vcf
+    snps_by_chrom, _ = _load_snps_from_vcf(vcf_path, samples)
     partitioner = SNPWindowPartitioner(
         snps_by_chrom, half_window=half_window, buffer=buffer
     )
-    dataset = UniqueWindowDataset(vcf_path, fasta_path, partitioner, samples=samples)
+    dataset = UniqueWindowDataset(
+        vcf_path, fasta_path, partitioner, samples=samples, engine=engine)
 
     if variant_only:
         indices = [

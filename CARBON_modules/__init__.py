@@ -14,11 +14,16 @@ backbone (analogue of `DNABERT2_modules/bert_layers.py`); use `load_carbon_local
 to materialize the checkpoint in it.
 """
 from .loader import (load_carbon, load_carbon_lm, load_carbon_local,
-                     load_carbon_variant_cache)
+                     load_carbon_variant_cache, load_carbon_variant_lora)
 from .carbon_layers import CarbonForCausalLM, CarbonModel
 from .variant_cache_layers import (VariantCacheCarbonEncoder,
                                    VariantCacheCarbonForCausalLM)
+from .variant_lora_layers import (LoRAConfig, ReferenceCache,
+                                  VariantLoRACarbonEncoder,
+                                  VariantLoRACarbonForCausalLM)
 
 __all__ = ["load_carbon", "load_carbon_lm", "load_carbon_local",
            "load_carbon_variant_cache", "CarbonForCausalLM", "CarbonModel",
-           "VariantCacheCarbonEncoder", "VariantCacheCarbonForCausalLM"]
+           "VariantCacheCarbonEncoder", "VariantCacheCarbonForCausalLM",
+           "load_carbon_variant_lora", "LoRAConfig", "ReferenceCache",
+           "VariantLoRACarbonEncoder", "VariantLoRACarbonForCausalLM"]

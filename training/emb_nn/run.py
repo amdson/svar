@@ -60,6 +60,32 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Preprocess: reduce the pooled per-sample embeddings to N dims with "
                         "TruncatedSVD fit on TRAIN only (like the SNP pipeline), before the "
                         "standardizer + head. Fixed/unsupervised (cf. the learnable --bottleneck-dim).")
+    p.add_argument("--fuse-svd", type=int, default=None,
+                   help="Late-fuse GBLUP: concat the top-N TruncatedSVD components of the SNP "
+                        "genotype matrix (fit on TRAIN only, then z-scored on TRAIN) onto the "
+                        "pooled per-sample embedding before the head. The cheapest test of "
+                        "whether the embeddings carry signal ORTHOGONAL to the SNP-SVD baseline: "
+                        "the fused input literally contains that baseline as a subspace, so the "
+                        "head can only add to it. --head mlp/linear only.")
+    p.add_argument("--fuse-svd-only", action="store_true",
+                   help="With --fuse-svd: DROP the pooled embedding and feed the head ONLY the "
+                        "z-scored SNP-SVD block. The GBLUP control through the IDENTICAL "
+                        "MLP/standardizer/split as the fused/emb-only heads (SNP-SVD -> MLP).")
+    p.add_argument("--random-proj", type=int, default=None,
+                   help="NULL CONTROL: replace the pooled embedding with a random projection of "
+                        "the raw dosage matrix — each SNP gets a fixed Gaussian vector of this "
+                        "width, dosage-summed per sample (X @ R). Reuses the IDENTICAL MLP/"
+                        "standardizer/split as emb-only, so emb-only vs this isolates whether the "
+                        "Carbon embedding carries anything beyond a random labeling+compression of "
+                        "the SNP set. --head mlp/linear only.")
+    p.add_argument("--context-proj", type=str, default=None, metavar="ESNP.pt",
+                   help="CONTEXT-PROJECTION test: like --random-proj but the projection matrix is "
+                        "STRUCTURED, not random — each SNP is assigned its window's (reference) "
+                        "embedding, and the genotype is projected through it (X @ E_snp). ESNP.pt is "
+                        "a (n_snps, D) float tensor aligned to snp_matrix_sparse's variant order "
+                        "(build with scripts-scratch precompute). Compared against --random-proj at "
+                        "the same D, this asks whether the LM's window-context basis beats a random "
+                        "basis for compressing the genotype. --head mlp/linear only.")
     # Attention head (--head attention): K learnable queries cross-attend to the
     # per-window embeddings, gathered per batch — no pre-pool to a single vector.
     p.add_argument("--n-queries", type=int, default=8,
@@ -122,8 +148,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--center-windows", action="store_true",
                    help="FPCenteredSumHeadModel: subtract each window's across-sample MEAN "
                         "(fit on TRAIN) before pooling. Mutually exclusive with --subtract-reference.")
+    p.add_argument("--alt-windows", action="store_true",
+                   help="ALT-WINDOW pooling: average each sample's window embeddings over ONLY "
+                        "the windows where it carries >=1 alt allele (its fingerprint's alt-tuple "
+                        "is non-empty), instead of over all windows — dropping the reference "
+                        "windows that dominate the ordinary mean-pool, so the vector is built from "
+                        "just the sequence neighbourhoods the sample actually varies at. Forces a "
+                        "MEAN over the alt windows (--pool is ignored). Composable with "
+                        "--center-windows, which here (unlike full-pool, where it's a constant "
+                        "shift the standardizer absorbs) genuinely changes the vector, because each "
+                        "sample averages a different subset of windows. Samples with zero alt "
+                        "windows get a zero vector (alt count floored at 1).")
     p.add_argument("--pool", choices=["sum", "mean"], default="sum",
-                   help="Window pooling into the per-sample vector (saved in head_config).")
+                   help="Window pooling into the per-sample vector (saved in head_config). "
+                        "Ignored under --alt-windows (always a mean over the alt windows).")
     p.add_argument("--center-ln-pool", action="store_true",
                    help="DIAGNOSTIC: mean-pool per-window-centered, per-window-LayerNorm'd windows "
                         "(uniform-attention floor). Forces mean pool; not reproduced at inference.")
@@ -388,12 +426,27 @@ def main() -> None:
         parser.error("--warm-start-head and --warm-start-standardizer are mutually exclusive.")
     if args.subtract_reference and args.center_windows:
         parser.error("--subtract-reference and --center-windows are mutually exclusive.")
+    if args.alt_windows:
+        # Alt-window pooling lives in the pre-pool path (like --center-ln-pool / the
+        # projection controls); it composes only with the default or --center-windows
+        # table, not with the reference-delta table or the summed-replacing controls.
+        for bad, name in [(args.subtract_reference, "--subtract-reference"),
+                          (args.center_ln_pool, "--center-ln-pool"),
+                          (args.random_proj, "--random-proj"),
+                          (args.context_proj, "--context-proj"),
+                          (args.fuse_svd, "--fuse-svd")]:
+            if bad:
+                parser.error(f"{name} is incompatible with --alt-windows.")
+        if args.head == "attention":
+            parser.error("--alt-windows is incompatible with --head attention.")
     if args.bottleneck_dim is not None and args.head != "mlp":
         parser.error("--bottleneck-dim requires --head mlp.")
     if args.head == "attention":
         for bad, name in [(args.subtract_reference, "--subtract-reference"),
                           (args.center_ln_pool, "--center-ln-pool"),
-                          (args.svd, "--svd"), (args.bottleneck_dim, "--bottleneck-dim")]:
+                          (args.svd, "--svd"), (args.bottleneck_dim, "--bottleneck-dim"),
+                          (args.fuse_svd, "--fuse-svd"), (args.random_proj, "--random-proj"),
+                          (args.context_proj, "--context-proj")]:
             if bad:
                 parser.error(f"{name} is incompatible with --head attention.")
         if args.positional and args.pos_encoding == "none":   # deprecated alias
@@ -472,6 +525,27 @@ def main() -> None:
         return
 
     # ── 1.a Pre-sum into one embedding per sample ─────────────────────────────────
+    # Pool a (n_fps, D) fingerprint table into (n_samples, D). Normally this is a
+    # sum/mean over ALL of a sample's windows (embedding_bag). Under --alt-windows it
+    # is instead a MEAN over only the sample's alt-bearing windows: a fingerprint has
+    # >=1 alt iff its alt-tuple is non-empty, so masking the table to those rows and
+    # sum-pooling, divided by the per-sample alt-window count, drops the (dominant,
+    # shared) reference windows from the average. The count is floored at 1 so a
+    # sample with no alt windows yields a zero vector rather than NaN.
+    def _pool(table: torch.Tensor) -> torch.Tensor:
+        if not args.alt_windows:
+            return F.embedding_bag(sample_fp_index, table, mode=args.pool)
+        alt_fp = torch.tensor(
+            [1.0 if len(a) > 0 else 0.0 for (_c, _s, _e, a) in dataset.unique_fingerprints],
+            dtype=table.dtype).unsqueeze(1)                                  # (n_fps, 1)
+        alt_sum = F.embedding_bag(sample_fp_index, table * alt_fp, mode="sum")   # (n, D)
+        alt_cnt = F.embedding_bag(sample_fp_index, alt_fp, mode="sum")           # (n, 1) counts
+        n_zero = int((alt_cnt < 1.0).sum())
+        print(f"  alt-windows: mean over alt-bearing windows only "
+              f"(median {int(alt_cnt.median())} alt windows/sample"
+              + (f"; {n_zero} samples with 0 → zero vector)" if n_zero else ")"))
+        return alt_sum / alt_cnt.clamp_min(1.0)
+
     if args.center_ln_pool:
         if args.subtract_reference:
             parser.error("--center-ln-pool is incompatible with --subtract-reference")
@@ -495,12 +569,12 @@ def main() -> None:
         window_center = FPCenteredSumHeadModel.build_window_center(
             cache.to(device), sample_fp_index.to(device), train_idx.to(device)).cpu()
         table = FPCenteredSumHeadModel.subtract_center(cache, window_center)  # (n_fps, D)
-        summed = F.embedding_bag(sample_fp_index, table, mode=args.pool)      # (n_samples, D)
+        summed = _pool(table)                                                 # (n_samples, D)
         print("  center-windows: pool each window's deviation from its across-sample mean")
     else:
         ref_index = None
         table = cache
-        summed = F.embedding_bag(sample_fp_index, table, mode=args.pool)      # (n_samples, D)
+        summed = _pool(table)                                                 # (n_samples, D)
 
     # ── 1.b Optional SVD reduction (fit on TRAIN only), like the SNP pipeline ─────
     if args.svd:
@@ -512,6 +586,65 @@ def main() -> None:
         evr = float(svd.explained_variance_ratio_.sum())
         print(f"  SVD: {summed.shape[1]} components (train-fit), "
               f"explained variance ratio={evr:.3f}")
+
+    # ── 1.c Optional late-fusion of SNP-SVD (GBLUP) features ──────────────────────
+    # Concat the top-N TruncatedSVD components of the raw genotype matrix (fit on TRAIN
+    # only, z-scored on TRAIN) onto the pooled embedding. The head then sees the strong
+    # additive baseline as a subspace of its input, so it can only ADD embedding signal
+    # on top — the cheapest test of whether the embeddings are orthogonal to GBLUP.
+    if args.fuse_svd:
+        svd_feats_np, evr = feat.snp_matrix_svd(
+            spec, dataset.samples, n_components=args.fuse_svd,
+            train_positions=train_idx.numpy(), seed=args.seed)
+        svd_feats = torch.tensor(svd_feats_np, dtype=torch.float32)
+        mu = svd_feats[train_idx].mean(0, keepdim=True)
+        sd = svd_feats[train_idx].std(0, keepdim=True).clamp_min(1e-6)
+        svd_feats = (svd_feats - mu) / sd                    # z-score on TRAIN stats
+        if args.fuse_svd_only:
+            summed = svd_feats                               # GBLUP control: drop embeddings
+            emb_dim = args.fuse_svd
+            print(f"  fuse-svd-only: SNP-SVD {args.fuse_svd} dims ONLY "
+                  f"(evr={evr:.3f}), embeddings dropped → emb_dim={emb_dim}")
+        else:
+            summed = torch.cat([summed, svd_feats], dim=1)
+            emb_dim = emb_dim + args.fuse_svd
+            print(f"  fuse-svd: concat {args.fuse_svd} SNP-SVD dims "
+                  f"(evr={evr:.3f}) → emb_dim={emb_dim}")
+
+    # ── 1.d Random-projection NULL control ────────────────────────────────────────
+    # Replace the Carbon embedding with X @ R: each SNP → a fixed Gaussian vector of
+    # width D, dosage-summed per sample (a random compression of the genotype, ≈ a JL
+    # sketch of the GBLUP kernel). Fed through the IDENTICAL head/standardizer/split as
+    # emb-only, so (emb-only − this) is exactly the information the embedding carries
+    # BEYOND a random labeling of the SNP set.
+    if args.random_proj:
+        import numpy as np
+        Xsp, _vids = feat.snp_matrix_sparse(spec, dataset.samples)      # CSR (n, n_snps) dosage
+        rng = np.random.default_rng(args.seed)
+        R = rng.standard_normal((Xsp.shape[1], args.random_proj)).astype(np.float32)
+        summed = torch.tensor(np.asarray(Xsp @ R), dtype=torch.float32)  # (n, D)
+        emb_dim = args.random_proj
+        print(f"  random-proj NULL: X({Xsp.shape[0]}×{Xsp.shape[1]}) @ R(·,{args.random_proj}) "
+              f"→ emb_dim={emb_dim}  (Carbon embedding replaced by random SNP labels)")
+
+    # ── 1.e Context-projection test ───────────────────────────────────────────────
+    # Same X @ E as random-proj, but E is STRUCTURED: row j is SNP j's window (reference)
+    # embedding. z = X @ E_snp projects the genotype through the LM's per-locus context
+    # basis. Compared to --random-proj at the same D, (context − random) is whether the
+    # window context provides a better-than-random subspace for the genotype — the "is
+    # the reference-window context itself useful?" test. Uses ONLY reference embeddings.
+    if args.context_proj:
+        import numpy as np
+        Xsp, _vids = feat.snp_matrix_sparse(spec, dataset.samples)      # CSR (n, n_snps) dosage
+        E_snp = torch.load(args.context_proj, map_location="cpu")
+        E_snp = torch.as_tensor(E_snp, dtype=torch.float32).numpy()
+        if E_snp.shape[0] != Xsp.shape[1]:
+            raise SystemExit(f"--context-proj rows {E_snp.shape[0]} != n_snps {Xsp.shape[1]} "
+                             "(E_snp must align to snp_matrix_sparse variant order).")
+        summed = torch.tensor(np.asarray(Xsp @ E_snp), dtype=torch.float32)  # (n, D)
+        emb_dim = E_snp.shape[1]
+        print(f"  context-proj: X({Xsp.shape[0]}×{Xsp.shape[1]}) @ E_snp(·,{emb_dim}) "
+              f"→ emb_dim={emb_dim}  (genotype projected through window-context basis)")
 
     train_ds = TensorDataset(summed[train_idx], Y[train_idx])
     val_x = summed[val_idx].to(device)
@@ -633,9 +766,10 @@ def main() -> None:
                         else "FPSumHeadModel"),
         "subtract_reference": args.subtract_reference,
         "center_windows": args.center_windows,
+        "alt_windows": args.alt_windows,
         "pool": args.pool, "emb_dim": emb_dim, "n_traits": n_traits,
         "hidden_dim": args.hidden_dim, "n_layers": args.n_layers, "dropout": args.dropout,
-        "bottleneck_dim": args.bottleneck_dim, "svd": args.svd,
+        "bottleneck_dim": args.bottleneck_dim, "svd": args.svd, "fuse_svd": args.fuse_svd,
         "early_stopping": args.early_stopping, "best_epoch": best_epoch,
         "normalize": not args.no_normalize, "standardizer": args.standardizer,
         "freeze_standardizer": freeze_standardizer,

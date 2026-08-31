@@ -249,6 +249,92 @@ def load_carbon_variant_cache(
     return model, tokenizer
 
 
+def load_carbon_variant_lora(
+    repo_id: str = _DEFAULT_REPO,
+    device: str | torch.device | None = None,
+    base_dtype: torch.dtype | None = None,
+    r: int = 16,
+    alpha: float = 32.0,
+    dropout: float = 0.0,
+    targets: tuple[str, ...] | None = None,
+    freeze_base: bool = True,
+    config_overrides: dict | None = None,
+):
+    """
+    Load Carbon as a `VariantLoRACarbonForCausalLM`: the variant cache with LoRA
+    adapters on the variant stream only, and the base frozen.
+
+    Same checkpoint and the same key remapping as `load_carbon_variant_cache`;
+    the adapters are additional parameters absent from the checkpoint, so they
+    are expected in `missing` and are not warned about.
+
+    base_dtype
+        dtype for the frozen base. The adapters stay fp32 regardless (see
+        `LoRADelta`), so bf16 here does NOT reproduce the bf16 failure of full
+        fine-tuning — that one needs the parameters to be updated, and these are
+        not. fp32 is still the default so a first result changes one thing at a
+        time.
+    freeze_base
+        False trains the base alongside the adapters. Strictly more expressive
+        than full fine-tuning — the base is shared by both streams, so it can
+        only move them together, while the adapters move the variant stream
+        alone. Costs the reference cache and forces fp32; see `freeze_base`.
+    targets
+        which projections get adapters; defaults to `DEFAULT_TARGETS` (q/o plus
+        the MLP), the ones applied only to the variant stream. Adding
+        k_proj/v_proj adapts the variant keys but not the reference keys — a
+        modelling decision, see `LoRAConfig.targets`.
+    """
+    from transformers import LlamaConfig
+
+    from .variant_lora_layers import (DEFAULT_TARGETS, LoRAConfig,
+                                      VariantLoRACarbonForCausalLM)
+
+    local = os.path.isdir(repo_id)
+    config = LlamaConfig.from_pretrained(repo_id, local_files_only=local)
+    if config_overrides:
+        for key, val in config_overrides.items():
+            setattr(config, key, val)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        repo_id, trust_remote_code=True, local_files_only=local
+    )
+
+    lora = LoRAConfig(r=r, alpha=alpha, dropout=dropout,
+                      targets=tuple(targets) if targets else DEFAULT_TARGETS)
+    model = VariantLoRACarbonForCausalLM(config, lora)
+
+    state_dict = _download_carbon_weights(repo_id)
+    remapped: dict[str, torch.Tensor] = {}
+    for k, v in state_dict.items():
+        if k.startswith("model.embed_tokens."):
+            remapped[k[len("model."):]] = v
+        elif k.startswith("model.layers.") or k.startswith("model.norm."):
+            remapped["encoder." + k[len("model."):]] = v
+        else:
+            remapped[k] = v
+    missing, unexpected = model.load_state_dict(remapped, strict=False)
+
+    model.tie_weights()
+    # lora_* and the tied head are missing by construction, not by accident.
+    non_trivial_missing = [k for k in missing
+                           if "lm_head.weight" not in k and "lora_" not in k]
+    if non_trivial_missing:
+        import warnings
+        warnings.warn(f"Missing keys not in checkpoint (random init): {non_trivial_missing}")
+    if unexpected:
+        import warnings
+        warnings.warn(f"Unexpected keys in checkpoint (ignored): {unexpected}")
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device=device)
+    # freeze_base first: cast_base refuses a non-fp32 base while it is trainable.
+    model.freeze_base(freeze_base)
+    model.cast_base(base_dtype or torch.float32)
+    return model.eval(), tokenizer
+
+
 def _download_carbon_weights(repo_id: str) -> dict[str, torch.Tensor]:
     """
     Load Carbon weights from a local directory or the HuggingFace Hub.

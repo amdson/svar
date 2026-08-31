@@ -63,7 +63,8 @@ def window_weights(batch) -> torch.Tensor:
 
 
 def window_bits(model, batch, backend: str = "cache",
-                hap_chunk: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+                hap_chunk: int | None = None,
+                ref_cache=None) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-token bits for one window: returns ``(bits (N, K), weights (N, K))``.
 
     Keeps grad, so the caller chooses the context. The weights fold in
@@ -73,17 +74,28 @@ def window_bits(model, batch, backend: str = "cache",
     """
     N = batch.n_hap
     step = hap_chunk or N
-    out = [_chunk_bits(model, batch, lo, min(lo + step, N), backend)
+    out = [_chunk_bits(model, batch, lo, min(lo + step, N), backend, ref_cache)
            for lo in range(0, N, step)]
     return torch.cat(out, dim=0), window_weights(batch)
 
 
-def _chunk_bits(model, batch, lo: int, hi: int, backend: str) -> torch.Tensor:
-    """(hi-lo, K) bits for one slice of the window's haplotypes."""
+def _chunk_bits(model, batch, lo: int, hi: int, backend: str,
+                ref_cache=None) -> torch.Tensor:
+    """(hi-lo, K) bits for one slice of the window's haplotypes.
+
+    ``ref_cache`` is a `CARBON_modules.ReferenceCache` and only applies to the
+    variant-LoRA model, whose frozen base makes a window's reference stream a
+    constant. Without it this function recomputes that stream once per chunk —
+    ceil(N/hap_chunk) times per window per step.
+    """
     if backend == "cache":
+        kw = {}
+        if ref_cache is not None:
+            kw["reference_layer_inputs"] = ref_cache.get(
+                (batch.chrom, batch.start), batch.ref_ids)
         res = model(batch.ref_ids,
                     variant_positions=batch.cache_idx,
-                    variant_input_ids=batch.hap_ids[lo:hi])
+                    variant_input_ids=batch.hap_ids[lo:hi], **kw)
         logits = res.logits.index_select(1, batch.pred_row)          # (n, K, V)
     else:
         full = batch.ref_ids.unsqueeze(0).repeat(hi - lo, 1)
@@ -96,7 +108,8 @@ def _chunk_bits(model, batch, lo: int, hi: int, backend: str) -> torch.Tensor:
 
 def window_backward(model, batch, backend: str = "cache",
                     hap_chunk: int | None = None,
-                    denom: float | None = None) -> tuple[float, float]:
+                    denom: float | None = None,
+                    ref_cache=None) -> tuple[float, float]:
     """Forward + backward one window, accumulating grad chunk by chunk.
 
     Returns ``(weighted bits summed, weight summed)`` as floats — no graph is
@@ -129,7 +142,7 @@ def window_backward(model, batch, backend: str = "cache",
     total_bits = 0.0
     for lo in range(0, N, step):
         hi = min(lo + step, N)
-        bits = _chunk_bits(model, batch, lo, hi, backend)
+        bits = _chunk_bits(model, batch, lo, hi, backend, ref_cache)
         wsum = (bits * w_all[lo:hi]).sum()
         (wsum / scale).backward()
         total_bits += float(wsum.detach())
@@ -148,7 +161,7 @@ def group_weight(batches) -> float:
 
 @torch.no_grad()
 def evaluate(model, batches, backend: str = "cache",
-             hap_chunk: int | None = None) -> dict:
+             hap_chunk: int | None = None, ref_cache=None) -> dict:
     """Token-weighted mean bits/SNP over windows, split by upstream context.
 
     The ``noup`` slice is capped at the per-site marginal by construction (those
@@ -166,7 +179,7 @@ def evaluate(model, batches, backend: str = "cache",
     tot = {"all": [0.0, 0.0], "up": [0.0, 0.0], "noup": [0.0, 0.0]}
 
     for batch in batches:
-        bits, w = window_bits(model, batch, backend, hap_chunk)
+        bits, w = window_bits(model, batch, backend, hap_chunk, ref_cache)
         up = batch.has_upstream.unsqueeze(0).expand_as(bits)
         for key, mask in (("all", torch.ones_like(up)), ("up", up), ("noup", ~up)):
             tot[key][0] += float((bits * w)[mask].sum())

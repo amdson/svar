@@ -71,12 +71,24 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
                         "test once). Ignored when --eval-accessions insample.")
     g.add_argument("--eval-every", type=int, default=0,
                    help="also evaluate every N optimizer steps (0 = epoch ends only)")
+    g.add_argument("--eval-epochs", type=int, default=1,
+                   help="evaluate at the end of every Nth epoch (the last is always "
+                        "scored). On a small window set an epoch is cheap but an "
+                        "eval is not — it forwards every fit and eval accession "
+                        "over every window — so at high epoch counts a per-epoch "
+                        "eval costs more than the training it is measuring.")
     g.add_argument("--no-eval-train", action="store_true",
                    help="skip scoring the training accessions at each eval. They "
                         "are scored by default: the train-vs-eval gap is what "
                         "separates 'overfitting' from 'converged to the baseline', "
                         "and the running mean printed during an epoch cannot "
                         "answer that (it lags, being averaged over changing weights).")
+    g.add_argument("--baselines-only", action="store_true",
+                   help="score B0/B1/B2 on this window set and stop, before any "
+                        "model is loaded. Costs no GPU and ~a minute, and it "
+                        "establishes the bar on the exact windows and the exact "
+                        "split the model run will use — so the comparison is "
+                        "against a number that was fixed in advance.")
 
     g = p.add_argument_group("model")
     g.add_argument("--model-path", default="HuggingFaceBio/Carbon-500M")
@@ -84,6 +96,35 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
                    help="'cache' is the variant cache under test; 'exact' is the "
                         "full causal forward it approximates (BENCHMARK.md §7's "
                         "ceiling). Both score identical candidates.")
+    g.add_argument("--arch", choices=["full", "lora"], default="full",
+                   help="'full' fine-tunes every weight (VariantCacheCarbonForCausalLM). "
+                        "'lora' trains variant-only LoRA adapters over a frozen base "
+                        "(VariantLoRACarbonForCausalLM): the reference stream becomes "
+                        "a constant of the window, so it is computed once per window "
+                        "for the whole run instead of once per haplotype chunk per "
+                        "step. Fewer trainable parameters, so expect it to fit less "
+                        "well at a fixed window count — the point is throughput.")
+    g.add_argument("--lora-r", type=int, default=16)
+    g.add_argument("--lora-alpha", type=float, default=32.0)
+    g.add_argument("--lora-dropout", type=float, default=0.0)
+    g.add_argument("--lora-targets", nargs="*", default=None,
+                   help="projections to adapt; default q_proj o_proj gate_proj "
+                        "up_proj down_proj — the ones applied ONLY to the variant "
+                        "stream. Adding k_proj/v_proj adapts the variant keys but "
+                        "not the reference keys, which changes what the log-sum-exp "
+                        "merge is combining; deliberate, not free.")
+    g.add_argument("--train-base", action="store_true",
+                   help="with --arch lora, train the base weights alongside the "
+                        "adapters. Strictly MORE expressive than --arch full: the "
+                        "base is shared by the reference and variant streams so it "
+                        "moves both together, while the adapters move the variant "
+                        "stream alone, and neither alone spans the pair. Costs the "
+                        "reference cache (the reference stream stops being constant) "
+                        "and forces fp32.")
+    g.add_argument("--no-ref-cache", action="store_true",
+                   help="with --arch lora, recompute the frozen reference stream "
+                        "instead of caching it. Only useful for measuring what the "
+                        "cache saves.")
     g.add_argument("--precision", choices=["fp32", "bf16"], default="fp32",
                    help="fp32 by default and deliberately: bf16 caps this "
                         "benchmark at the baseline and looks like a converged null "
@@ -131,9 +172,12 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
                    help="checkpoint path; the JSONL metric sidecar and run.json go "
                         "beside it. Default: an auto-named dir under $SVAR_SCRATCH/runs/.")
     g.add_argument("--save-model", action="store_true",
-                   help="write the fine-tuned weights (~2 GB in fp32). Off by "
-                        "default so a sweep does not fill scratch; turn it on when "
-                        "the run is one you will want to re-evaluate.")
+                   help="write the fine-tuned weights (~2 GB in fp32): "
+                        "model_best.pt on every new best eval, and model.pt at the "
+                        "end. Off by default so a sweep does not fill scratch, but "
+                        "turn it on for any run whose number you may want to "
+                        "re-verify — a run that is killed or that diverges after "
+                        "its peak otherwise leaves no weights behind at all.")
     g.add_argument("--out-root", default=None, help="override runs/ root")
     g.add_argument("--strict", action="store_true",
                    help="content-hash artifacts into the run record")
@@ -300,7 +344,29 @@ def expand_alleles(batch) -> np.ndarray:
 
 def load_model(args, device, dtype):
     """The variant-cache model, or the plain causal LM for the exact backend."""
-    from CARBON_modules import load_carbon_local, load_carbon_variant_cache
+    from CARBON_modules import (load_carbon_local, load_carbon_variant_cache,
+                                load_carbon_variant_lora)
+    if getattr(args, "arch", "full") == "lora":
+        if args.backend != "cache":
+            raise ValueError("--arch lora requires --backend cache")
+        # bf16 is safe for the base here in a way it is not for full fine-tuning:
+        # the base is frozen, and the adapters stay fp32 (see LoRADelta), so the
+        # AdamW-moments-in-bf16 failure that caps full fine-tuning cannot occur.
+        model, tokenizer = load_carbon_variant_lora(
+            args.model_path, device=device, base_dtype=dtype,
+            r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout,
+            targets=tuple(args.lora_targets) if args.lora_targets else None,
+            freeze_base=not args.train_base)
+        if args.train_base:
+            # The reference pass needs its graph back, and that graph is what
+            # forced checkpointing on the full model in the first place.
+            model.encoder.reference_checkpointing = args.ckpt_reference
+        summ = model.parameter_summary()
+        print(f"  LoRA r={args.lora_r} alpha={args.lora_alpha:g} on "
+              f"{', '.join(model.lora_config.targets)}")
+        print(f"  trainable {summ['trainable']:,} / {summ['total']:,} "
+              f"({100 * summ['fraction']:.2f}%)")
+        return model, tokenizer
     if args.backend == "cache":
         model, tokenizer = load_carbon_variant_cache(
             args.model_path, device=device, dtype=dtype, backend="efficient")
@@ -348,6 +414,9 @@ def run(args) -> dict:
           f"(headroom {base['b1_all'] - base['b2_all']:+.4f})   "
           f"[up {base['b2_up']:.4f} | no-up {base['b2_noup']:.4f}]")
 
+    if args.baselines_only:
+        return baselines_only(args, ws, base)
+
     print(f"\nLoading Carbon on {device} ({dtype}, backend={args.backend}) …")
     model, tokenizer = load_model(args, device, dtype)
     ws.source.verify(tokenizer)
@@ -355,6 +424,14 @@ def run(args) -> dict:
 
     tr_dev = [b.to(device) for b in ws.train_batches]
     ev_dev = tr_dev if ws.insample else [b.to(device) for b in ws.eval_batches]
+
+    # Only meaningful with a frozen base — ReferenceCache re-checks that itself
+    # and raises rather than serving a stale stream.
+    ref_cache = None
+    if (getattr(args, "arch", "full") == "lora"
+            and not args.no_ref_cache and not args.train_base):
+        from CARBON_modules import ReferenceCache
+        ref_cache = ReferenceCache(model)
 
     out_path, run_dir = resolve_output(args)
     logger = MetricLogger(metrics_path_for(out_path),
@@ -371,7 +448,7 @@ def run(args) -> dict:
                "site_stats": dict(ws.source.stats), "history": history}
 
     def score(tag: str, step: int, train_running: float | None = None) -> dict:
-        ev = loss.evaluate(model, ev_dev, args.backend, hap_chunk)
+        ev = loss.evaluate(model, ev_dev, args.backend, hap_chunk, ref_cache)
         row = {"tag": tag, "step": step,
                "eval_bits": ev["all_bits"], "eval_up": ev["up_bits"],
                "eval_noup": ev["noup_bits"]}
@@ -380,7 +457,7 @@ def run(args) -> dict:
         if not args.no_eval_train and not ws.insample:
             # With the *final* weights, unlike the running mean, so the train-vs-eval
             # gap is a real generalisation measurement rather than a lag artifact.
-            tr = loss.evaluate(model, tr_dev, args.backend, hap_chunk)
+            tr = loss.evaluate(model, tr_dev, args.backend, hap_chunk, ref_cache)
             row.update(train_bits=tr["all_bits"], train_up=tr["up_bits"],
                        gap=ev["all_bits"] - tr["all_bits"])
         history.append(row)
@@ -406,21 +483,98 @@ def run(args) -> dict:
 
     best = dict(zs)
     if args.epochs:
-        best = fine_tune(model, tr_dev, args, score, base, results)
+        best = fine_tune(model, tr_dev, args, score, base, results,
+                         ckpt_path=out_path.with_name("model_best.pt"),
+                         ref_cache=ref_cache)
 
     if args.permute:
         results["permuted"] = permutation_control(model, ws, args, hap_chunk,
-                                                  best, results)
+                                                  best, results, ref_cache)
 
     results["best"] = best
+    if ref_cache is not None:
+        st = ref_cache.stats()
+        results["ref_cache"] = st
+        # misses should equal the window count exactly: one reference pass per
+        # window for the whole run. Anything more means it is being recomputed.
+        print(f"\n  reference cache: {st['entries']} windows, {st['mb']:.0f} MB, "
+              f"{st['hits']:,} hits / {st['misses']:,} misses "
+              f"({100 * st['hit_rate']:.1f}% hit rate)")
     finalize(args, model, results, base, ws, out_path, run_dir)
     logger.close()
     return results
 
 
-def fine_tune(model, tr_dev, args, score, base, results) -> dict:
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                            weight_decay=args.weight_decay)
+def save_checkpoint(model, args, results, best: dict, path: Path) -> None:
+    """Write a checkpoint atomically.
+
+    Via a temp file + rename because this is called *during* training, on every
+    new best: a run killed mid-write would otherwise leave a truncated file where
+    the previous best used to be, which is exactly the checkpoint you want when a
+    run is killed. Rename is atomic within a filesystem, so the old best survives
+    until the new one is complete.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    # For LoRA only the adapters changed; writing 2 GB of frozen base on every
+    # new best would dominate the step it is saving.
+    sd = (model.checkpoint_state_dict()
+          if hasattr(model, "checkpoint_state_dict") else model.state_dict())
+    torch.save({"model_state_dict": sd, "args": vars(args),
+                "best": dict(best),
+                "results": {k: v for k, v in results.items() if k != "history"}}, tmp)
+    tmp.replace(path)
+
+
+def baselines_only(args, ws: WindowSet, base: dict) -> dict:
+    """The bar for this window set, recorded without loading the model.
+
+    Same WindowSet, same shared split, same per-slice accounting as a full run —
+    so the B1 a model is later compared against is a number that existed before
+    the model did, not one produced in the same process that produced the model's.
+    """
+    out_path, run_dir = resolve_output(args)
+    results = {"config": vars(args), "baselines": base,
+               "n_sites": sum(b.n_site for b in ws.eval_batches),
+               "n_tokens": sum(len(b.tok_idx) for b in ws.eval_batches),
+               "n_windows": len(ws.eval_batches),
+               "n_fit_accessions": int(len(ws.fit_rows)),
+               "n_eval_accessions": int(len(ws.eval_rows)),
+               "upstream_frac": upstream_frac(ws.eval_batches),
+               "site_stats": dict(ws.source.stats), "history": []}
+    artifacts.save_json(run_dir / "results.json", results)
+
+    phase = "test" if (args.eval_split == "test" and
+                       args.eval_accessions == "heldout") else "val"
+    rec = run_record.build(
+        dataset=args.dataset, features="variant_ll", model="baselines",
+        seed=args.seed, traits=[],
+        hyperparams={"half_window": args.half_window, "windows": args.windows,
+                     "chrom": args.chrom, "eval_accessions": args.eval_accessions},
+        metrics={phase: {"mean": {"b1_bits": base["b1_all"],
+                                  "b2_bits": base["b2_all"],
+                                  "b1_bits_up": base["b1_up"],
+                                  "b2_bits_up": base["b2_up"]}}},
+        half_window=args.half_window,
+        split_path=str(ws.split_path) if ws.split_path else None,
+        strict=args.strict,
+        extra={"n_sites": results["n_sites"], "n_windows": results["n_windows"],
+               "upstream_frac": results["upstream_frac"],
+               "site_stats": results["site_stats"],
+               "eval_accessions": args.eval_accessions,
+               "eval_split": args.eval_split})
+    run_record.write(rec, run_dir)
+    print(f"\n[{args.dataset}/variant_ll/baselines] run_id={rec.run_id}\n  -> {run_dir}")
+    return results
+
+
+def fine_tune(model, tr_dev, args, score, base, results,
+              ckpt_path: Path | None = None, ref_cache=None) -> dict:
+    # trainable_parameters() on the LoRA model is the adapters only; handing
+    # AdamW model.parameters() there would build moments for 500M frozen weights.
+    params = (model.trainable_parameters()
+              if hasattr(model, "trainable_parameters") else list(model.parameters()))
+    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     rng = np.random.default_rng(args.seed)
     order = np.arange(len(tr_dev))
     accum = max(1, args.accum_windows)
@@ -439,6 +593,12 @@ def fine_tune(model, tr_dev, args, score, base, results) -> dict:
     def maybe_best(row):
         if row["eval_bits"] < best["eval_bits"]:
             best.clear(); best.update(row)
+            # Written here, not at the end: the previous 40-window run peaked at
+            # epoch 119, then diverged, and was killed at 146 — the best weights
+            # had never been written anywhere and the number was unreproducible.
+            if args.save_model and ckpt_path is not None:
+                save_checkpoint(model, args, results, best, ckpt_path)
+                return "  *best (saved)"
             return "  *best"
         return ""
 
@@ -458,11 +618,12 @@ def fine_tune(model, tr_dev, args, score, base, results) -> dict:
             opt.zero_grad(set_to_none=True)
             for b in group:
                 b_sum, n_sum = loss.window_backward(model, b, args.backend,
-                                                    hap_chunk, denom=denom)
+                                                    hap_chunk, denom=denom,
+                                                    ref_cache=ref_cache)
                 run_bits += b_sum; run_n += n_sum
                 win_bits += b_sum; win_n += n_sum
             if args.grad_clip:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
             opt.step()
             gstep += 1
             if step % 100 == 0 and step:
@@ -475,6 +636,9 @@ def fine_tune(model, tr_dev, args, score, base, results) -> dict:
                       f"{base['b1_all']:.4f} ({row['eval_bits'] - base['b1_all']:+.4f})"
                       f"{maybe_best(row)}", flush=True)
                 model.train()
+        if (epoch + 1) % max(1, args.eval_epochs) and epoch != args.epochs - 1:
+            print(f"  epoch {epoch}: train {run_bits / run_n:.4f} bits/SNP", flush=True)
+            continue
         row = score(f"epoch {epoch}", gstep, run_bits / run_n)
         extra = (f" | train {row['train_bits']:.4f} (gap {row['gap']:+.4f})"
                  if "train_bits" in row else "")
@@ -495,7 +659,8 @@ def history_last(results) -> dict:
     return h[-1] if h else {}
 
 
-def permutation_control(model, ws: WindowSet, args, hap_chunk, best, results) -> dict:
+def permutation_control(model, ws: WindowSet, args, hap_chunk, best, results,
+                        ref_cache=None) -> dict:
     """Score with LD destroyed but every site's marginal preserved.
 
     Read this with care. Permuting alleles across accessions also produces
@@ -508,7 +673,8 @@ def permutation_control(model, ws: WindowSet, args, hap_chunk, best, results) ->
     device = next(model.parameters()).device
     perm = build_batches(ws.source, ws.win_ids, ws.eval_rows,
                          shuffle_sites=True, seed=args.seed)
-    pm = loss.evaluate(model, [b.to(device) for b in perm], args.backend, hap_chunk)
+    pm = loss.evaluate(model, [b.to(device) for b in perm], args.backend,
+                       hap_chunk, ref_cache)
     stage = f"after {args.epochs} epoch(s)" if args.epochs else "zero-shot"
     intact = best.get("eval_bits", float("nan"))
     print(f"\n  LD-destroyed control  {pm['all_bits']:.4f} bits/SNP  "
@@ -524,7 +690,9 @@ def resolve_output(args) -> tuple[Path, Path]:
         out = Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)
         return out, out.parent
-    model_tag = f"{args.backend}_{args.precision}_{args.eval_accessions}"
+    model_tag = ("baselines_" + args.eval_accessions
+                 if getattr(args, "baselines_only", False)
+                 else f"{args.backend}_{args.precision}_{args.eval_accessions}")
     rd = artifacts.run_dir(args.dataset, "variant_ll", model_tag,
                            run_id=f"hw{args.half_window}_w{args.windows}"
                                   f"_e{args.epochs}_lr{args.lr:g}_s{args.seed}",
@@ -540,7 +708,11 @@ def finalize(args, model, results, base, ws, out_path: Path, run_dir: Path) -> N
         torch.save({"model_state_dict": model.state_dict(), "args": vars(args),
                     "results": {k: v for k, v in results.items() if k != "history"}},
                    out_path)
-        print(f"  saved weights → {out_path}")
+        print(f"  saved final weights → {out_path}")
+        bp = out_path.with_name("model_best.pt")
+        if bp.exists():
+            print(f"  best weights (eval {best.get('eval_bits', float('nan')):.4f}) "
+                  f"→ {bp}")
 
     artifacts.save_json(run_dir / "results.json", results)
 
@@ -562,7 +734,9 @@ def finalize(args, model, results, base, ws, out_path: Path, run_dir: Path) -> N
                        args.eval_accessions == "heldout") else "val"
     rec = run_record.build(
         dataset=args.dataset, features="variant_ll",
-        model=f"carbon_{args.backend}_{args.precision}",
+        model=(f"carbon_{args.backend}_{args.precision}"
+               + ("_lora" if getattr(args, "arch", "full") == "lora" else "")
+               + ("_base" if getattr(args, "train_base", False) else "")),
         seed=args.seed, traits=[],
         hyperparams={"half_window": args.half_window, "windows": args.windows,
                      "chrom": args.chrom, "epochs": args.epochs, "lr": args.lr,
