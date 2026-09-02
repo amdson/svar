@@ -58,6 +58,7 @@ def parse_vcf(vcf_path):
     chroms = [[] for _ in range(n)]
     poss = [[] for _ in range(n)]
     alts = [[] for _ in range(n)]
+    acs = [[] for _ in range(n)]     # per-variant hom-ALT carrier count
     n_het = np.zeros(n, dtype=np.int64)
     n_miss = np.zeros(n, dtype=np.int64)
     n_rows = n_multi = 0
@@ -71,19 +72,24 @@ def parse_vcf(vcf_path):
             if len(ref) != 1 or len(alt) != 1 or alt not in "ACGT":
                 n_multi += 1
                 continue
+            carriers = []
             for i, g in enumerate(f[9:]):
                 gt = g.split(":", 1)[0]
                 if gt in ("1/1", "1|1"):
-                    chroms[i].append(chrom)
-                    poss[i].append(pos)
-                    alts[i].append(alt)
+                    carriers.append(i)
                 elif gt in ("0/1", "1/0", "0|1", "1|0"):
                     n_het[i] += 1
                 elif gt in ("./.", "."):
                     n_miss[i] += 1
+            ac = len(carriers)
+            for i in carriers:
+                chroms[i].append(chrom)
+                poss[i].append(pos)
+                alts[i].append(alt)
+                acs[i].append(ac)
     print(f"VCF: {n_rows:,} rows ({n_multi:,} non-SNV skipped), "
           f"{n} samples, contigs: {list(contigs)[:8]}")
-    return samples, chroms, poss, alts, n_het, n_miss, contigs
+    return samples, chroms, poss, alts, acs, n_het, n_miss, contigs
 
 
 def main():
@@ -97,6 +103,11 @@ def main():
                          "stripping the 'BdiBd21-3.' prefix)")
     ap.add_argument("--cis-window", type=int, default=4000,
                     help="bp around gene span defining a cis mutation")
+    ap.add_argument("--max-ac", type=int, default=1,
+                    help="max population carrier count for a variant to count "
+                         "as an induced mutation in the pair table (1 = "
+                         "singletons; shared variants are seed-stock "
+                         "background, not mutagenesis)")
     ap.add_argument("--background-ratio", type=float, default=2.0)
     ap.add_argument("--no-log", action="store_true",
                     help="skip log2(1+x); the Zenodo README claims the matrix "
@@ -123,19 +134,23 @@ def main():
 
     # ---- variants ----
     vcf = d / "snps.combined.M5.filtered.renamed.vcf.gz"
-    vsamples, chroms, poss, alts, n_het, n_miss, contigs = parse_vcf(vcf)
+    vsamples, chroms, poss, alts, acs, n_het, n_miss, contigs = parse_vcf(vcf)
     n_alt = np.array([len(p) for p in poss])
+    # induced mutations are population-private; shared variants are background
+    # seed-stock heterogeneity (paper counts SINGLETONS: mutants ~884, ctrl ~12.5)
+    n_single = np.array([sum(1 for a in ac if a == 1) for ac in acs])
     order = {s: i for i, s in enumerate(vsamples)}
     missing = [s for s in samp if s not in order]
     print(f"expression lines absent from VCF: {len(missing)}"
           + (f" e.g. {missing[:5]}" if missing else ""))
 
-    # controls: an order of magnitude below the mutant median
-    med = np.median(n_alt[n_alt > 0])
+    # controls: singleton count an order of magnitude below the mutant median
+    med = np.median(n_single[n_single > 0])
     ctrl_thresh = med / 10
-    is_control = np.array([n_alt[order[s]] < ctrl_thresh if s in order else False
+    is_control = np.array([n_single[order[s]] < ctrl_thresh if s in order else False
                            for s in samp])
-    print(f"median SNVs/line {med:.0f}; control threshold {ctrl_thresh:.0f}; "
+    print(f"median singletons/line {med:.0f} (median total {np.median(n_alt):.0f}); "
+          f"control threshold {ctrl_thresh:.0f}; "
           f"controls detected: {int(is_control.sum())}")
 
     # ---- deviation target: subtract control-line mean per gene ----
@@ -159,7 +174,10 @@ def main():
                                if poss[i] else np.empty(0, np.int32))
             grp.create_dataset("alt", data=np.array(alts[i], "S1")[o].view(np.uint8)
                                if poss[i] else np.empty(0, np.uint8))
+            grp.create_dataset("ac", data=np.array(acs[i], np.int16)[o]
+                               if poss[i] else np.empty(0, np.int16))
             grp.attrs["n_alt"] = len(poss[i])
+            grp.attrs["n_singletons"] = int(n_single[i])
             grp.attrs["n_het_skipped"] = int(n_het[i])
             grp.attrs["n_missing_skipped"] = int(n_miss[i])
         h5.attrs["source"] = "SIEVE M5 VCF (Zenodo 18236856), hom-ALT SNVs only"
@@ -194,8 +212,9 @@ def main():
             i = order[s]
             if not poss[i]:
                 continue
-            mchrom = np.array(chroms[i])
-            mpos = np.array(poss[i], np.int64)
+            induced = np.array(acs[i]) <= a.max_ac
+            mchrom = np.array(chroms[i])[induced]
+            mpos = np.array(poss[i], np.int64)[induced]
             for c in coords["chrom"].unique():
                 sel = mchrom == c
                 if not sel.any():
