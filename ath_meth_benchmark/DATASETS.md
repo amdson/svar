@@ -71,6 +71,32 @@ inflate scores.
 - **Metric:** per-gene Spearman r across held-out accessions, median over
   genes, stratified by cis-h² bin (`baselines/evaluate.py`).
 
+## 3. SIEVE benchmark (`brachypodium_sieve/dataset/`) — separate, not a transfer target
+
+A third, **standalone** benchmark in *Brachypodium distachyon*: 796
+sodium-azide-mutagenized lines (769 mutant, 27 control) in the isogenic
+Bd21-3 background, ~730 induced SNVs per line (581,803 across the
+population), PEER-corrected leaf expression for 27,914 genes (EMPRES/SIEVE,
+Zenodo 18236856). No LD, no population structure: each expression change has
+usually exactly one candidate cis variant, so effects are causally clean —
+but the mutation spectrum is narrow (~79 % C→T in pyrimidine contexts) and
+each gene is cis-hit in only ~10–20 lines.
+
+Consequences of that structure: the Arabidopsis baseline sandwich does not
+apply (kinship is meaningless in an isogenic panel; per-SNP elastic nets
+cannot fit private mutations), the evaluation unit is the **per-mutation
+contrast** rather than per-gene correlation across lines
+(`baselines/t6_evaluate.py`: pooled β vs EMPRES's published 0.38, sign
+concordance above the control-noise floor, Var(pred)/Var(obs) calibration,
+background wild-type pairs as the zero check), and training feeds are
+selected by **genotype** (pairs carrying a cis mutation, plus matched
+wild-type background pairs) — never by observed expression, which would
+select on the outcome. Fine-tuning on SIEVE itself is in scope, so gene
+splits are family-aware; line-level leakage cannot occur (mutations are
+private). Cross-species zero-shot from the Arabidopsis models is an optional
+secondary read, not the headline — Arabidopsis→Brachypodium is a long jump,
+and a miss there says little about the within-species questions.
+
 ## How they differ (and why both)
 
 Methylation offers far more signal per unit — ~10⁵–10⁶ evaluation sites, a

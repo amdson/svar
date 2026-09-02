@@ -1,0 +1,18 @@
+# Python dependencies for the benchmark builds and baselines.
+# Base env: the svar conda env (python 3.11). These were the versions in use
+# at build time; exact pins matter little — the pipeline uses stable APIs.
+numpy
+pandas>=2.0          # 3.0.2 in use; str.removeprefix and modern dtypes assumed
+scipy>=1.10          # spearmanr .statistic attribute
+scikit-learn>=1.3    # ElasticNetCV
+h5py>=3.8
+pyarrow>=14          # parquet io (pandas backend)
+tabulate             # pandas .to_markdown in stage-2 report
+pysam                # bgzipped VCF access (loader utilities)
+pyfaidx              # FASTA windows (window_loader, REF checks)
+pgenlib              # plink2 .pgen reading (t1_sandwich, stage4)
+
+# Non-Python tools (conda env `svar` / cluster modules):
+#   plink2   — pgen builds, LD pruning, GRM prep
+#   wget, curl, gzip — downloads and validation
+#   Slurm (sbatch) — stage jobs on the atlas partition

@@ -121,9 +121,19 @@ def worker(gi):
     Ztr = standardized_window(geno, rows, tr, af)
     yt = y[tr]
 
+    # sure-screening: cap EN design at top-k |corr| SNPs (keeps runtime bounded
+    # on 100kb windows; k=3000 >> n=531 so the fit is unchanged in practice)
+    k = G.get("screen_k", 3000)
+    if len(rows) > k:
+        c = np.abs(Ztr.T @ (yt - yt.mean()))
+        sel = np.sort(np.argpartition(c, -k)[-k:])
+        rows = rows[sel]
+        Ztr = Ztr[:, sel]
+    out["n_cis_used"] = len(rows)
+
     # --- elastic net ---
     try:
-        en = ElasticNetCV(l1_ratio=0.5, n_alphas=20, cv=5, max_iter=3000,
+        en = ElasticNetCV(l1_ratio=0.5, n_alphas=12, cv=3, max_iter=2000,
                           random_state=0)
         en.fit(Ztr, yt)
         Zte = standardized_window(geno, rows, te, af)
@@ -150,6 +160,20 @@ def worker(gi):
         except np.linalg.LinAlgError:
             pass
     return out
+
+
+def run_chunk(args):
+    """Checkpointed unit: computes a block of genes, writes a partial parquet,
+    skipped on rerun if the partial exists."""
+    chunk_id, gis = args
+    part = G["partials"] / f"chunk{chunk_id:04d}.parquet"
+    if part.exists():
+        return chunk_id
+    rows = [worker(gi) for gi in gis]
+    pd.DataFrame(rows).to_parquet(part.with_suffix(".tmp.parquet"))
+    part.with_suffix(".tmp.parquet").rename(part)
+    print(f"chunk {chunk_id} done ({len(gis)} genes)", flush=True)
+    return chunk_id
 
 
 def main():
@@ -193,8 +217,11 @@ def main():
     prefix = np.array([i.rsplit(":", 2)[0] for i in ids])
     grm_rows = np.flatnonzero(np.isin(pid, prefix))
     print(f"GRM SNPs: {len(grm_rows):,}")
-    K = grm_from_rows(geno, grm_rows, af)
-    np.save(out / "grm.npy", K)
+    if (out / "grm.npy").exists():
+        K = np.load(out / "grm.npy")
+    else:
+        K = grm_from_rows(geno, grm_rows, af)
+        np.save(out / "grm.npy", K)
     K_train = K[np.ix_(tr, tr)]
 
     # ---- kinship BLUP, all genes at once ----
@@ -226,13 +253,22 @@ def main():
             blup_r_val[gi] = spearman_rows(pred_va[gi_local][None, :], Y[gi, va])[0]
     print("kinship BLUP done")
 
-    # ---- per-gene EN + cis-h2 (parallel; geno shared via fork) ----
+    # ---- per-gene EN + cis-h2 (parallel; geno shared via fork; resumable) ----
+    partials = out / "partials"
+    partials.mkdir(exist_ok=True)
     G.update(geno=geno, af=af, maf=maf, tr=tr, te=te, va=va, Y=Y,
              chrom=chrom, tss=tss, snp_key=snp_key, cis_w=a.cis_window,
-             maf_min=a.maf_min, K_train=K_train)
+             maf_min=a.maf_min, K_train=K_train, partials=partials)
+    csize = 100
+    chunks = [(i, list(range(s, min(s + csize, len(gene_id)))))
+              for i, s in enumerate(range(0, len(gene_id), csize))]
+    todo = [c for c in chunks if not (partials / f"chunk{c[0]:04d}.parquet").exists()]
+    print(f"{len(todo)}/{len(chunks)} chunks to compute")
     with Pool(a.workers) as pool:
-        rows = pool.map(worker, range(len(gene_id)), chunksize=64)
-    df = pd.DataFrame(rows).set_index("gene_i").sort_index()
+        pool.map(run_chunk, todo, chunksize=1)
+    df = pd.concat([pd.read_parquet(partials / f"chunk{c[0]:04d}.parquet")
+                    for c in chunks], ignore_index=True)
+    df = df.set_index("gene_i").sort_index()
     df["gene_id"] = gene_id
     df["blup_r_test"] = blup_r_test
     df["blup_r_val"] = blup_r_val
