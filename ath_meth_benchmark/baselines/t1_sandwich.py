@@ -5,8 +5,15 @@ split (train=531 / val / test by admixture group):
   1. population mean        — floor; exactly r=0 on deviations by construction
   2. kinship BLUP           — global GRM kernel ridge; per-gene lambda by
                               closed-form LOO on the train eigendecomposition
-  3. elastic net on cis SNPs— MAF>=0.01 within panel, +-CIS_WINDOW of TSS;
-                              the model to beat
+  3. cis kernel ridge       — dense-linear cis baseline on K_cis = Z Z'/p
+                              (n x n regardless of SNP count; per-gene lambda
+                              by the same closed-form LOO as the BLUP; ~0.1s
+                              per gene). Runs for every gene.
+  3b. elastic net on cis SNPs— MAF>=0.01 within panel, +-CIS_WINDOW of TSS;
+                              the sparse model to beat. Feature-space cost is
+                              the bottleneck, so by default (--en-mode
+                              primary) it fits only genes whose HE cis-h2
+                              from the same pass clears --en-h2-min.
   4. cis-h2 ceiling         — two-component Haseman-Elston regression
                               (K_cis + K_global), fast and unbiased; can be
                               swapped for REML/GEMMA later
@@ -120,45 +127,75 @@ def worker(gi):
 
     Ztr = standardized_window(geno, rows, tr, af)
     yt = y[tr]
-
-    # sure-screening: cap EN design at top-k |corr| SNPs (keeps runtime bounded
-    # on 100kb windows; k=3000 >> n=531 so the fit is unchanged in practice)
-    k = G.get("screen_k", 3000)
-    if len(rows) > k:
-        c = np.abs(Ztr.T @ (yt - yt.mean()))
-        sel = np.sort(np.argpartition(c, -k)[-k:])
-        rows = rows[sel]
-        Ztr = Ztr[:, sel]
-    out["n_cis_used"] = len(rows)
-
-    # --- elastic net ---
-    try:
-        en = ElasticNetCV(l1_ratio=0.5, n_alphas=12, cv=3, max_iter=2000,
-                          random_state=0)
-        en.fit(Ztr, yt)
-        Zte = standardized_window(geno, rows, te, af)
-        Zva = standardized_window(geno, rows, va, af)
-        out["en_r_test"] = float(spearman_rows(en.predict(Zte)[None, :], y[te])[0])
-        out["en_r_val"] = float(spearman_rows(en.predict(Zva)[None, :], y[va])[0])
-        out["en_nnz"] = int((en.coef_ != 0).sum())
-    except Exception as e:
-        out["en_error"] = str(e)
+    p = len(rows)
 
     # --- cis-h2 via two-component Haseman-Elston on train accessions ---
-    Kc = (Ztr @ Ztr.T) / max(len(rows), 1)
+    Kc = (Ztr @ Ztr.T) / p
     Kg = G["K_train"]
     yc = yt - yt.mean()
     vy = yc.var()
+    cis_h2 = np.nan
     if vy > 0:
         iu = np.triu_indices(len(tr), k=1)
         z = (np.outer(yc, yc) / vy)[iu]
         A = np.column_stack([Kc[iu], Kg[iu], np.ones(len(z))])
         try:
             coef, *_ = np.linalg.lstsq(A, z, rcond=None)
-            out["cis_h2"] = float(np.clip(coef[0], 0, 1))
+            cis_h2 = float(np.clip(coef[0], 0, 1))
+            out["cis_h2"] = cis_h2
             out["glob_h2"] = float(np.clip(coef[1], 0, 1))
         except np.linalg.LinAlgError:
             pass
+
+    # --- cis kernel ridge (dense-linear cis baseline; reuses Kc) ---
+    # Same closed-form-LOO lambda selection as the kinship BLUP, but on the
+    # gene's own cis kernel. O(n^3) per gene regardless of SNP count.
+    try:
+        S, U = np.linalg.eigh(Kc)
+        S = np.maximum(S, 0)
+        Yr = U.T @ yc
+        best = (np.inf, 1.0)
+        for lam in np.logspace(-2, 3, 30):
+            dvec = S / (S + lam)
+            hdiag = (U ** 2 * dvec).sum(1)
+            resid = yc - U @ (dvec * Yr)
+            loo = float(((resid / (1 - hdiag)) ** 2).mean())
+            if loo < best[0]:
+                best = (loo, lam)
+        lam = best[1]
+        alpha = U @ (Yr / (S + lam))
+        Zte = standardized_window(geno, rows, te, af)
+        Zva = standardized_window(geno, rows, va, af)
+        out["krr_r_test"] = float(spearman_rows(
+            ((Zte @ Ztr.T) / p @ alpha)[None, :], y[te])[0])
+        out["krr_r_val"] = float(spearman_rows(
+            ((Zva @ Ztr.T) / p @ alpha)[None, :], y[va])[0])
+        out["krr_lambda"] = float(lam)
+    except np.linalg.LinAlgError as e:
+        out["krr_error"] = str(e)
+
+    # --- elastic net: only where it can matter (primary genes), feature-space
+    # cost is the pipeline bottleneck so it is gated on the HE estimate ---
+    if G["en_mode"] == "all" or (G["en_mode"] == "primary"
+                                 and cis_h2 >= G["en_h2_min"]):
+        k = G.get("screen_k", 3000)
+        if p > k:  # sure-screening keeps runtime bounded; k >> n leaves fit unchanged
+            c = np.abs(Ztr.T @ yc)
+            sel = np.sort(np.argpartition(c, -k)[-k:])
+            rows = rows[sel]
+            Ztr = Ztr[:, sel]
+        out["n_cis_used"] = len(rows)
+        try:
+            en = ElasticNetCV(l1_ratio=0.5, n_alphas=12, cv=3, max_iter=2000,
+                              random_state=0)
+            en.fit(Ztr, yt)
+            Zte = standardized_window(geno, rows, te, af)
+            Zva = standardized_window(geno, rows, va, af)
+            out["en_r_test"] = float(spearman_rows(en.predict(Zte)[None, :], y[te])[0])
+            out["en_r_val"] = float(spearman_rows(en.predict(Zva)[None, :], y[va])[0])
+            out["en_nnz"] = int((en.coef_ != 0).sum())
+        except Exception as e:
+            out["en_error"] = str(e)
     return out
 
 
@@ -186,6 +223,11 @@ def main():
     ap.add_argument("--cis-window", type=int, default=100_000)
     ap.add_argument("--maf-min", type=float, default=0.01)
     ap.add_argument("--workers", type=int, default=32)
+    ap.add_argument("--en-mode", choices=["primary", "all", "none"],
+                    default="primary",
+                    help="elastic net on: primary genes only (cis_h2 >= "
+                         "--en-h2-min, from the same pass), all genes, or skip")
+    ap.add_argument("--en-h2-min", type=float, default=0.05)
     a = ap.parse_args()
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -258,7 +300,8 @@ def main():
     partials.mkdir(exist_ok=True)
     G.update(geno=geno, af=af, maf=maf, tr=tr, te=te, va=va, Y=Y,
              chrom=chrom, tss=tss, snp_key=snp_key, cis_w=a.cis_window,
-             maf_min=a.maf_min, K_train=K_train, partials=partials)
+             maf_min=a.maf_min, K_train=K_train, partials=partials,
+             en_mode=a.en_mode, en_h2_min=a.en_h2_min)
     csize = 100
     chunks = [(i, list(range(s, min(s + csize, len(gene_id)))))
               for i, s in enumerate(range(0, len(gene_id), csize))]
@@ -275,24 +318,28 @@ def main():
     df.to_parquet(out / "t1_sandwich.parquet")
 
     # ---- report ----
-    en = df["en_r_test"]
     h2 = df["cis_h2"]
     primary = df[h2 >= 0.1]
+    en_col = df["en_r_test"] if "en_r_test" in df else pd.Series(dtype=float)
     lines = [
         "# T1 baseline sandwich report\n",
         f"- genes: {len(df):,}; cis window ±{a.cis_window/1000:.0f} kb, "
-        f"MAF ≥ {a.maf_min}",
+        f"MAF ≥ {a.maf_min}; en-mode={a.en_mode}",
         f"- median cis-h2 (HE, all genes): {h2.median():.3f}; "
         f"genes with cis-h2 ≥ 0.05 / 0.1: "
         f"{int((h2 >= .05).sum()):,} / {int((h2 >= .1).sum()):,}",
         f"- kinship BLUP median Spearman r (test accessions): "
         f"{df['blup_r_test'].median():.3f}",
-        f"- elastic net median Spearman r (test): {en.median():.3f}",
+        f"- cis kernel ridge median r (all genes): "
+        f"{df['krr_r_test'].median():.3f}",
+        f"- elastic net median r (fitted genes, n={int(en_col.notna().sum()):,}): "
+        f"{en_col.median():.3f}",
         f"\n## Primary gene set (cis-h2 ≥ 0.1, n={len(primary):,})",
-        f"- elastic net median r: {primary['en_r_test'].median():.3f}",
+        f"- cis kernel ridge median r: {primary['krr_r_test'].median():.3f}",
+        f"- elastic net median r: {primary['en_r_test'].median() if 'en_r_test' in primary else float('nan'):.3f}",
         f"- BLUP median r: {primary['blup_r_test'].median():.3f}",
         f"- median headroom (cis_h2 − en_r_test²): "
-        f"{(primary['cis_h2'] - primary['en_r_test'].clip(lower=0)**2).median():.3f}",
+        f"{(primary['cis_h2'] - primary['en_r_test'].clip(lower=0)**2).median() if 'en_r_test' in primary else float('nan'):.3f}",
         "\nHeadroom > ~0.05 on a few thousand genes = T1 discriminates; "
         "≈0 = the action is in T2/T3 (see benchmark-viability note).",
     ]

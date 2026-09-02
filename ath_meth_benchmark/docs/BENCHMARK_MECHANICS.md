@@ -96,7 +96,16 @@ all** — only genome-wide relatedness — so anything it captures is
 population structure plus trans-polygenic background. It is the leak
 detector: a sequence model that fails to beat it has learned nothing local.
 
-**4.3 Cis elastic net (the model to beat).** PrediXcan-style: for each
+**4.3 Cis kernel ridge (dense-linear cis, every gene).** The kernel-space
+version of a ridge on all cis SNPs: `K_cis = Z·Zᵀ/p` is n×n regardless of
+how many SNPs the window holds, so fitting costs O(n³) per gene (~0.1 s)
+instead of feature-space coordinate descent. λ per gene by the same
+closed-form LOO as the BLUP. It reuses the `K_cis` already built for the
+cis-h² step, runs for all 22.6k genes, and serves as the fast screen; the
+elastic net then fits only genes whose cis-h² clears a threshold
+(`--en-mode primary`, default 0.05).
+
+**4.3b Cis elastic net (the sparse model to beat).** PrediXcan-style: for each
 gene, take biallelic SNPs within ±100 kb of the TSS with MAF ≥ 0.01 in the
 665 panel (missing calls imputed to 2·AF, dosages standardized; if > 3,000
 SNPs, sure-screening keeps the top 3,000 by |correlation with y| — with
