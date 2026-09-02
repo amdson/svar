@@ -50,6 +50,7 @@ Backends
 """
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 from typing import List, Optional
@@ -61,6 +62,11 @@ import torch.utils.checkpoint
 from .carbon_layers import (CarbonDecoderLayer, CarbonRMSNorm,
                             CarbonRotaryEmbedding, apply_rotary_pos_emb,
                             build_causal_mask, repeat_kv, rotate_half)
+
+
+def _add(base: torch.Tensor, delta: Optional[torch.Tensor]) -> torch.Tensor:
+    """base + delta, treating None as zero (the no-adapter case)."""
+    return base if delta is None else base + delta
 
 
 def _rope_single(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
@@ -107,6 +113,14 @@ class VariantCacheCarbonEncoder(nn.Module):
         # instead of storing them. Off by default (inference never needs it); set
         # by the trainer. See `forward_reference`.
         self.reference_checkpointing = False
+
+        # Same idea for the *variant* branch. The cross branch saves, per layer,
+        # an (h, N*cs, ref) probability tensor for backward — at variant_ll's
+        # cs≈8 that is nothing, but at expression-scale cache sets (cs in the
+        # hundreds to thousands over a T=8192 window) it is tens of GB and is
+        # what OOMs, not the reference pass. Checkpointing `_variant_layer`
+        # keeps only the (N, cs, hidden) layer inputs and recomputes the rest.
+        self.variant_checkpointing = False
 
     # ------------------------------------------------------------------ #
     # Reference pass: cache the (pre-norm) residual stream entering each   #
@@ -221,6 +235,87 @@ class VariantCacheCarbonEncoder(nn.Module):
         out = out.view(h, N, Lq, d).transpose(0, 1)  # (N, h, Lq, d)
         return out, lse.transpose(0, 1)  # (N, h, Lq, 1)
 
+    def _delta(self, layer_idx: int, name: str,
+               x: torch.Tensor) -> Optional[torch.Tensor]:
+        """Adapter hook: additive delta for projection ``name`` of layer
+        ``layer_idx`` applied to ``x``, or None. The base encoder has no
+        adapters; `VariantLoRACarbonEncoder` overrides this. Only ever called
+        from `_variant_layer`, so nothing reachable from `forward_reference`
+        can see an adapter."""
+        return None
+
+    def _variant_layer(
+        self,
+        layer_idx: int,
+        var: torch.Tensor,        # (N, cs, hidden) variant residual stream
+        ref_input: torch.Tensor,  # (1, ref, hidden) frozen reference layer input
+        cos_q: torch.Tensor, sin_q: torch.Tensor,
+        cos_r: torch.Tensor, sin_r: torch.Tensor,
+        cross_mask: torch.Tensor,  # (1, 1, cs, ref)
+        self_mask: torch.Tensor,   # (1, 1, cs, cs)
+    ) -> torch.Tensor:
+        """One decoder layer of the variant branch: cross/self attention against
+        the frozen reference plus the pre-norm MLP block. Checkpointable unit."""
+        layer_module = self.layers[layer_idx]
+        attn = layer_module.self_attn
+        device, dtype = var.device, var.dtype
+        N, cache_seqlen = var.shape[:2]
+        ref_seqlen = ref_input.shape[1]
+        h, kvh, d = self.num_attention_heads, self.num_key_value_heads, self.head_dim
+        groups, scale = self.num_key_value_groups, self.scaling
+        dl = self._delta
+
+        residual = var
+        var_normed = layer_module.input_layernorm(var)  # (N, cs, hidden)
+        ref_normed = layer_module.input_layernorm(
+            ref_input.to(device=device, dtype=dtype))   # (1, ref, hidden)
+
+        # Variant Q/K/V (batch N) from the running variant residual stream.
+        q_v = _add(attn.q_proj(var_normed), dl(layer_idx, "q_proj", var_normed))
+        k_v = _add(attn.k_proj(var_normed), dl(layer_idx, "k_proj", var_normed))
+        v_v = _add(attn.v_proj(var_normed), dl(layer_idx, "v_proj", var_normed))
+        q_v = q_v.view(N, cache_seqlen, h, d).transpose(1, 2)
+        k_v = k_v.view(N, cache_seqlen, kvh, d).transpose(1, 2)
+        v_v = v_v.view(N, cache_seqlen, kvh, d).transpose(1, 2)
+
+        # Reference K/V (batch 1) from the cached layer input, this layer's
+        # base projections (never adapted); kept at batch 1.
+        k_r = attn.k_proj(ref_normed).view(1, ref_seqlen, kvh, d).transpose(1, 2)
+        v_r = attn.v_proj(ref_normed).view(1, ref_seqlen, kvh, d).transpose(1, 2)
+
+        # RoPE: variant Q/K at the variant positions, reference K at 0..ref-1.
+        q_v, k_v = apply_rotary_pos_emb(q_v, k_v, cos_q, sin_q)
+        k_r = _rope_single(k_r, cos_r, sin_r)
+
+        # Expand grouped KV heads to full head count.
+        k_v, v_v = repeat_kv(k_v, groups), repeat_kv(v_v, groups)  # (N, h, cs, d)
+        k_r, v_r = repeat_kv(k_r, groups), repeat_kv(v_r, groups)  # (1, h, ref, d)
+
+        out_c, lse_c = self._cross_attention_with_lse(q_v, k_r, v_r,
+                                                      cross_mask, scale)
+        out_s, lse_s = self._attention_with_lse(q_v, k_v, v_v, self_mask, scale)
+
+        # Merge the two softmaxes by their log-sum-exps == single softmax
+        # over the union of the two key sets.
+        lse = torch.logaddexp(lse_c, lse_s)
+        attn_out = (torch.exp(lse_c - lse) * out_c +
+                    torch.exp(lse_s - lse) * out_s)  # (N, h, cs, d)
+
+        attn_out = attn_out.transpose(1, 2).reshape(N, cache_seqlen, h * d)
+        attn_out = _add(attn.o_proj(attn_out), dl(layer_idx, "o_proj", attn_out))
+        var = residual + attn_out
+
+        # Pre-norm SwiGLU block, unrolled from CarbonMLP.forward — identical to
+        # `mlp(x)` when every delta is None: down(act(gate(x)) * up(x)).
+        residual = var
+        x = layer_module.post_attention_layernorm(var)
+        mlp = layer_module.mlp
+        gate = _add(mlp.gate_proj(x), dl(layer_idx, "gate_proj", x))
+        up = _add(mlp.up_proj(x), dl(layer_idx, "up_proj", x))
+        inner = mlp.act_fn(gate) * up
+        var = residual + _add(mlp.down_proj(inner), dl(layer_idx, "down_proj", inner))
+        return var
+
     def forward(
         self,
         variant_cache: torch.Tensor,  # (N, cache_seqlen, hidden) variant embeddings
@@ -228,18 +323,17 @@ class VariantCacheCarbonEncoder(nn.Module):
         hidden_states: torch.Tensor,  # (ref_seqlen, hidden) reference embeddings
         attention_mask: torch.Tensor,  # (ref_seqlen,) or (1, ref_seqlen)
         output_all_encoded_layers: Optional[bool] = True,
+        reference_layer_inputs: Optional[List[torch.Tensor]] = None,
     ) -> List[torch.Tensor]:
         # Per-layer frozen reference residual stream (the cross-attn K/V source).
-        reference_layer_inputs = self.forward_reference(
-            hidden_states=hidden_states, attention_mask=attention_mask)
+        # May be supplied precomputed (frozen base + `ReferenceCache`).
+        if reference_layer_inputs is None:
+            reference_layer_inputs = self.forward_reference(
+                hidden_states=hidden_states, attention_mask=attention_mask)
 
         device, dtype = variant_cache.device, variant_cache.dtype
         N, cache_seqlen = variant_cache.shape[:2]
         ref_seqlen = reference_layer_inputs[0].shape[1]
-        h, kvh = self.num_attention_heads, self.num_key_value_heads
-        d = self.head_dim
-        groups = self.num_key_value_groups
-        scale = self.scaling
         neg = torch.finfo(dtype).min
 
         pos_q = variant_cache_indices.to(device=device).long()  # (cs,)
@@ -267,53 +361,20 @@ class VariantCacheCarbonEncoder(nn.Module):
                                 device=device).masked_fill(~causal_s, neg)
         self_mask = self_mask[None, None]                       # (1, 1, cs, cs)
 
+        ckpt = self.variant_checkpointing and torch.is_grad_enabled()
+
         var = variant_cache  # (N, cs, hidden) running variant residual stream
         all_encoder_layers: List[torch.Tensor] = []
-        for layer_module, ref_input in zip(self.layers, reference_layer_inputs):
-            attn = layer_module.self_attn
-
-            residual = var
-            var_normed = layer_module.input_layernorm(var)  # (N, cs, hidden)
-            ref_normed = layer_module.input_layernorm(
-                ref_input.to(device=device, dtype=dtype))   # (1, ref, hidden)
-
-            # Variant Q/K/V (batch N) from the running variant residual stream.
-            q_v = attn.q_proj(var_normed).view(N, cache_seqlen, h, d).transpose(1, 2)
-            k_v = attn.k_proj(var_normed).view(N, cache_seqlen, kvh, d).transpose(1, 2)
-            v_v = attn.v_proj(var_normed).view(N, cache_seqlen, kvh, d).transpose(1, 2)
-
-            # Reference K/V (batch 1) from the cached layer input, this layer's
-            # projections; kept at batch 1 and broadcast over N in the matmul.
-            k_r = attn.k_proj(ref_normed).view(1, ref_seqlen, kvh, d).transpose(1, 2)
-            v_r = attn.v_proj(ref_normed).view(1, ref_seqlen, kvh, d).transpose(1, 2)
-
-            # RoPE: variant Q/K at the variant positions, reference K at 0..ref-1.
-            q_v, k_v = apply_rotary_pos_emb(q_v, k_v, cos_q, sin_q)
-            k_r = _rope_single(k_r, cos_r, sin_r)
-
-            # Expand grouped KV heads to full head count.
-            k_v, v_v = repeat_kv(k_v, groups), repeat_kv(v_v, groups)  # (N, h, cs, d)
-            k_r, v_r = repeat_kv(k_r, groups), repeat_kv(v_r, groups)  # (1, h, ref, d)
-
-            out_c, lse_c = self._cross_attention_with_lse(q_v, k_r, v_r,
-                                                          cross_mask, scale)
-            out_s, lse_s = self._attention_with_lse(q_v, k_v, v_v, self_mask, scale)
-
-            # Merge the two softmaxes by their log-sum-exps == single softmax
-            # over the union of the two key sets.
-            lse = torch.logaddexp(lse_c, lse_s)
-            attn_out = (torch.exp(lse_c - lse) * out_c +
-                        torch.exp(lse_s - lse) * out_s)  # (N, h, cs, d)
-
-            attn_out = attn_out.transpose(1, 2).reshape(N, cache_seqlen, h * d)
-            attn_out = attn.o_proj(attn_out)
-            var = residual + attn_out
-
-            # Pre-norm MLP block.
-            residual = var
-            var = layer_module.post_attention_layernorm(var)
-            var = layer_module.mlp(var)
-            var = residual + var
+        for layer_idx, ref_input in enumerate(reference_layer_inputs):
+            if ckpt:
+                var = torch.utils.checkpoint.checkpoint(
+                    functools.partial(self._variant_layer, layer_idx),
+                    var, ref_input, cos_q, sin_q, cos_r, sin_r,
+                    cross_mask, self_mask, use_reentrant=False)
+            else:
+                var = self._variant_layer(layer_idx, var, ref_input,
+                                          cos_q, sin_q, cos_r, sin_r,
+                                          cross_mask, self_mask)
 
             if output_all_encoded_layers:
                 all_encoder_layers.append(var)

@@ -68,10 +68,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .carbon_layers import apply_rotary_pos_emb, build_causal_mask, repeat_kv
 from .variant_cache_layers import (VariantCacheCarbonEncoder,
                                    VariantCacheCarbonForCausalLM,
-                                   VariantCacheOutput, _rope_single)
+                                   VariantCacheOutput)
 
 
 # Every adaptable projection, and which of the two streams it is applied to in
@@ -186,108 +185,17 @@ class VariantLoRACarbonEncoder(VariantCacheCarbonEncoder):
             VariantLayerAdapters(config, self.lora_config)
             for _ in range(config.num_hidden_layers)])
 
-    def forward(
-        self,
-        variant_cache: torch.Tensor,          # (N, cs, hidden)
-        variant_cache_indices: torch.Tensor,  # (cs,)
-        hidden_states: torch.Tensor,          # (ref, hidden)
-        attention_mask: torch.Tensor,         # (ref,) or (1, ref)
-        output_all_encoded_layers: Optional[bool] = True,
-        reference_layer_inputs: Optional[List[torch.Tensor]] = None,
-    ) -> List[torch.Tensor]:
-        # The one structural change vs the parent: the frozen reference stream may
-        # be supplied instead of recomputed. With the base frozen it is a constant
-        # of the window, so `ReferenceCache` computes it once per run.
-        if reference_layer_inputs is None:
-            reference_layer_inputs = self.forward_reference(
-                hidden_states=hidden_states, attention_mask=attention_mask)
+    def _delta(self, layer_idx: int, name: str,
+               x: torch.Tensor) -> torch.Tensor | None:
+        """Route the parent's adapter hook to this layer's `VariantLayerAdapters`.
 
-        device, dtype = variant_cache.device, variant_cache.dtype
-        N, cache_seqlen = variant_cache.shape[:2]
-        ref_seqlen = reference_layer_inputs[0].shape[1]
-        h, kvh = self.num_attention_heads, self.num_key_value_heads
-        d = self.head_dim
-        groups = self.num_key_value_groups
-        scale = self.scaling
-        neg = torch.finfo(dtype).min
-
-        pos_q = variant_cache_indices.to(device=device).long()
-        pos_ref = torch.arange(ref_seqlen, device=device)
-
-        cos_q, sin_q = self.rotary_emb(variant_cache, pos_q.unsqueeze(0))
-        cos_r, sin_r = self.rotary_emb(variant_cache, pos_ref.unsqueeze(0))
-
-        keep = attention_mask.to(device=device).bool().reshape(ref_seqlen).clone()
-        keep[pos_q] = False
-        allow_c = (pos_ref[None, :] <= pos_q[:, None]) & keep[None, :]
-        cross_mask = torch.zeros(cache_seqlen, ref_seqlen, dtype=dtype,
-                                 device=device).masked_fill(~allow_c, neg)[None, None]
-
-        causal_s = pos_q[None, :] <= pos_q[:, None]
-        self_mask = torch.zeros(cache_seqlen, cache_seqlen, dtype=dtype,
-                                device=device).masked_fill(~causal_s, neg)[None, None]
-
-        var = variant_cache
-        all_encoder_layers: List[torch.Tensor] = []
-        for layer_module, ref_input, ad in zip(self.layers, reference_layer_inputs,
-                                               self.adapters):
-            attn = layer_module.self_attn
-
-            residual = var
-            var_normed = layer_module.input_layernorm(var)
-            ref_normed = layer_module.input_layernorm(
-                ref_input.to(device=device, dtype=dtype))
-
-            # Variant Q/K/V — the adapted stream.
-            q_v = _add(attn.q_proj(var_normed), ad.delta("q_proj", var_normed))
-            k_v = _add(attn.k_proj(var_normed), ad.delta("k_proj", var_normed))
-            v_v = _add(attn.v_proj(var_normed), ad.delta("v_proj", var_normed))
-            q_v = q_v.view(N, cache_seqlen, h, d).transpose(1, 2)
-            k_v = k_v.view(N, cache_seqlen, kvh, d).transpose(1, 2)
-            v_v = v_v.view(N, cache_seqlen, kvh, d).transpose(1, 2)
-
-            # Reference K/V — base projections only, never adapted, batch 1.
-            k_r = attn.k_proj(ref_normed).view(1, ref_seqlen, kvh, d).transpose(1, 2)
-            v_r = attn.v_proj(ref_normed).view(1, ref_seqlen, kvh, d).transpose(1, 2)
-
-            q_v, k_v = apply_rotary_pos_emb(q_v, k_v, cos_q, sin_q)
-            k_r = _rope_single(k_r, cos_r, sin_r)
-
-            k_v, v_v = repeat_kv(k_v, groups), repeat_kv(v_v, groups)
-            k_r, v_r = repeat_kv(k_r, groups), repeat_kv(v_r, groups)
-
-            out_c, lse_c = self._cross_attention_with_lse(q_v, k_r, v_r,
-                                                          cross_mask, scale)
-            out_s, lse_s = self._attention_with_lse(q_v, k_v, v_v, self_mask, scale)
-
-            lse = torch.logaddexp(lse_c, lse_s)
-            attn_out = (torch.exp(lse_c - lse) * out_c +
-                        torch.exp(lse_s - lse) * out_s)
-
-            attn_out = attn_out.transpose(1, 2).reshape(N, cache_seqlen, h * d)
-            attn_out = _add(attn.o_proj(attn_out), ad.delta("o_proj", attn_out))
-            var = residual + attn_out
-
-            # SwiGLU, unrolled from CarbonMLP.forward so each projection can take
-            # its own delta: down(act(gate(x)) * up(x)).
-            residual = var
-            x = layer_module.post_attention_layernorm(var)
-            mlp = layer_module.mlp
-            gate = _add(mlp.gate_proj(x), ad.delta("gate_proj", x))
-            up = _add(mlp.up_proj(x), ad.delta("up_proj", x))
-            inner = mlp.act_fn(gate) * up
-            var = residual + _add(mlp.down_proj(inner), ad.delta("down_proj", inner))
-
-            if output_all_encoded_layers:
-                all_encoder_layers.append(var)
-
-        if not output_all_encoded_layers:
-            all_encoder_layers.append(var)
-        return all_encoder_layers
-
-
-def _add(base: torch.Tensor, delta: torch.Tensor | None) -> torch.Tensor:
-    return base if delta is None else base + delta
+        The parent's `forward` / `_variant_layer` (which also carry the
+        variant-branch gradient-checkpointing support and the
+        ``reference_layer_inputs`` shortcut) are inherited unchanged; the hook is
+        called only from `_variant_layer`, never from `forward_reference`, so the
+        reference stream stays base-weights-only by construction.
+        """
+        return self.adapters[layer_idx].delta(name, x)
 
 
 class VariantLoRACarbonForCausalLM(VariantCacheCarbonForCausalLM):
