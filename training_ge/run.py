@@ -74,9 +74,11 @@ def evaluate(model, head, batches, device, tag, logger=None, step=None):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", choices=["sieve", "ath"], default="sieve")
     ap.add_argument("--n-genes", type=int, default=200)
     ap.add_argument("--hw", type=int, default=4000)
-    ap.add_argument("--max-lines", type=int, default=64)
+    ap.add_argument("--max-lines", type=int, default=None,
+                    help="rows per gene batch (default: 64 sieve, 700 ath)")
     ap.add_argument("--max-ac", type=int, default=5,
                     help="drop SNVs shared by more lines than this (stock "
                          "heterogeneity, not induced mutations)")
@@ -90,8 +92,14 @@ def main() -> int:
     ap.add_argument("--accum-genes", type=int, default=8)
     ap.add_argument("--val-frac", type=float, default=0.2,
                     help="fraction of sampled genes held out (holdout=genes)")
-    ap.add_argument("--holdout", choices=["genes", "lines", "family"],
-                    default="genes")
+    ap.add_argument("--holdout", choices=["genes", "lines", "family",
+                                          "accessions"],
+                    default="genes",
+                    help="'accessions' (ath only): train rows = acc_split "
+                         "train, val rows = acc_split val, same genes")
+    ap.add_argument("--variant-ckpt", action="store_true",
+                    help="checkpoint the variant branch (needed at ath-scale "
+                         "cs; on by default for --dataset ath)")
     ap.add_argument("--permute", action="store_true",
                     help="shuffle z across lines within each gene (control)")
     ap.add_argument("--seed", type=int, default=42)
@@ -110,12 +118,25 @@ def main() -> int:
     model.train()
     head = torch.nn.Linear(model.config.hidden_size, 1).to(device)
 
-    source = SieveWindowSource(tokenizer, half_window=args.hw,
-                               max_lines=args.max_lines, seed=args.seed,
-                               max_ac=args.max_ac)
+    if args.dataset == "ath":
+        from training_ge.ath_data import ArabidopsisWindowSource
+        source = ArabidopsisWindowSource(tokenizer, half_window=args.hw,
+                                         max_lines=args.max_lines or 700,
+                                         seed=args.seed)
+        model.encoder.variant_checkpointing = True  # cs ~100+ per window
+    else:
+        source = SieveWindowSource(tokenizer, half_window=args.hw,
+                                   max_lines=args.max_lines or 64,
+                                   seed=args.seed, max_ac=args.max_ac)
+        model.encoder.variant_checkpointing = args.variant_ckpt
     rng = np.random.default_rng(args.seed)
 
-    if args.holdout == "family":
+    if args.holdout == "accessions":
+        if args.dataset != "ath":
+            raise SystemExit("--holdout accessions requires --dataset ath")
+        # same genes both sides; rows partitioned by the committed acc_split
+        train_ix = val_ix = source.sample_genes(args.n_genes, split="train")
+    elif args.holdout == "family":
         train_ix = source.sample_genes(args.n_genes, split="train")
         # cap val: ~1.5k genes ≈ 16k pairs -> pearson SE ~0.008, plenty
         val_ix = source.sample_genes(min(max(args.n_genes // 4, 50), 1500),
@@ -135,12 +156,17 @@ def main() -> int:
         lines = sorted(source.snv)
         test = set(rng.choice(lines, size=len(lines) // 5, replace=False))
         line_split = test
+    excluded = set()
+    if args.holdout == "accessions":
+        # committed split: val rows held out, test rows excluded entirely
+        line_split = set(source.eco[source.acc_split == "val"])
+        excluded = set(source.eco[source.acc_split == "test"])
 
     def filter_batch(batch, want_val: bool):
         if line_split is None:
             return batch
         keep = [i for i, l in enumerate(batch.lines)
-                if (l in line_split) == want_val]
+                if (l in line_split) == want_val and l not in excluded]
         if not keep:
             return None
         k = torch.tensor(keep)
