@@ -38,6 +38,15 @@ entries. The cost is an older assembly; acceptable for cis-window modeling.
 
 ## Caveats
 
+* **"KNN-imputed" is not complete.** Measured on a 50k-row sample of chr10:
+  ~12% of calls at biallelic sites are still `N` genome-wide (5–6% within
+  gene-proximal windows, per `model_dev/probe_kremling_windows.py`). The pgen
+  carries these as missing; the training data layer must decide mask-vs-ref,
+  as for arabidopsis.
+* **Multiallelic sites are dropped** by `hmp_to_vcf.py` (~16% of hapmap rows
+  have 3–4 alleles; ~25.0M biallelic SNPs kept of roughly 30M rows). This
+  matches the repo convention (every other dataset here is biallelic-SNPs
+  only); splitting or top-2-allele retention would be an extension.
 * **MAF > 0.05 only** in the default genotype set — rare variants live in the
   companion tarball and are KNN-imputed with the same pipeline; a rare-variant
   extension is a follow-up, not part of the first build. (Kremling's own headline
