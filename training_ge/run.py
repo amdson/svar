@@ -77,6 +77,9 @@ def main() -> int:
     ap.add_argument("--n-genes", type=int, default=200)
     ap.add_argument("--hw", type=int, default=4000)
     ap.add_argument("--max-lines", type=int, default=64)
+    ap.add_argument("--max-ac", type=int, default=5,
+                    help="drop SNVs shared by more lines than this (stock "
+                         "heterogeneity, not induced mutations)")
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--head-lr", type=float, default=1e-3)
@@ -108,7 +111,8 @@ def main() -> int:
     head = torch.nn.Linear(model.config.hidden_size, 1).to(device)
 
     source = SieveWindowSource(tokenizer, half_window=args.hw,
-                               max_lines=args.max_lines, seed=args.seed)
+                               max_lines=args.max_lines, seed=args.seed,
+                               max_ac=args.max_ac)
     rng = np.random.default_rng(args.seed)
 
     if args.holdout == "family":

@@ -64,7 +64,7 @@ class SieveWindowSource:
     """Builds `GeneBatch`es for a sample of scoreable SIEVE genes."""
 
     def __init__(self, tokenizer, half_window: int = 4000,
-                 max_lines: int = 64, seed: int = 42):
+                 max_lines: int = 64, seed: int = 42, max_ac: int = 5):
         import h5py
         import pandas as pd
         import pysam
@@ -92,13 +92,23 @@ class SieveWindowSource:
         lix = {l: i for i, l in enumerate(self.line_id)}
         gix = {g: i for i, g in enumerate(self.gene_id)}
 
-        # per-line SNVs (hom-ALT only, per the arrays' builder)
+        # per-line SNVs (hom-ALT only, per the arrays' builder), dropping
+        # high-allele-count records: ~35% of records have ac>100 — shared
+        # Bd21-3 stock heterogeneity, not induced mutations, and confounded
+        # with line structure. max_ac<=5 keeps private + plausibly shared-M1
+        # mutations only.
+        self.max_ac = max_ac
         self.snv = {}
+        n_kept = n_all = 0
         with h5py.File(DATA + "sieve_snv_arrays.h5", "r") as f:
             for line in f["acc"]:
                 g = f["acc"][line]
-                self.snv[line] = (g["chrom"][:].astype(str), g["pos"][:],
-                                  g["alt"][:])
+                keep = g["ac"][:] <= max_ac
+                n_all += len(keep)
+                n_kept += int(keep.sum())
+                self.snv[line] = (g["chrom"][:].astype(str)[keep],
+                                  g["pos"][:][keep], g["alt"][:][keep])
+        print(f"SNV filter ac<={max_ac}: kept {n_kept:,}/{n_all:,} records")
 
         # per-line offset from background pairs (see sieve_signal_gate)
         pairs = pd.read_parquet(DATA + "sieve_pairs.parquet")
