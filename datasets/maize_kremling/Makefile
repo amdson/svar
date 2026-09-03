@@ -56,9 +56,10 @@ $(FASTA_GZ): | $(DATA)
 $(GFF_GZ): | $(DATA)
 	$(WGET) "$(URL_GFF)"
 
+# faidx via pysam (the svar env has no samtools binary; pysam bundles htslib).
 $(FASTA): $(FASTA_GZ)
-	gunzip -k "$<"
-	$(SAMTOOLS) faidx "$@"
+	gunzip -kf "$<"
+	$(CONDA_RUN) python -c "import pysam; pysam.faidx('$@')"
 
 # ── hapmap text → single bgzipped VCF (provisional REF = hapmap allele1) ──────
 # Streams each chromosome's tarball; het IUPAC codes become 0/1. REF/ALT are

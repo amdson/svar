@@ -40,10 +40,20 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    bgzip = subprocess.Popen(["bgzip", "-c", "-@", "4"],
-                             stdin=subprocess.PIPE,
-                             stdout=open(args.out, "wb"))
-    w = bgzip.stdin
+    # Write to a temp name, rename on success — a failed run must not leave a
+    # partial output that make would treat as up to date.
+    tmp_out = args.out + ".tmp"
+    # bgzip if available (tabix-compatible), else plain gzip — plink2 reads both.
+    bgzip = None
+    try:
+        bgzip = subprocess.Popen(["bgzip", "-c", "-@", "4"],
+                                 stdin=subprocess.PIPE,
+                                 stdout=open(tmp_out, "wb"))
+        w = bgzip.stdin
+    except FileNotFoundError:
+        import gzip
+        print("bgzip not found; falling back to Python gzip (level 1)")
+        w = gzip.open(tmp_out, "wb", compresslevel=1)
 
     taxa = None
     n_rows = n_skip = het_calls = total_calls = 0
@@ -89,8 +99,10 @@ def main() -> int:
               flush=True)
 
     w.close()
-    if bgzip.wait() != 0:
+    if bgzip is not None and bgzip.wait() != 0:
         raise SystemExit("bgzip failed")
+    import os
+    os.replace(tmp_out, args.out)
     het_rate = het_calls / max(total_calls, 1)
     print(f"wrote {args.out}: {n_rows:,} variants x {len(taxa)} taxa; "
           f"{n_skip:,} non-SNP rows skipped; sampled het rate {het_rate:.4f}")
