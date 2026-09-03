@@ -48,16 +48,11 @@ def pooled_delta(model, batch, device) -> torch.Tensor:
     return (delta * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
 
 
-def evaluate(model, head, source, gene_ix, device, tag, logger=None, step=None,
-             batch_filter=None):
+def evaluate(model, head, batches, device, tag, logger=None, step=None):
     model.eval()
     preds, targs = [], []
     with torch.no_grad():
-        for batch in source.iter_batches(gene_ix):
-            if batch_filter is not None:
-                batch = batch_filter(batch)
-                if batch is None:
-                    continue
+        for batch in batches:
             p = head(pooled_delta(model, batch, device)).squeeze(-1)
             preds.append(p.cpu())
             targs.append(batch.z)
@@ -118,7 +113,9 @@ def main() -> int:
 
     if args.holdout == "family":
         train_ix = source.sample_genes(args.n_genes, split="train")
-        val_ix = source.sample_genes(max(args.n_genes // 4, 50), split="val")
+        # cap val: ~1.5k genes ≈ 16k pairs -> pearson SE ~0.008, plenty
+        val_ix = source.sample_genes(min(max(args.n_genes // 4, 50), 1500),
+                                     split="val")
     else:
         ix = source.sample_genes(args.n_genes)
         n_val = int(len(ix) * args.val_frac)
@@ -148,6 +145,29 @@ def main() -> int:
         batch.lines = [batch.lines[i] for i in keep]
         return batch
 
+    # Materialize batches ONCE — a GeneBatch is ~11 KB, so even the full train
+    # family split (~16k genes) is a few hundred MB of host RAM, while
+    # rebuilding (fasta fetch + tokenize) every epoch dominated early runs'
+    # wall clock. Line filtering and the permutation control are applied here,
+    # so --permute is a *fixed* mislabeled dataset, the cleanest control.
+    import time
+    t0 = time.perf_counter()
+    train_batches = [b for b in (filter_batch(x, want_val=False)
+                                 for x in source.iter_batches(train_ix)) if b]
+    val_batches = [b for b in (filter_batch(x, want_val=True)
+                               for x in source.iter_batches(val_ix)) if b] \
+        if len(val_ix) else []
+    if args.permute:
+        g = torch.Generator().manual_seed(args.seed)
+        for b in train_batches:
+            if len(b.z) > 1:
+                b.z = b.z[torch.randperm(len(b.z), generator=g)]
+    n_tr = sum(len(b.z) for b in train_batches)
+    n_va = sum(len(b.z) for b in val_batches)
+    print(f"built {len(train_batches)} train batches ({n_tr:,} pairs), "
+          f"{len(val_batches)} val batches ({n_va:,} pairs) in "
+          f"{time.perf_counter() - t0:.0f}s; skips {source.skip_counts}")
+
     params = [{"params": model.trainable_parameters(), "lr": args.lr},
               {"params": head.parameters(), "lr": args.head_lr}]
     opt = torch.optim.AdamW(params, weight_decay=args.weight_decay)
@@ -160,41 +180,28 @@ def main() -> int:
     best_val = -math.inf
     zero_r2_note = "predict-zero baseline is R2=0 by construction"
     print(zero_r2_note)
+    train_probe = train_batches[:max(len(val_batches), 40)]
     for epoch in range(args.epochs):
-        order = rng.permutation(train_ix)
-        batches = []
+        order = rng.permutation(len(train_batches))
         losses = []
-        for batch in source.iter_batches(order):
-            batch = filter_batch(batch, want_val=False)
-            if batch is None:
-                continue
-            if args.permute:
-                batch.z = batch.z[torch.randperm(len(batch.z))]
-            batches.append(batch)
-            if len(batches) < args.accum_genes:
-                continue
-            group_n = sum(len(b.z) for b in batches)
+        for g0 in range(0, len(order), args.accum_genes):
+            group = [train_batches[i] for i in order[g0:g0 + args.accum_genes]]
+            group_n = sum(len(b.z) for b in group)
             opt.zero_grad(set_to_none=True)
-            for b in batches:
+            for b in group:
                 pred = head(pooled_delta(model, b, device)).squeeze(-1)
                 loss = ((pred - b.z.to(device)) ** 2).sum() / group_n
                 loss.backward()
                 losses.append(loss.item())
             opt.step()
             step += 1
-            batches = []
             if step % 20 == 0:
                 logger.log({"step": step, "epoch": epoch,
-                            "train/mse": float(np.sum(losses[-args.accum_genes:]))})
-        evaluate(model, head, source, train_ix[:max(len(val_ix), 40)], device,
-                 "train", logger, step,
-                 batch_filter=(lambda b: filter_batch(b, want_val=False))
-                 if line_split else None)
-        if len(val_ix):
-            val_row = evaluate(model, head, source, val_ix, device, "val",
-                               logger, step,
-                               batch_filter=(lambda b: filter_batch(b, want_val=True))
-                               if line_split else None)
+                            "train/mse": float(np.sum(losses[-len(group):]))})
+        evaluate(model, head, train_probe, device, "train", logger, step)
+        if val_batches:
+            val_row = evaluate(model, head, val_batches, device, "val",
+                               logger, step)
             key = "val/pearson"
             if val_row.get(key, -math.inf) > best_val:
                 best_val = val_row[key]
