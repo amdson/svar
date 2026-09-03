@@ -97,6 +97,9 @@ def main() -> int:
                     default="genes",
                     help="'accessions' (ath only): train rows = acc_split "
                          "train, val rows = acc_split val, same genes")
+    ap.add_argument("--kinship-residual", action="store_true",
+                    help="ath only: train/eval on z minus the train-fitted "
+                         "GBLUP prediction (relatedness-orthogonal target)")
     ap.add_argument("--variant-ckpt", action="store_true",
                     help="checkpoint the variant branch (needed at ath-scale "
                          "cs; on by default for --dataset ath)")
@@ -120,9 +123,9 @@ def main() -> int:
 
     if args.dataset == "ath":
         from training_ge.ath_data import ArabidopsisWindowSource
-        source = ArabidopsisWindowSource(tokenizer, half_window=args.hw,
-                                         max_lines=args.max_lines or 700,
-                                         seed=args.seed)
+        source = ArabidopsisWindowSource(
+            tokenizer, half_window=args.hw, max_lines=args.max_lines or 700,
+            seed=args.seed, kinship_residual=args.kinship_residual)
         model.encoder.variant_checkpointing = True  # cs ~100+ per window
     else:
         source = SieveWindowSource(tokenizer, half_window=args.hw,

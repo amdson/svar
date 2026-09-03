@@ -43,7 +43,8 @@ def load_pvar(path):
 
 class ArabidopsisWindowSource:
     def __init__(self, tokenizer, half_window: int = 4000,
-                 max_lines: int = 700, seed: int = 42, max_ac: int = 0):
+                 max_lines: int = 700, seed: int = 42, max_ac: int = 0,
+                 kinship_residual: bool = False, gblup_lambda: float = 3.0):
         import h5py
         import pgenlib
         import pysam
@@ -69,6 +70,20 @@ class ArabidopsisWindowSource:
         sd = dev[:, tr].std(axis=1, ddof=1, keepdims=True)
         self.scoreable = sd[:, 0] > 1e-3
         self.z_all = (dev - mu) / np.where(sd > 1e-3, sd, 1.0)  # (genes, 665)
+
+        if kinship_residual:
+            # Subtract the train-fitted GBLUP prediction from every accession's
+            # z: val rows become orthogonal-to-relatedness by construction
+            # (pooled val pearson of GBLUP itself was 0.167 at lambda=3).
+            # Conservative: also removes the stratified share of true cis
+            # effects — a positive result is unimpeachable, a null is soft.
+            K = np.load(f"{DATA}/expression/baselines/grm.npy")
+            K_at = K[:, tr]                       # (665, n_train)
+            K_tt = K[np.ix_(tr, tr)]
+            n_t = K_tt.shape[0]
+            A = K_at @ np.linalg.solve(K_tt + gblup_lambda * np.eye(n_t),
+                                       np.eye(n_t))       # (665, n_train)
+            self.z_all = self.z_all - self.z_all[:, tr] @ A.T
 
         psam = [l.split()[0] for l in open(PFILE + ".psam")
                 if not l.startswith("#")]
