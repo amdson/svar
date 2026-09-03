@@ -100,6 +100,10 @@ def main() -> int:
     ap.add_argument("--kinship-residual", action="store_true",
                     help="ath only: train/eval on z minus the train-fitted "
                          "GBLUP prediction (relatedness-orthogonal target)")
+    ap.add_argument("--enet-residual", action="store_true",
+                    help="ath only: additionally subtract a per-gene cis "
+                         "elastic net (double residual — signal beyond both "
+                         "relatedness and linear cis effects)")
     ap.add_argument("--variant-ckpt", action="store_true",
                     help="checkpoint the variant branch (needed at ath-scale "
                          "cs; on by default for --dataset ath)")
@@ -151,6 +155,10 @@ def main() -> int:
         # holdout=lines: same genes both sides; lines partitioned inside the loop
         if args.holdout == "lines":
             train_ix = val_ix = ix
+    if args.enet_residual:
+        if args.dataset != "ath":
+            raise SystemExit("--enet-residual requires --dataset ath")
+        source.subtract_enet(np.unique(np.concatenate([train_ix, val_ix])))
     print(f"{len(train_ix)} train genes, {len(val_ix)} val genes "
           f"(holdout={args.holdout}, hw={args.hw}, permute={args.permute})")
 

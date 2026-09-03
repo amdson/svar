@@ -108,6 +108,62 @@ class ArabidopsisWindowSource:
             ok &= self.fam_split == split
         return self.rng.permutation(np.flatnonzero(ok))[:n_genes]
 
+    def subtract_enet(self, gene_ix: np.ndarray) -> None:
+        """Double-residual target: subtract a per-gene cis elastic net (fit on
+        TRAIN accessions, predicted out-of-sample for all) from self.z_all for
+        each gene in gene_ix. Apply on top of the kinship residual so what
+        remains is orthogonal to BOTH relatedness and linear cis effects — the
+        signal only a nonlinear/motif-level model could still find.
+
+        No leakage: the enet sees only train accessions' z; its val predictions
+        are out-of-sample, exactly as in ath_elasticnet_control.
+        """
+        import warnings
+
+        from sklearn.exceptions import ConvergenceWarning
+        from sklearn.linear_model import ElasticNetCV
+        warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
+        tr = self.acc_split == "train"
+        tr_cols = self.panel_cols[tr]
+        done = fit = 0
+        for gi in gene_ix:
+            gi = int(gi)
+            c = self.chrom[gi]
+            ix = self.by_chrom.get(c)
+            if ix is None:
+                continue
+            pos_c = self.v_pos[ix]
+            a, b = np.searchsorted(pos_c, [self.tss[gi] - self.hw,
+                                           self.tss[gi] + self.hw])
+            if b <= a:
+                continue
+            vsel = ix[a:b]
+            keep = np.array([len(self.v_ref[v]) == 1 and len(self.v_alt[v]) == 1
+                             for v in vsel])
+            vsel = vsel[keep]
+            if len(vsel) == 0:
+                continue
+            lo, hi = int(vsel[0]), int(vsel[-1]) + 1
+            geno = np.empty((hi - lo, self.n_psam), dtype=np.int8)
+            self.reader.read_range(lo, hi, geno)
+            geno = geno[vsel - lo][:, self.panel_cols]
+            alt = (geno > 0).astype(np.float32)          # (S, 665)
+            X = alt.T                                    # (665, S)
+            X_tr = X[tr]
+            p = X_tr.mean(0)
+            keepc = (p > 0) & (p < 1)
+            done += 1
+            if keepc.sum() == 0:
+                continue
+            enet = ElasticNetCV(l1_ratio=[0.1, 0.5, 0.9], n_alphas=20, cv=5,
+                                max_iter=3000, n_jobs=-1, random_state=0)
+            enet.fit(X_tr[:, keepc], self.z_all[gi, tr])
+            self.z_all[gi] = self.z_all[gi] - enet.predict(X[:, keepc])
+            fit += 1
+        print(f"subtract_enet: fit {fit}/{done} genes "
+              f"(rest had no polymorphic cis-SNP)")
+
     def build(self, gi: int) -> Optional[GeneBatch]:
         c = self.chrom[gi]
         w0 = int(self.tss[gi]) - self.hw          # 1-based inclusive
