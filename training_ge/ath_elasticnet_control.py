@@ -37,6 +37,11 @@ def main() -> int:
     ap.add_argument("--hw", type=int, default=4000)
     ap.add_argument("--gblup-lambda", type=float, default=3.0)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--enet-residual", action="store_true",
+                    help="linear-exhaustion check: fit a SECOND elastic net "
+                         "on the double residual (kinship + enet #1 removed). "
+                         "~0 means enet #1 was CV-optimal and whatever the "
+                         "cache finds there is beyond linear reach.")
     args = ap.parse_args()
 
     import h5py
@@ -54,8 +59,13 @@ def main() -> int:
     # verify_id6 draw, is reproduced by construction).
     tok = AutoTokenizer.from_pretrained("HuggingFaceBio/Carbon-500M",
                                         trust_remote_code=True)
-    src = ArabidopsisWindowSource(tok, half_window=args.hw, seed=args.seed)
+    src = ArabidopsisWindowSource(tok, half_window=args.hw, seed=args.seed,
+                                  kinship_residual=True,
+                                  gblup_lambda=args.gblup_lambda)
     gene_ix = src.sample_genes(args.n_genes, split="train")
+    if args.enet_residual:
+        src.subtract_enet(gene_ix)          # enet #1, identical recipe
+    z = src.z_all                           # kinship-(and enet-)subtracted
 
     with h5py.File(H5, "r") as f:
         dev = f["deviation"][:]
@@ -64,19 +74,7 @@ def main() -> int:
         eco = f["accessions/ecotype_id"][:].astype(str)
         acc_split = f["accessions/acc_split"][:].astype(str)
 
-    tr, va = acc_split == "train", acc_split == "va" + "l"
-    mu = dev[:, tr].mean(axis=1, keepdims=True)
-    sd = dev[:, tr].std(axis=1, ddof=1, keepdims=True)
-    scoreable = sd[:, 0] > 1e-3
-    z = (dev - mu) / np.where(sd > 1e-3, sd, 1.0)
-
-    # identical GBLUP residualization to ath_data.py
-    K = np.load(f"{DATA}/expression/baselines/grm.npy")
-    K_at, K_tt = K[:, tr], K[np.ix_(tr, tr)]
-    n_t = K_tt.shape[0]
-    A = K_at @ np.linalg.solve(K_tt + args.gblup_lambda * np.eye(n_t),
-                               np.eye(n_t))
-    z = z - z[:, tr] @ A.T                     # kinship-subtracted target
+    tr, va = acc_split == "train", acc_split == "val"
 
     psam = [l.split()[0] for l in open(PFILE + ".psam") if not l.startswith("#")]
     col = {s: i for i, s in enumerate(psam)}
@@ -138,10 +136,15 @@ def main() -> int:
           f"{len(T):,} val pairs")
     print(f"POOLED val pearson (elastic net) = {r.statistic:+.4f} "
           f"(p={r.pvalue:.1e})")
-    print(f"per-gene val pearson: median {np.median(per_gene):+.4f}, "
-          f"mean {np.mean(per_gene):+.4f}")
-    print("\ncompare: variant cache (r=1, wd=3) plateaued ~+0.063 pooled val "
-          "pearson on the same target/split")
+    print(f"per-gene val pearson: median {np.nanmedian(per_gene):+.4f}, "
+          f"mean {np.nanmean(per_gene):+.4f}")
+    if args.enet_residual:
+        print("\nlinear-exhaustion check: cache scored ~+0.05 on this same "
+              "double-residual target; enet #2 near 0 => that signal is "
+              "beyond linear reach, enet #2 >= 0.05 => enet #1 underfit")
+    else:
+        print("\ncompare: variant cache (r=1, wd=3) plateaued ~+0.063 pooled "
+              "val pearson on the same target/split")
     return 0
 
 
