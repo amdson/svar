@@ -35,17 +35,52 @@ import torch
 # which this env doesn't have (vcf_polars is the data agent's new path)
 from crop_embed.logging_utils import MetricLogger, metrics_path_for
 
+HAP_CHUNK = None  # set from --hap-chunk in main()
 
-def pooled_delta(model, batch, device) -> torch.Tensor:
-    """(N, hidden) fp32: mean over own-mutation positions of (mutant − ref)."""
+
+def _delta_rows(model, batch, device, rows: torch.Tensor) -> torch.Tensor:
+    """pooled (mutant − ref) delta for a subset of haplotype rows (row 0 = ref
+    is always prepended so every chunk carries its own reference baseline)."""
+    hap = torch.cat([batch.hap_ids[:1], batch.hap_ids[1:][rows]]).to(device)
     out = model(batch.ref_ids.to(device),
                 variant_positions=batch.cache_idx.to(device),
-                variant_input_ids=batch.hap_ids.to(device),
-                output_logits=False)
-    h = out.last_hidden_state.float()          # (N+1, C, H)
+                variant_input_ids=hap, output_logits=False)
+    h = out.last_hidden_state.float()          # (n+1, C, H)
     delta = h[1:] - h[0:1]                     # row 0 = reference
-    m = batch.own_mask.to(device).unsqueeze(-1).float()
+    m = batch.own_mask[rows].to(device).unsqueeze(-1).float()
     return (delta * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+
+
+def pooled_delta(model, batch, device, hap_chunk=None, no_grad=False) -> torch.Tensor:
+    """(N, hidden) fp32: mean over own-mutation positions of (mutant − ref).
+    hap_chunk splits the N rows into chunks (memory at exact-forward cs=T);
+    no_grad runs the encoder without a graph (head-only training)."""
+    N = batch.hap_ids.shape[0] - 1
+    idx = torch.arange(N)
+    chunks = [idx] if not hap_chunk else idx.split(hap_chunk)
+    ctx = torch.no_grad() if no_grad else torch.enable_grad()
+    outs = []
+    with ctx:
+        for rows in chunks:
+            outs.append(_delta_rows(model, batch, device, rows))
+    return torch.cat(outs)
+
+
+def to_exact(batch):
+    """Recompute EVERY window position through the cache: cache_idx = all of
+    0..T-1, so the cross branch is fully masked and the self branch is a
+    plain causal full forward of each haplotype's complete sequence — the
+    bruteforce/exact-forward control, sharing the LoRA, readout and target
+    code with the cache runs. Cost scales with rows x T² (no amortization)."""
+    T = batch.ref_ids.shape[0]
+    R = batch.hap_ids.shape[0]
+    full = batch.ref_ids.unsqueeze(0).repeat(R, 1)
+    full[:, batch.cache_idx] = batch.hap_ids
+    own = torch.zeros(R - 1, T, dtype=torch.bool)
+    own[:, batch.cache_idx] = batch.own_mask
+    batch.hap_ids, batch.own_mask = full, own
+    batch.cache_idx = torch.arange(T)
+    return batch
 
 
 def evaluate(model, head, batches, device, tag, logger=None, step=None):
@@ -53,7 +88,7 @@ def evaluate(model, head, batches, device, tag, logger=None, step=None):
     preds, targs = [], []
     with torch.no_grad():
         for batch in batches:
-            p = head(pooled_delta(model, batch, device)).squeeze(-1)
+            p = head(pooled_delta(model, batch, device, HAP_CHUNK)).squeeze(-1)
             preds.append(p.cpu())
             targs.append(batch.z)
     model.train()
@@ -104,6 +139,15 @@ def main() -> int:
                     help="ath only: additionally subtract a per-gene cis "
                          "elastic net (double residual — signal beyond both "
                          "relatedness and linear cis effects)")
+    ap.add_argument("--exact", action="store_true",
+                    help="exact-forward control: recompute every window "
+                         "position (cache_idx = all), i.e. a full forward per "
+                         "haplotype; cost ~ rows x T^2")
+    ap.add_argument("--hap-chunk", type=int, default=None,
+                    help="rows per encoder call (default: 16 with --exact)")
+    ap.add_argument("--head-only", action="store_true",
+                    help="freeze the adapters: pretrained Carbon features + "
+                         "fitted head only (the zero-shot-style row)")
     ap.add_argument("--variant-ckpt", action="store_true",
                     help="checkpoint the variant branch (needed at ath-scale "
                          "cs; on by default for --dataset ath)")
@@ -198,6 +242,14 @@ def main() -> int:
     val_batches = [b for b in (filter_batch(x, want_val=True)
                                for x in source.iter_batches(val_ix)) if b] \
         if len(val_ix) else []
+    global HAP_CHUNK
+    HAP_CHUNK = args.hap_chunk or (16 if args.exact else None)
+    if args.exact:
+        for b in train_batches + val_batches:
+            to_exact(b)
+        model.encoder.variant_checkpointing = True
+        print(f"--exact: cache_idx = all {train_batches[0].ref_ids.shape[0]} "
+              f"positions; hap_chunk={HAP_CHUNK}")
     if args.permute:
         g = torch.Generator().manual_seed(args.seed)
         for b in train_batches:
@@ -209,8 +261,12 @@ def main() -> int:
           f"{len(val_batches)} val batches ({n_va:,} pairs) in "
           f"{time.perf_counter() - t0:.0f}s; skips {source.skip_counts}")
 
-    params = [{"params": model.trainable_parameters(), "lr": args.lr},
-              {"params": head.parameters(), "lr": args.head_lr}]
+    params = [{"params": head.parameters(), "lr": args.head_lr}]
+    if not args.head_only:
+        params.insert(0, {"params": model.trainable_parameters(), "lr": args.lr})
+    else:
+        for p_ in model.trainable_parameters():
+            p_.requires_grad_(False)
     opt = torch.optim.AdamW(params, weight_decay=args.weight_decay)
     n_train = sum(p.numel() for g in params for p in g["params"])
     print(f"trainable parameters: {n_train:,}")
@@ -230,7 +286,8 @@ def main() -> int:
             group_n = sum(len(b.z) for b in group)
             opt.zero_grad(set_to_none=True)
             for b in group:
-                pred = head(pooled_delta(model, b, device)).squeeze(-1)
+                pred = head(pooled_delta(model, b, device, HAP_CHUNK,
+                                        no_grad=args.head_only)).squeeze(-1)
                 loss = ((pred - b.z.to(device)) ** 2).sum() / group_n
                 loss.backward()
                 losses.append(loss.item())
