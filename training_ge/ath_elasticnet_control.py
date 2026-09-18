@@ -37,6 +37,11 @@ def main() -> int:
     ap.add_argument("--hw", type=int, default=4000)
     ap.add_argument("--gblup-lambda", type=float, default=3.0)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--split-key", default="acc_split",
+                    choices=["acc_split", "kin_split"])
+    ap.add_argument("--no-kinship-residual", action="store_true",
+                    help="fit/score on raw z (for kin_split, where the "
+                         "split itself controls relatedness)")
     ap.add_argument("--enet-residual", action="store_true",
                     help="linear-exhaustion check: fit a SECOND elastic net "
                          "on the double residual (kinship + enet #1 removed). "
@@ -60,8 +65,9 @@ def main() -> int:
     tok = AutoTokenizer.from_pretrained("HuggingFaceBio/Carbon-500M",
                                         trust_remote_code=True)
     src = ArabidopsisWindowSource(tok, half_window=args.hw, seed=args.seed,
-                                  kinship_residual=True,
-                                  gblup_lambda=args.gblup_lambda)
+                                  kinship_residual=not args.no_kinship_residual,
+                                  gblup_lambda=args.gblup_lambda,
+                                  split_key=args.split_key)
     gene_ix = src.sample_genes(args.n_genes, split="train")
     if args.enet_residual:
         src.subtract_enet(gene_ix)          # enet #1, identical recipe
@@ -72,7 +78,8 @@ def main() -> int:
         chrom = f["genes/chrom"][:].astype(str)
         tss = f["genes/tss"][:]
         eco = f["accessions/ecotype_id"][:].astype(str)
-        acc_split = f["accessions/acc_split"][:].astype(str)
+        acc_split = f[f"accessions/{args.split_key}"][:].astype(str)
+    print(f"split={args.split_key} kinship_residual={not args.no_kinship_residual}")
 
     tr, va = acc_split == "train", acc_split == "val"
 
@@ -86,7 +93,7 @@ def main() -> int:
     reader = pgenlib.PgenReader(str(PFILE + ".pgen").encode())
     n_psam = len(psam)
 
-    preds, targs, per_gene = [], [], []
+    preds, targs, per_gene, novel = [], [], [], []
     n_skip = 0
     for k, gi in enumerate(gene_ix):
         c = chrom[gi]
@@ -109,9 +116,12 @@ def main() -> int:
         alt = (geno > 0)
         X_tr = alt[:, tr_cols].T.astype(np.float32)
         X_va = alt[:, va_cols].T.astype(np.float32)
-        # drop monomorphic-in-train columns
+        # drop monomorphic-in-train columns; a val row carrying an alt at an
+        # absent-in-train column is a 'novel-allele' row (same definition as
+        # ath_data.GeneBatch.novel, so the cache evaluator's subsets match)
         p = X_tr.mean(0)
         keepc = (p > 0) & (p < 1)
+        novel.append((X_va[:, p == 0] > 0).any(1))
         X_tr, X_va = X_tr[:, keepc], X_va[:, keepc]
         if X_tr.shape[1] == 0:
             n_skip += 1
@@ -131,11 +141,16 @@ def main() -> int:
                   f"{pearsonr(tt, pp).statistic:+.4f}")
 
     P, T = np.concatenate(preds), np.concatenate(targs)
+    Nv = np.concatenate(novel)
     r = pearsonr(T, P)
     print(f"\nscored {len(preds)}/{len(gene_ix)} genes ({n_skip} skipped), "
           f"{len(T):,} val pairs")
     print(f"POOLED val pearson (elastic net) = {r.statistic:+.4f} "
           f"(p={r.pvalue:.1e})")
+    for tag, m in (("novel-allele rows", Nv), ("seen-allele rows", ~Nv)):
+        if m.sum() >= 30 and P[m].std() > 0:
+            print(f"  {tag:18s} n={m.sum():,}  pooled pearson="
+                  f"{pearsonr(T[m], P[m]).statistic:+.4f}")
     print(f"per-gene val pearson: median {np.nanmedian(per_gene):+.4f}, "
           f"mean {np.nanmean(per_gene):+.4f}")
     if args.enet_residual:

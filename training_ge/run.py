@@ -147,6 +147,10 @@ def main() -> int:
                     default="genes",
                     help="'accessions' (ath only): train rows = acc_split "
                          "train, val rows = acc_split val, same genes")
+    ap.add_argument("--split-key", default="acc_split",
+                    choices=["acc_split", "kin_split"],
+                    help="ath accession partition: random (acc_split) or "
+                         "admixture-group holdout (kin_split)")
     ap.add_argument("--kinship-residual", action="store_true",
                     help="ath only: train/eval on z minus the train-fitted "
                          "GBLUP prediction (relatedness-orthogonal target)")
@@ -194,7 +198,8 @@ def main() -> int:
         from training_ge.ath_data import ArabidopsisWindowSource
         source = ArabidopsisWindowSource(
             tokenizer, half_window=args.hw, max_lines=args.max_lines or 700,
-            seed=args.seed, kinship_residual=args.kinship_residual)
+            seed=args.seed, kinship_residual=args.kinship_residual,
+            split_key=args.split_key)
         model.encoder.variant_checkpointing = True  # cs ~100+ per window
     else:
         source = SieveWindowSource(tokenizer, half_window=args.hw,
@@ -236,7 +241,8 @@ def main() -> int:
     if args.holdout == "accessions":
         # committed split: val rows held out, test rows excluded entirely
         line_split = set(source.eco[source.acc_split == "val"])
-        excluded = set(source.eco[source.acc_split == "test"])
+        excluded = set(source.eco[np.isin(source.acc_split,
+                                          ["test", "excluded"])])
 
     def filter_batch(batch, want_val: bool):
         if line_split is None:

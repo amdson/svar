@@ -44,7 +44,8 @@ def load_pvar(path):
 class ArabidopsisWindowSource:
     def __init__(self, tokenizer, half_window: int = 4000,
                  max_lines: int = 700, seed: int = 42, max_ac: int = 0,
-                 kinship_residual: bool = False, gblup_lambda: float = 3.0):
+                 kinship_residual: bool = False, gblup_lambda: float = 3.0,
+                 split_key: str = "acc_split"):
         import h5py
         import pgenlib
         import pysam
@@ -63,7 +64,13 @@ class ArabidopsisWindowSource:
             self.tss = f["genes/tss"][:]
             self.fam_split = f["genes/family_split"][:].astype(str)
             self.eco = f["accessions/ecotype_id"][:].astype(str)
-            self.acc_split = f["accessions/acc_split"][:].astype(str)
+            # accession partition: 'acc_split' (random) or 'kin_split'
+            # (admixture-group holdout, see ath_kinship_split.py); values
+            # train/val/test(/excluded). Everything downstream — target
+            # standardisation, GBLUP fit, enet fit — uses the train rows of
+            # this key.
+            self.split_key = split_key
+            self.acc_split = f[f"accessions/{split_key}"][:].astype(str)
 
         tr = self.acc_split == "train"
         mu = dev[:, tr].mean(axis=1, keepdims=True)
@@ -243,6 +250,13 @@ class ArabidopsisWindowSource:
             return None
         kr = keep_rows.nonzero(as_tuple=True)[0]
         z = self.z_all[gi][accs[kr.numpy()]].astype(np.float32)
+        # unseen-allele flag: SNPs carried by no train accession are exactly
+        # the columns a train-fitted per-gene enet drops (monomorphic), so a
+        # row carrying one is where a linear model has zero information and
+        # a sequence model may still have some.
+        in_train = alt_carrier[:, self.acc_split == "train"].any(1)   # (S,)
+        novel_row = (alt_carrier[~in_train][:, accs]).any(0)          # (N,)
+        novel = torch.from_numpy(novel_row[kr.numpy()])
 
         return GeneBatch(gene_id=self.gene_id[gi], fam_split=self.fam_split[gi],
                          ref_ids=ref_ids,
@@ -250,7 +264,8 @@ class ArabidopsisWindowSource:
                          hap_ids=torch.cat([hap[:1], hap[1:][kr]]),
                          own_mask=own[kr],
                          z=torch.from_numpy(z),
-                         lines=[self.eco[ai] for ai in accs[kr.numpy()]])
+                         lines=[self.eco[ai] for ai in accs[kr.numpy()]],
+                         novel=novel)
 
     def iter_batches(self, gene_ix: np.ndarray):
         for gi in gene_ix:

@@ -58,6 +58,8 @@ class GeneBatch:
     own_mask: torch.Tensor  # (N, C) bool — line's own mutated positions
     z: torch.Tensor         # (N,) float — offset-corrected z targets
     lines: list             # line ids, parallel to z
+    novel: Optional[torch.Tensor] = None  # (N,) bool — row carries >=1 alt
+                            # allele at a SNP no TRAIN accession carries (ath)
 
 
 class SieveWindowSource:

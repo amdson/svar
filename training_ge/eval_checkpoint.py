@@ -25,6 +25,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--kinship-residual", action="store_true")
     ap.add_argument("--enet-residual", action="store_true")
+    ap.add_argument("--split-key", default=None,
+                    help="defaults to the checkpoint's training split key")
     ap.add_argument("--rows-per-call", type=int, default=64)
     ap.add_argument("--splits", default="val", help="comma list of acc splits to score")
     ap.add_argument("--replicate-subsample", type=int, default=None,
@@ -59,7 +61,9 @@ def main() -> int:
     src = ArabidopsisWindowSource(
         tok, half_window=args.hw,
         max_lines=args.replicate_subsample or 700, seed=args.seed,
-        kinship_residual=args.kinship_residual)
+        kinship_residual=args.kinship_residual,
+        split_key=args.split_key or a.get("split_key", "acc_split"))
+    print(f"accession split: {src.split_key}")
     gene_ix = src.sample_genes(args.n_genes, split="train")  # same set as training
     if args.enet_residual:
         if args.z_cache and os.path.exists(args.z_cache):
@@ -78,6 +82,7 @@ def main() -> int:
 
     preds = {s: [] for s in want}
     targs = {s: [] for s in want}
+    novel = {s: [] for s in want}
     with torch.no_grad():
         for gi in gene_ix:
             b = src.build(int(gi))
@@ -103,12 +108,18 @@ def main() -> int:
                 for s, w in want.items():
                     if b.lines[i] in w:
                         preds[s].append(p[k]); targs[s].append(float(b.z[i]))
+                        novel[s].append(bool(b.novel[i]))
     for s in want:
         P, T = np.array(preds[s]), np.array(targs[s])
-        r = np.corrcoef(P, T)[0, 1]
-        se = 1 / np.sqrt(len(T))
-        print(f"[{s}] n={len(T):,}  pooled pearson={r:+.4f}  (SE~{se:.3f}, "
-              f"{r/se:.1f} sigma)")
+        Nv = np.array(novel[s])
+        for tag, m in (("all", np.ones(len(T), bool)),
+                       ("novel-allele rows", Nv), ("seen-allele rows", ~Nv)):
+            if m.sum() < 30:
+                continue
+            r = np.corrcoef(P[m], T[m])[0, 1]
+            se = 1 / np.sqrt(m.sum())
+            print(f"[{s}] {tag:18s} n={m.sum():,}  pooled pearson={r:+.4f}  "
+                  f"(SE~{se:.3f}, {r/se:.1f} sigma)")
     return 0
 
 
