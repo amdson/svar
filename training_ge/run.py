@@ -83,6 +83,21 @@ def to_exact(batch):
     return batch
 
 
+def _sample_rows(batch, k: int, rng):
+    """A shallow copy of `batch` holding a random k of its haplotype rows
+    (row 0, the reference, is kept). Fresh draw per gene visit."""
+    import copy
+    N = batch.hap_ids.shape[0] - 1
+    if N <= k:
+        return batch
+    keep = torch.from_numpy(np.sort(rng.choice(N, k, replace=False)))
+    b = copy.copy(batch)
+    b.hap_ids = torch.cat([batch.hap_ids[:1], batch.hap_ids[1:][keep]])
+    b.own_mask, b.z = batch.own_mask[keep], batch.z[keep]
+    b.lines = [batch.lines[i] for i in keep.tolist()]
+    return b
+
+
 def evaluate(model, head, batches, device, tag, logger=None, step=None):
     model.eval()
     preds, targs = [], []
@@ -145,6 +160,12 @@ def main() -> int:
                          "haplotype; cost ~ rows x T^2")
     ap.add_argument("--hap-chunk", type=int, default=None,
                     help="rows per encoder call (default: 16 with --exact)")
+    ap.add_argument("--rows-per-step", type=int, default=None,
+                    help="stochastic minibatching over accessions: each gene "
+                         "visit uses a fresh random subset of this many rows "
+                         "(all rows across epochs; eval always scores all). "
+                         "Unlike --hap-chunk this changes the objective's "
+                         "sampling, not its memory staging.")
     ap.add_argument("--head-only", action="store_true",
                     help="freeze the adapters: pretrained Carbon features + "
                          "fitted head only (the zero-shot-style row)")
@@ -285,6 +306,9 @@ def main() -> int:
             group = [train_batches[i] for i in order[g0:g0 + args.accum_genes]]
             group_n = sum(len(b.z) for b in group)
             opt.zero_grad(set_to_none=True)
+            if args.rows_per_step:
+                group = [_sample_rows(b, args.rows_per_step, rng) for b in group]
+                group_n = sum(len(b.z) for b in group)
             for b in group:
                 pred = head(pooled_delta(model, b, device, HAP_CHUNK,
                                         no_grad=args.head_only)).squeeze(-1)
