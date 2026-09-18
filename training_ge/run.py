@@ -98,12 +98,46 @@ def _sample_rows(batch, k: int, rng):
     return b
 
 
+class GeneHead(torch.nn.Module):
+    """Linear readout with an optional per-gene ridge component.
+
+    pred = feat . (w0 + w_g) + b0 + b_g.  w_g / b_g live in embedding tables
+    indexed by gene id and start at zero, so an unseen gene (family holdout,
+    or index -1) falls back to the shared head exactly. This is the fair
+    counterpart to a PrediXcan-style per-gene elastic net: the same per-gene
+    capacity, but over cache features instead of genotypes. Decay w_g
+    separately (--gene-wd): 1024 weights per gene vs ~530 train accessions.
+    """
+
+    def __init__(self, hidden: int, gene_ids=None):
+        super().__init__()
+        self.shared = torch.nn.Linear(hidden, 1)
+        self.gene_index = {g: i for i, g in enumerate(gene_ids or [])}
+        n = max(len(self.gene_index), 1)
+        self.w_g = torch.nn.Embedding(n, hidden)
+        self.b_g = torch.nn.Embedding(n, 1)
+        torch.nn.init.zeros_(self.w_g.weight)
+        torch.nn.init.zeros_(self.b_g.weight)
+
+    def forward(self, feat, gene_id=None):
+        out = self.shared(feat)
+        i = self.gene_index.get(gene_id, -1) if self.gene_index else -1
+        if i >= 0:
+            idx = torch.tensor(i, device=feat.device)
+            out = out + feat @ self.w_g(idx).unsqueeze(-1) + self.b_g(idx)
+        return out
+
+    def gene_parameters(self):
+        return [self.w_g.weight, self.b_g.weight]
+
+
 def evaluate(model, head, batches, device, tag, logger=None, step=None):
     model.eval()
     preds, targs = [], []
     with torch.no_grad():
         for batch in batches:
-            p = head(pooled_delta(model, batch, device, HAP_CHUNK)).squeeze(-1)
+            p = head(pooled_delta(model, batch, device, HAP_CHUNK),
+                     batch.gene_id).squeeze(-1)
             preds.append(p.cpu())
             targs.append(batch.z)
     model.train()
@@ -170,6 +204,11 @@ def main() -> int:
                          "(all rows across epochs; eval always scores all). "
                          "Unlike --hap-chunk this changes the objective's "
                          "sampling, not its memory staging.")
+    ap.add_argument("--per-gene-head", action="store_true",
+                    help="add a per-gene weight vector + bias to the linear "
+                         "head (GeneHead); unseen genes use the shared head")
+    ap.add_argument("--gene-wd", type=float, default=1.0,
+                    help="AdamW weight decay on the per-gene head tables")
     ap.add_argument("--head-only", action="store_true",
                     help="freeze the adapters: pretrained Carbon features + "
                          "fitted head only (the zero-shot-style row)")
@@ -192,7 +231,6 @@ def main() -> int:
         device=device, base_dtype=torch.bfloat16, r=args.lora_r,
         alpha=args.lora_alpha, dropout=args.lora_dropout)
     model.train()
-    head = torch.nn.Linear(model.config.hidden_size, 1).to(device)
 
     if args.dataset == "ath":
         from training_ge.ath_data import ArabidopsisWindowSource
@@ -288,7 +326,14 @@ def main() -> int:
           f"{len(val_batches)} val batches ({n_va:,} pairs) in "
           f"{time.perf_counter() - t0:.0f}s; skips {source.skip_counts}")
 
-    params = [{"params": head.parameters(), "lr": args.head_lr}]
+    gene_ids = sorted({b.gene_id for b in train_batches}) \
+        if args.per_gene_head else None
+    head = GeneHead(model.config.hidden_size, gene_ids).to(device)
+    params = [{"params": head.shared.parameters(), "lr": args.head_lr}]
+    if args.per_gene_head:
+        params.append({"params": head.gene_parameters(), "lr": args.head_lr,
+                       "weight_decay": args.gene_wd})
+        print(f"per-gene head over {len(gene_ids)} genes (gene-wd {args.gene_wd})")
     if not args.head_only:
         params.insert(0, {"params": model.trainable_parameters(), "lr": args.lr})
     else:
@@ -317,7 +362,8 @@ def main() -> int:
                 group_n = sum(len(b.z) for b in group)
             for b in group:
                 pred = head(pooled_delta(model, b, device, HAP_CHUNK,
-                                        no_grad=args.head_only)).squeeze(-1)
+                                        no_grad=args.head_only),
+                            b.gene_id).squeeze(-1)
                 loss = ((pred - b.z.to(device)) ** 2).sum() / group_n
                 loss.backward()
                 losses.append(loss.item())
@@ -334,7 +380,8 @@ def main() -> int:
             if val_row.get(key, -math.inf) > best_val:
                 best_val = val_row[key]
                 torch.save({"lora": model.checkpoint_state_dict(),
-                            "head": head.state_dict(), "args": vars(args),
+                            "head": head.state_dict(),
+                            "head_gene_ids": gene_ids, "args": vars(args),
                             "epoch": epoch, "val": val_row}, args.output)
         print(f"epoch {epoch}: mean group loss "
               f"{np.mean(losses) * args.accum_genes:.4f}")

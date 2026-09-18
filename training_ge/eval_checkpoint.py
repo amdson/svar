@@ -53,8 +53,11 @@ def main() -> int:
     assert not [k for k in missing if "lora_" in k], "adapter weights missing"
     model.eval()
     model.encoder.variant_checkpointing = False
-    head = torch.nn.Linear(model.config.hidden_size, 1).to(device)
-    head.load_state_dict(ck["head"])
+    from training_ge.run import GeneHead
+    head = GeneHead(model.config.hidden_size, ck.get("head_gene_ids")).to(device)
+    if "shared.weight" not in ck["head"]:            # pre-GeneHead checkpoint
+        ck["head"] = {"shared." + k: v for k, v in ck["head"].items()}
+    head.load_state_dict(ck["head"], strict=False)
     print(f"checkpoint epoch {ck['epoch']} (saved val {ck['val']})")
 
     import os
@@ -103,7 +106,7 @@ def main() -> int:
                 delta = h[1:] - h[0:1]
                 m = b.own_mask[chunk].to(device).unsqueeze(-1).float()
                 outs.append((delta * m).sum(1) / m.sum(1).clamp(min=1))
-            p = head(torch.cat(outs)).squeeze(-1).cpu().numpy()
+            p = head(torch.cat(outs), b.gene_id).squeeze(-1).cpu().numpy()
             for k, i in enumerate(rows):
                 for s, w in want.items():
                     if b.lines[i] in w:
