@@ -94,6 +94,7 @@ def main() -> int:
     n_psam = len(psam)
 
     preds, targs, per_gene, novel = [], [], [], []
+    preds_tr, targs_tr = [], []
     n_skip = 0
     for k, gi in enumerate(gene_ix):
         c = chrom[gi]
@@ -131,6 +132,7 @@ def main() -> int:
                             max_iter=3000, n_jobs=-1, random_state=0)
         enet.fit(X_tr, y_tr)
         p_va = enet.predict(X_va)
+        preds_tr.append(enet.predict(X_tr)); targs_tr.append(y_tr)
         preds.append(p_va)
         targs.append(y_va)
         if p_va.std() > 0:
@@ -147,6 +149,8 @@ def main() -> int:
           f"{len(T):,} val pairs")
     print(f"POOLED val pearson (elastic net) = {r.statistic:+.4f} "
           f"(p={r.pvalue:.1e})")
+    print(f"  train (in-sample) pooled pearson = "
+          f"{pearsonr(np.concatenate(targs_tr), np.concatenate(preds_tr)).statistic:+.4f}")
     for tag, m in (("novel-allele rows", Nv), ("seen-allele rows", ~Nv)):
         if m.sum() >= 30 and P[m].std() > 0:
             print(f"  {tag:18s} n={m.sum():,}  pooled pearson="

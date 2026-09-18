@@ -88,6 +88,7 @@ def fit(args, feats_path):
     genes = d["genes"]
     alphas = np.logspace(args.alpha_min, args.alpha_max, args.n_alphas)
     P, T, Nv, per_gene, chosen = [], [], [], [], []
+    Ptr, Ttr = [], []
     Ftr_all, ztr_all, Fva_all = [], [], []
     for g in genes:
         F, z = d[f"{g}/F"], d[f"{g}/z"]
@@ -98,6 +99,7 @@ def fit(args, feats_path):
         m = RidgeCV(alphas=alphas).fit(F[tr], z[tr])
         p = m.predict(F[va])
         P.append(p); T.append(z[va]); Nv.append(nv[va]); chosen.append(m.alpha_)
+        Ptr.append(m.predict(F[tr])); Ttr.append(z[tr])
         if p.std() > 0:
             per_gene.append(pearsonr(z[va], p).statistic)
         Ftr_all.append(F[tr]); ztr_all.append(z[tr]); Fva_all.append(F[va])
@@ -106,6 +108,8 @@ def fit(args, feats_path):
           f"alpha chosen: median {np.median(chosen):.3g} "
           f"(grid {alphas[0]:.3g}..{alphas[-1]:.3g})")
     print(f"POOLED val pearson (per-gene ridge) = {pearsonr(T, P).statistic:+.4f}")
+    Ptr, Ttr = np.concatenate(Ptr), np.concatenate(Ttr)
+    print(f"  train (in-sample) pooled pearson = {pearsonr(Ttr, Ptr).statistic:+.4f}")
     for tag, mm in (("novel-allele rows", Nv), ("seen-allele rows", ~Nv)):
         if mm.sum() >= 30:
             print(f"  {tag:18s} n={mm.sum():,}  pooled pearson="
@@ -118,7 +122,8 @@ def fit(args, feats_path):
     m = RidgeCV(alphas=alphas).fit(np.concatenate(Ftr_all), np.concatenate(ztr_all))
     Ps = m.predict(np.concatenate(Fva_all))
     print(f"shared ridge (one head for all genes): pooled val pearson = "
-          f"{pearsonr(T, Ps).statistic:+.4f} (alpha {m.alpha_:.3g})")
+          f"{pearsonr(T, Ps).statistic:+.4f} (alpha {m.alpha_:.3g}); train "
+          f"{pearsonr(Ttr, m.predict(np.concatenate(Ftr_all))).statistic:+.4f}")
     print("\ncompare: per-gene elastic net on genotypes, same rows: "
           "kin_split raw +0.243 / acc_split kinship-resid +0.233")
 
