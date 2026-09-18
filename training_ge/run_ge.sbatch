@@ -21,9 +21,9 @@
 
 set -euo pipefail
 source /apps/spack-managed-x86_64_v3-v1.1/gcc-11.5.0/miniconda3-25.11.1-tjcxbz5i5qh6q7of6cwnp2bdstdptxxu/etc/profile.d/conda.sh
-conda activate svar
+conda activate svar  # PATH only; the interpreter below is pinned because the default env is no longer svar
 cd "$HOME/svar"
 source "$HOME/svar/env.sh"
 export PYTHONUNBUFFERED=1
 echo "node=$(hostname) gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader) args: $*"
-python -m training_ge.run "$@"
+/home/andrew.dickson/.conda/envs/svar/bin/python -m training_ge.run "$@"
