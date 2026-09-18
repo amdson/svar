@@ -207,8 +207,12 @@ def main() -> int:
     ap.add_argument("--per-gene-head", action="store_true",
                     help="add a per-gene weight vector + bias to the linear "
                          "head (GeneHead); unseen genes use the shared head")
-    ap.add_argument("--gene-wd", type=float, default=1.0,
-                    help="AdamW weight decay on the per-gene head tables")
+    ap.add_argument("--gene-wd", type=float, default=0.1,
+                    help="AdamW (decoupled) weight decay on the per-gene head "
+                         "tables; per-step shrink is 1 - gene_lr*gene_wd")
+    ap.add_argument("--gene-lr", type=float, default=3e-2,
+                    help="lr for the per-gene tables: each gene gets ONE Adam "
+                         "update per epoch, so this must be far above head-lr")
     ap.add_argument("--head-only", action="store_true",
                     help="freeze the adapters: pretrained Carbon features + "
                          "fitted head only (the zero-shot-style row)")
@@ -331,9 +335,10 @@ def main() -> int:
     head = GeneHead(model.config.hidden_size, gene_ids).to(device)
     params = [{"params": head.shared.parameters(), "lr": args.head_lr}]
     if args.per_gene_head:
-        params.append({"params": head.gene_parameters(), "lr": args.head_lr,
+        params.append({"params": head.gene_parameters(), "lr": args.gene_lr,
                        "weight_decay": args.gene_wd})
-        print(f"per-gene head over {len(gene_ids)} genes (gene-wd {args.gene_wd})")
+        print(f"per-gene head over {len(gene_ids)} genes "
+              f"(gene-lr {args.gene_lr}, gene-wd {args.gene_wd})")
     if not args.head_only:
         params.insert(0, {"params": model.trainable_parameters(), "lr": args.lr})
     else:

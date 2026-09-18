@@ -5,6 +5,7 @@
 #
 #   sbatch -J ge_exact  training_ge/run_ge.sbatch --dataset ath --exact ... --output $SVAR_SCRATCH/runs/x.pt
 #   sbatch -J ge_head   training_ge/run_ge.sbatch --dataset ath --head-only ...
+#   sbatch -J ridge     training_ge/run_ge.sbatch training_ge.ath_ridge_head --features ...
 #
 # Console log: logs/<jobname>_<jobid>.out ; metrics sidecar + checkpoint land
 # next to --output as always. Partition list lets Slurm take whichever GPU
@@ -26,4 +27,7 @@ cd "$HOME/svar"
 source "$HOME/svar/env.sh"
 export PYTHONUNBUFFERED=1
 echo "node=$(hostname) gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader) args: $*"
-/home/andrew.dickson/.conda/envs/svar/bin/python -m training_ge.run "$@"
+# first arg of the form training_ge.<module> selects a different entry point
+MOD=training_ge.run
+case "${1:-}" in training_ge.*) MOD=$1; shift;; esac
+/home/andrew.dickson/.conda/envs/svar/bin/python -m "$MOD" "$@"
