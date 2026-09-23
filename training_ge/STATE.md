@@ -1,14 +1,7 @@
-# svar expression program: state of the codebase
-
-As of 2026-09-23. Author: Andrew Dickson (drafted by Claude).
-
 ## Question and verdict so far
 
 The question: can fine-tuning Carbon-500M through the variant cache predict cis gene expression from SNPs better than the field default, a per-gene elastic net on genotypes?
 
-Verdict as of 2026-09-23: on the accession axis, no. Pretrained Carbon read out with an exact per-gene ridge reaches pooled val r +0.20 on arabidopsis where the elastic net reaches +0.24, and fine-tuning the cache adds nothing measurable on top of that (+0.205). A cache trained on the elastic-net residual scores 0.00, so the model knows nothing about these windows that the linear model does not already extract from genotypes. Every earlier fine-tuning number near +0.06 was a readout artifact: the SGD head never fit.
-
-The one axis not yet tested is unseen genes, where a per-gene elastic net scores exactly zero by construction. That job is running now (Slurm 20733806). If it is near the permutation null, this program should be called closed for arabidopsis expression. If it is clearly positive, the pitch changes from "beats the elastic net" to "predicts where the elastic net cannot".
 
 ## The model
 
@@ -158,13 +151,19 @@ T = 8,192 tokens, cs = 1,024, N = 32 rows: 12.1 s per step and 43.7 GiB with var
 
 ## Open questions and what is running now
 
-Running: Slurm 20733806 `ge_fam_ridge_frozen` extracts frozen Carbon features for 1,000 train-family and 500 val-family genes on the kinship split, then fits one shared ridge on the train-family genes and scores it on the val-family genes, with a within-gene permuted-target null. Features cache to `$SVAR_SCRATCH/runs/feat_fam_frozen.npz`, so every re-fit after that is CPU-only.
+Unseen-gene test, done 2026-09-23 (Slurm 20733806, `logs/ge_fam_ridge_frozen_20733806.out`): frozen Carbon features for 997 train-family and 500 val-family genes on the kinship split, one shared ridge fit on the train-family genes (train accessions), scored on val-family genes, with a within-gene permuted-target null. Features cached at `$SVAR_SCRATCH/runs/feat_fam_frozen.npz`, so any re-fit is CPU-only.
 
-**Unseen-gene result: pending (job running as of 2026-09-23; fill in from `logs/ge_fam_ridge_frozen_20733806.out`).**
+| Rows scored | n | Pooled r | Permuted null |
+| --- | --- | --- | --- |
+| val genes x train accessions (unseen genes) | 249,435 | -0.005 | +0.003 |
+| val genes x val accessions (unseen both axes) | 39,877 | -0.008 | +0.007 |
+| seen genes x val accessions (reference) | 79,460 | +0.057 | |
 
-Decision rule agreed with Andrew: near the permutation null means the arabidopsis expression program is closed; clearly positive means the claim becomes "predicts where a per-gene elastic net scores zero".
+Train in-sample r of the shared ridge was +0.093 on 494,933 rows (alpha 31.6). The shared readout transfers to unseen genes exactly as well as a permuted target does. On seen genes it reproduces the +0.06 that every SGD shared-head run found, so that number was the shared-head ceiling all along, not an optimization failure.
 
-Open, in rough order of value if the unseen-gene test is positive:
+Decision rule agreed with Andrew beforehand: near the permutation null means the arabidopsis expression program is closed. It is at the null.
+
+Remaining items, listed for the record; none is expected to change the verdict on arabidopsis:
 
 - [ ] Widen the window on frozen features (hw 12 kb or 24 kb): one extraction pass each, elastic-net bar re-run at the same hw on CPU.
 - [ ] Stack ridge and elastic net: fit ridge on elastic-net residuals from the cached features to see whether the two are additive at all.
