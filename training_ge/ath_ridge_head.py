@@ -58,6 +58,9 @@ def extract(args, feats_path):
                                   kinship_residual=args.kinship_residual,
                                   split_key=args.split_key)
     gene_ix = src.sample_genes(args.n_genes, split="train")
+    if args.n_val_genes:
+        gene_ix = np.concatenate([gene_ix,
+                                  src.sample_genes(args.n_val_genes, split="val")])
     sp = dict(zip(src.eco, src.acc_split))
     out = {}
     t0 = time.perf_counter()
@@ -71,7 +74,7 @@ def extract(args, feats_path):
                            for ch in rows.split(args.rows_per_call)])
             out[b.gene_id] = dict(
                 F=F.numpy().astype(np.float32), z=b.z.numpy(),
-                novel=b.novel.numpy(),
+                novel=b.novel.numpy(), fam=np.array(b.fam_split),
                 split=np.array([sp[l] for l in b.lines]))
             if (k + 1) % 20 == 0:
                 print(f"  {k+1}/{len(gene_ix)} genes, {time.perf_counter()-t0:.0f}s")
@@ -128,6 +131,50 @@ def fit(args, feats_path):
           "kin_split raw +0.243 / acc_split kinship-resid +0.233")
 
 
+def fit_transfer(args, feats_path):
+    """Unseen-gene test: ONE shared ridge fit on train-family genes (train
+    accessions), scored on val-family genes it never saw. A per-gene elastic
+    net scores exactly 0 here by construction. Reported on (a) train
+    accessions of val genes — unseen genes only — and (b) val accessions of
+    val genes — unseen on both axes. Null: targets permuted within gene."""
+    from scipy.stats import pearsonr
+    from sklearn.linear_model import RidgeCV
+
+    d = np.load(feats_path)
+    alphas = np.logspace(args.alpha_min, args.alpha_max, args.n_alphas)
+    rng = np.random.default_rng(0)
+    tr_genes = [g for g in d["genes"] if str(d[f"{g}/fam"]) == "train"]
+    va_genes = [g for g in d["genes"] if str(d[f"{g}/fam"]) == "val"]
+    print(f"\nfamily holdout: {len(tr_genes)} train-family genes -> "
+          f"{len(va_genes)} val-family genes")
+
+    def rows(genes, acc_split):
+        F, z, zp = [], [], []
+        for g in genes:
+            m = d[f"{g}/split"] == acc_split
+            F.append(d[f"{g}/F"][m]); z.append(d[f"{g}/z"][m])
+            zp.append(rng.permutation(d[f"{g}/z"][m]))
+        return np.concatenate(F), np.concatenate(z), np.concatenate(zp)
+
+    Ftr, ztr, ztr_p = rows(tr_genes, "train")
+    m = RidgeCV(alphas=alphas).fit(Ftr, ztr)
+    m_null = RidgeCV(alphas=alphas).fit(Ftr, ztr_p)
+    print(f"shared ridge alpha {m.alpha_:.3g}; train in-sample r "
+          f"{pearsonr(ztr, m.predict(Ftr)).statistic:+.4f} (n={len(ztr):,})")
+    for tag, acc in (("val genes x TRAIN accessions", "train"),
+                     ("val genes x VAL accessions", "val")):
+        F, z, _ = rows(va_genes, acc)
+        r = pearsonr(z, m.predict(F)).statistic
+        r0 = pearsonr(z, m_null.predict(F)).statistic
+        se = 1 / np.sqrt(len(z))
+        print(f"  {tag:30s} n={len(z):,}  pooled r={r:+.4f} ({r/se:.1f} sigma)"
+              f"   permuted-target null {r0:+.4f}")
+    # reference: same shared fit scored on train genes' val accessions
+    F, z, _ = rows(tr_genes, "val")
+    print(f"  {'(seen genes x val accessions)':30s} n={len(z):,}  pooled r="
+          f"{pearsonr(z, m.predict(F)).statistic:+.4f}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--features", required=True, help="npz cache path")
@@ -135,6 +182,9 @@ def main() -> int:
     ap.add_argument("--split-key", default="kin_split")
     ap.add_argument("--kinship-residual", action="store_true")
     ap.add_argument("--n-genes", type=int, default=200)
+    ap.add_argument("--n-val-genes", type=int, default=0,
+                    help="also extract this many VAL-family genes and run the "
+                         "unseen-gene transfer fit")
     ap.add_argument("--hw", type=int, default=4000)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--rows-per-call", type=int, default=64)
@@ -147,7 +197,10 @@ def main() -> int:
         extract(args, args.features)
     else:
         print(f"using cached features {args.features}")
-    fit(args, args.features)
+    if args.n_val_genes:
+        fit_transfer(args, args.features)
+    else:
+        fit(args, args.features)
     return 0
 
 
